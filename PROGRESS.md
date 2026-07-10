@@ -19,6 +19,11 @@ Append-only. Newest at bottom. Absolute dates.
 - Known gap: fixtures are clean synthetic TTS (upper bound vs. real dictation); real-microphone Czech recordings are still required before the model choice can be locked into an ADR.
 - Next: ITN-aware WER scoring, real-mic Czech validation, local LLM cleanup comparison (no Ollama models pulled yet), VAD/capture/macOS text-injection research, `docs/RESEARCH.md`.
 
+## 2026-07-10 — Phase 1: LLM cleanup benchmark harness
+- Built `fixtures/llm/cleanup-cases.json` (13 cases: cs disfluencies, false starts/self-corrections, proper-name casing, dev-vocab code-switching, 4 trap cases where dictated questions/commands/prompt-injections must be transcribed, never answered) and `scripts/bench_llm_cleanup.py` (stdlib-only Ollama chat client; WER/CER + `answered_instead` + `diacritics_lost` heuristics + latency; writes `docs/llm-cleanup-benchmark.json`). Implemented by sonnet-implementer, reviewed by Fable. py_compile + ruff clean; graceful-skip path exercised; not yet run against real models.
+- Ollama daemon started; qwen3:8b, gemma3:12b, mistral-nemo:12b downloading in background.
+- Next: run the benchmark once models finish pulling; record results + model pick input for Phase 2.
+
 ## Debt register
 
 (empty)
