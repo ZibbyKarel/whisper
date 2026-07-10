@@ -1,3 +1,26 @@
+# Project Constitution — local-first voice intelligence engine
+
+Wispr Flow–inspired dictation engine: audio → STT → post-processing → text injection. Built as an embeddable platform component, not just an app. Persistent memory lives in: ROADMAP.md, ARCHITECTURE.md, DECISIONS.md (ADRs), PROGRESS.md, HANDOFF.md — read these at session start, keep them current.
+
+## Hard constraints
+- **Local-first:** fully offline capable; no cloud services, paid APIs, or telemetry. Optional cloud features need a local replacement and an ADR.
+- **Czech-first:** Czech (full diacritics) + English + code-switching must work through the whole pipeline. Every model choice is validated on real Czech samples before adoption — never from English benchmarks. Test data must include Czech.
+- **Layering:** UX → Interface → Core Engine; Platform plugs in via ports. Core has no UI/OS dependencies; everything is reachable through the Interface Layer without a UI. See ARCHITECTURE.md.
+- **Licensing:** permissive/open dependencies only; record license + local-execution capability in the ADR.
+
+## Delegation rules
+- Fable orchestrates: architecture, decisions, reviews, hard debugging, quality gates. Routine coding is delegated.
+- `.claude/agents/opus-implementer` — complex implementation, algorithms, integration, perf.
+- `.claude/agents/sonnet-implementer` — normal features, UI, tests, docs, refactors.
+- `.claude/agents/small-worker` — formatting, lint, migrations, repetitive edits.
+- Reviewer must differ from implementer.
+
+## Quality gates (every feature)
+Compiles · tests pass (incl. Czech cases) · lint passes · docs updated · cross-agent review done. Significant decisions get an ADR in DECISIONS.md at decision time (see `.claude/skills/architecture-adr`).
+
+## Workflow
+Small commits, working repo after each. After milestones: update ROADMAP + CHANGELOG, commit. Before ending a run: checkpoint, commit, update HANDOFF.md.
+
 ## graphify
 
 This project has a graphify knowledge graph at graphify-out/.
