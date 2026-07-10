@@ -2,7 +2,7 @@
 
 Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-first, built as an embeddable platform component.
 
-**Current position: Phase 1 ✅ complete (2026-07-10) — RESEARCH.md, STT rounds 1–2 + real-mic validation (default large-v3-turbo q5_0 confirmed), LLM cleanup round 1 (default qwen3:8b), VAD silence-trimming = measured hard requirement. Phase 2 (architecture) starting.**
+**Current position: Phase 2 (architecture) ✅ designed & reviewed (2026-07-10) — ARCHITECTURE.md full design + ADRs D-0004..D-0010, adversarial cross-review addressed. Next: Phase 3 Core Engine MVP (Rust workspace scaffold → capture→VAD→STT pipeline on fixtures).**
 
 ## Phase 0 — Environment & tooling bootstrap ✅ (2026-07-10)
 - Capability audit (`docs/CAPABILITY_AUDIT.md`), local skills, subagents, runtimes, memory files, verification gate.
@@ -14,10 +14,10 @@ Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-fi
 - VAD, audio capture, macOS text-injection methods
 - Deliverable: `docs/RESEARCH.md` + Czech fixture set + model shortlist with measured WER
 
-## Phase 2 — Architecture
-- Full design per mission: layers, APIs, data flow, security, testing/deploy strategy
-- Czech validation results locked into model ADRs
-- Deliverable: `ARCHITECTURE.md` + ADRs
+## Phase 2 — Architecture ✅ (2026-07-10)
+- Full design: layers, APIs, data flow, failure paths, testing seams (`ARCHITECTURE.md`)
+- Czech validation locked into ADRs D-0004 (STT), D-0005 (LLM); D-0006..D-0010 (stack, insertion, VAD, interface, storage)
+- Adversarial cross-review (16 findings) addressed
 
 ## Phase 3 — Core Engine MVP
 - Audio capture → VAD → STT (streaming) → raw transcript events

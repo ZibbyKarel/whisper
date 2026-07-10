@@ -1,43 +1,43 @@
 # HANDOFF
 
 ## Current state
-Phase 1 (research) mostly done. `docs/RESEARCH.md` written — synthesizes the deep-research
-run (Wispr Flow teardown, OSS landscape, Czech STT/LLM evidence, macOS integration) with
-per-claim confidence tags, plus our measured benchmarks. LLM cleanup benchmark round 1
-done (`docs/llm-cleanup-benchmark.md`): **qwen3:8b = provisional cleanup default** (0/4
-trap failures, avg WER 0.15, 1.6 s); mistral-nemo:12b disqualified (obeys prompt
-injections). STT round 2 done (`docs/stt-benchmark-round2.md`): mikr Czech fine-tune and
-Parakeet v3 benchmarked, ITN-aware — **default stays large-v3-turbo q5_0**; Parakeet
-(cs 0.11, ~10× faster) is the low-latency profile candidate but worst at code-switching.
-Provisional model pair: whisper large-v3-turbo q5_0 (STT) + qwen3:8b (cleanup) ≈ 5.8 GB
-resident, inside the ~10 GB budget (D-0001). All automatable Phase-1 work is done —
-only real-mic validation (needs the user) remains before Phase 2.
+Phase 1 (research) and Phase 2 (architecture) complete, 2026-07-10. ARCHITECTURE.md holds
+the full reviewed design; DECISIONS.md has ADRs D-0001..D-0010. Confirmed model pair:
+whisper large-v3-turbo q5_0 (STT, D-0004) + qwen3:8b via llama.cpp (cleanup, D-0005),
+≈5.8 GB resident. Next: Phase 3 — Core Engine MVP.
 
 ## Architecture overview
-See ARCHITECTURE.md (skeleton; binding layer contract only) — unchanged since Phase 0.
-RESEARCH.md §2 identifies the proven stack pattern (Rust core: cpal → Silero VAD →
-whisper.cpp/Parakeet → pasteboard+Cmd-V insertion; Handy MIT as reference) as Phase-2 input.
+See ARCHITECTURE.md (authoritative). Shape: Rust workspace — `whisper-core` (pure lib,
+ports: AudioSource/SttEngine/CleanupEngine/TextSink), `whisper-iface` (`whisperd`
+localhost HTTP+WS daemon; hosts production whisper.cpp/llama.cpp adapters),
+`whisper-platform` (macOS: cpal, hotkeys, pasteboard injection), `whisper-cli`.
+Pipeline: capture → Silero VAD (mandatory silence-trim, D-0008) → per-VAD-segment
+whisper decode → dictionary pass → skip-gate → optional LLM cleanup → TextSink.
 
 ## Completed
-See PROGRESS.md 2026-07-10 entries. Key artifacts:
-- `docs/stt-benchmark.{md,json}` — large-v3-turbo q5_0 provisional STT default.
-- `docs/RESEARCH.md` — Phase 1 research deliverable (claims tagged MEASURED/VERIFIED/PLAUSIBLE/SNIPPET).
-- `scripts/bench_llm_cleanup.py` + `fixtures/llm/cleanup-cases.json` — 13 cases incl. 4
-  trap cases (dictated questions/commands must be transcribed, never answered).
+See PROGRESS.md 2026-07-10 entries. Key artifacts: docs/RESEARCH.md,
+docs/stt-benchmark{,.-round2}.md, docs/stt-real-validation.md (turbo confirmed on real
+speech; silence-hallucination finding), docs/llm-cleanup-benchmark.md (qwen3:8b wins,
+mistral-nemo disqualified), ARCHITECTURE.md + ADRs D-0004..D-0010 (cross-reviewed, 16
+findings addressed).
 
-## Unfinished / next steps
-1. ~~Real-mic validation~~ DONE (`docs/stt-real-validation.md`): gate passed,
-   large-v3-turbo q5_0 confirmed default; VAD silence-trimming = measured hard
-   requirement (whisper hallucinates "Titulky vytvořil JohnyX." on trailing silence).
-2. Round 2 of the LLM cleanup eval belongs to Phase 2 (engineered prompt: few-shot
-   self-correction + anti-paraphrase; try qwen3:4b; cleanup-skip gate).
-3. Phase 2 architecture (STARTING): ARCHITECTURE.md full design + ADRs (STT model, LLM model,
-   stack language, insertion method — RESEARCH.md has the evidence base).
+## Unfinished / next steps (Phase 3 — Core Engine MVP)
+1. Scaffold the Rust workspace (4 crates per D-0006), CI running fixture-audio pipeline
+   tests (no hardware). Delegate scaffold to sonnet-implementer; whisper-rs/VAD
+   integration to opus-implementer; Fable reviews.
+2. Implement capture→VAD→STT path against fixtures first (headless), incl. the
+   anti-hallucination test (silence-padded clip ≡ trimmed clip output).
+3. whisper-rs output parity check vs whisper-cli on the fixture set (D-0006 consequence).
+4. LLM cleanup stage: re-measure qwen3:8b traps+latency in-process via llama.cpp with the
+   final few-shot prompt BEFORE freezing (D-0005 evidence-transfer guard); qwen3:4b trial.
+5. Verify Parakeet v3 weights license before adopting the low-latency profile (D-0004).
 
 ## Known issues / assumptions
-- Ollama daemon started via `brew services start ollama`; model pulls ran in a background
-  task — verify with `ollama list` (~20 GB total for the three models).
-- Deep-research verification debt (RESEARCH.md §6): Secure Input, VocaMac, CzechBench
-  numbers, Mistral-Nemo Czech claims are PLAUSIBLE only — verify individually if an ADR
-  depends on them.
+- Review-surfaced watched risks: rdev maintenance (fallback CGEventTap), Fn/globe key
+  needs flagsChanged/IOKit (Phase 5), clipboard NFD round-trip (NFC-normalize), Secure
+  Input behavior still [PLAUSIBLE] (verify in Phase 5).
+- Ollama + pulled models (qwen3/gemma3/mistral-nemo, 19 GB) remain as dev/benchmark
+  tooling only; `/tmp/stt_round2/` holds the throwaway venv + Parakeet model dir (not in
+  models/ — re-download if /tmp got cleaned).
+- Real-speech corpus is n=1 recording; Phase 3 testing should grow it (noise, speakers).
 - rtk warns about untrusted `.rtk/filters.toml` (cosmetic).

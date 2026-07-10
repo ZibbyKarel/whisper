@@ -51,6 +51,12 @@ Append-only. Newest at bottom. Absolute dates.
 - **Measured hallucination finding:** all whisper models appended "Titulky vytvořil JohnyX." on 3 s of trailing silence; trimming silence removes it → VAD silence-trimming before STT is a hard Phase-2/3 requirement. Parakeet did not hallucinate.
 - Phase 1 complete. Next: Phase 2 architecture (ARCHITECTURE.md + ADRs; model ADR now unblocked).
 
+## 2026-07-10 — Phase 2: architecture design + ADRs D-0004..D-0010
+- ARCHITECTURE.md rewritten from skeleton to full design: Rust workspace (whisper-core pure lib with ports/adapters, whisper-iface = `whisperd` HTTP+WS daemon hosting production STT/LLM adapters, whisper-platform macOS adapters, whisper-cli), session FSM with cancellation + model-failure + device-loss paths, per-VAD-segment decoding (whisper.cpp is non-streaming; segments decode during recording → bounded release-to-text even for hands-free), cleanup skip-gate, single-active-session concurrency (409), latency budget (≤1.5 s gate-skipped / ~2.5 s with LLM).
+- ADRs: D-0004 STT default turbo q5_0 + profiles; D-0005 qwen3:8b via llama.cpp (Ollama dev-only) with evidence-transfer guard; D-0006 Rust workspace + dep license table; D-0007 pasteboard+Cmd-V insertion, Secure Input never bypassed; D-0008 Silero VAD mandatory (measured hallucination); D-0009 localhost HTTP+WS JSON; D-0010 TOML/JSON/SQLite storage.
+- Cross-agent review (opus, adversarial): 16 findings, 0 blockers, 8 MAJOR — all addressed: streaming partials rescoped to per-segment, long-session latency solved by incremental decoding, Ollama→llama.cpp parity guard added, Fn-key infeasibility via rdev documented, concurrency/WS-disconnect/model-load-failure semantics specified, latency header reconciled, Parakeet weights license flagged for verification, plugin hook deferred to Phase 4.
+- Review-surfaced risk register: rdev maintenance, whisper-rs↔whisper-cli parity, qwen3 GGUF re-measurement in-process, clipboard NFD round-trip.
+
 ## Debt register
 
 (empty)
