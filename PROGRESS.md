@@ -129,6 +129,14 @@ Append-only. Newest at bottom. Absolute dates.
 - Incident (Fable): a missing newline in `.gitignore` had glued `target/` to a comment — commit 3a87853 accidentally tracked **84k build artifacts**; pattern fixed + `git rm -r --cached target/` (history rewrite of the bloated commit denied by policy — **flag before pushing to origin**: that one commit carries ~GBs in history).
 - Gates (final, all re-run): fmt clean; clippy -D warnings clean in default + platform configs; **191 workspace + 45 platform-feature + 74 ux tests pass**; package.sh end-to-end verified (`codesign -dv` adhoc, plist keys checked; app not launched — TCC rule).
 
+## 2026-07-11 — User feedback round 3: floating overlay, icons, Inter/sidebar UI, language picker
+- User verdict on round 2: "definitely better"; asked for a Wispr Flow-style **floating waveform overlay** while dictating (center of screen, top/bottom configurable), a dictation-language setting, an app icon, a nicer menu-bar icon, and another modernization pass.
+- Overlay (opus, reviewed by Fable): `overlay.rs` + `shell_settings.rs` — second egui viewport (borderless, transparent, always-on-top, `with_active(false)` + mouse passthrough; immediate viewport chosen over deferred to avoid `Arc<Mutex>` state), 24-bar voice-reactive waveform from `audio.level` (10 Hz ring eased per-frame, idle breathing baseline, peak-lit tip), red dot + mm:ss while Recording, frozen/dimmed + "…" while Processing (latched so startup model-loading never pops it), horizontally centered, Top/Bottom persisted shell-locally (`config_dir/whisper-tray/shell.json` — deliberately NOT daemon /v1 config). Focus/click-through honoring is platform-dependent — manual-verification item.
+- Icons (sonnet, reviewed by Fable): menu-bar dots → 5-bar waveform glyph (4×4 supersampled AA; idle=template auto dark/light, recording=red+bolder, processing=teal 70 %, error=amber+red badge; 12 icon tests) and `gen_app_icon` bin → deterministic `assets/AppIcon.icns` (104 KB, Big Sur-style teal gradient + white waveform; `png` crate MIT/Apache-2.0).
+- UI pass 2 (sonnet, reviewed by Fable): vendored **Inter v4.001** (Regular+SemiBold, SIL OFL 1.1, license committed), TextStyle hierarchy; left sidebar nav (accent highlight) replaces tab bar; roomier cards, accent slider fills, primary accent buttons; Status = dashboard (big meter + session/process grid); **dictation-language picker** in Dictation (Čeština/English/Auto presets + Other… free code; unknown codes round-trip byte-exact, `language.rs`). Window 760×520.
+- Gates: fmt/clippy -D warnings clean, **109 ux tests** (100→109), release build ok; `dist/Whisper.app` (45 MB) + `dist/Whisper.dmg` (18 MB) rebuilt with the icon (`CFBundleIconFile` verified).
+- Manual-verification additions: overlay transparency/no-focus/click-through on real desktop, sidebar/typography rendering, language presets round-trip.
+
 ## Debt register
 
 (empty)

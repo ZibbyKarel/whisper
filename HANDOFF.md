@@ -1,13 +1,16 @@
 # HANDOFF
 
 ## Current state
-Phases 1–4 complete; Phases 5–6 implemented + hardened from two rounds of live user
-feedback, **pending final manual verification** (2026-07-10). Round 2 shipped: PUT
+Phases 1–4 complete; Phases 5–6 implemented + hardened through three rounds of live
+user feedback, **pending final manual verification** (2026-07-11). Round 2: PUT
 /v1/config 500 fixed (mkdir parent), default hotkey **Ctrl+Alt** (modifier-only,
 enabled by default), rdev permission failure surfaced (stderr + `platform.permission`
-WS event), full-config Settings UI with modern dark theme, and **Whisper.app / DMG
-packaging with tray-managed whisperd lifecycle (D-0014)** — `scripts/package.sh`
-builds `dist/Whisper.dmg`; `scripts/run.sh` is the one-command dev launcher.
+WS event), full-config Settings UI, **Whisper.app / DMG packaging with tray-managed
+whisperd lifecycle (D-0014)** — `scripts/package.sh` builds `dist/Whisper.dmg`;
+`scripts/run.sh` is the one-command dev launcher. Round 3: **floating waveform
+overlay** while dictating (second egui viewport, top/bottom shell-local setting),
+waveform menu-bar glyphs + generated `assets/AppIcon.icns`, Inter typography +
+sidebar UI, dictation-language picker (Čeština/English/Auto/Other).
 Root cause of "hotkey did nothing in other apps": whisperd reads ONLY
 `~/Library/Application Support/whisper-engine/config.toml` (not the repo-root file);
 that dir didn't exist, so hotkey/delivery ran on old defaults (disabled/none). The
@@ -33,14 +36,18 @@ platform → tray → feedback round 2). ADRs D-0004..D-0014 in DECISIONS.md.
 1. **Manual verification (user):** packaged-app or run.sh walkthrough — Czech at
    normal volume (AGC + VAD 0.35), Ctrl+Alt PTT into another app, TCC grants,
    Secure Input, device unplug, tray sections/settings round-trip (staged notice +
-   Restart button), onboarding.
+   Restart button), onboarding; round-3 additions: overlay transparency /
+   no-focus-steal / click-through on the real desktop (platform-dependent, plan B
+   is an NSPanel via raw-window-handle if winit's hints are ignored), sidebar +
+   Inter rendering, language presets round-trip, new tray glyph states, Dock/DMG
+   icon.
 2. **Before pushing to origin:** commit 3a87853 accidentally tracked 84k `target/`
    files (fixed forward in 7e88ad0, history still bloated ~GBs; amend/rewrite was
    policy-denied mid-session). Decide: interactive rebase before first push, or
    accept the bloat. Also: stale `stash@{0}` — safe to `git stash drop` manually.
-3. UI polish round 2 (user has "many reservations", wants it less form-like): visual
-   refinement beyond the new theme, app icon (`assets/AppIcon.icns` — package.sh
-   already embeds it if present), async HTTP off the UI thread, language presets.
+3. UI follow-ups: async HTTP off the UI thread; truncate long session UUIDs in the
+   Status grid; onboarding kept its old top-bar layout (restyled fonts only) —
+   consider sidebar-izing it if the user wants.
 4. Phase-5 remainder: Fn/globe-key capture (NSEvent flagsChanged/IOKit behind the
    hotkey port).
 5. Phase-4 follow-ups (tracked, not blocking): queued transcribe behind active

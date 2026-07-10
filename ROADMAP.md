@@ -2,7 +2,7 @@
 
 Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-first, built as an embeddable platform component.
 
-**Current position: Phase 6 hardened + Phase 7 packaging started (2026-07-10). Feedback round 2 shipped: PUT-config 500 fix, default hotkey Ctrl+Alt (modifier-only, on by default), surfaced Input-Monitoring failure, modern dark sectioned UI with every config field editable (incl. VAD/AGC sliders), and Whisper.app/DMG packaging with tray-managed whisperd (D-0014: `scripts/package.sh`, `scripts/run.sh`, `docs/install.md`). ⚠️ Manual verification pending (docs/install.md + phase5/6 checklists): Czech at normal volume, Ctrl+Alt PTT into other apps, TCC grants. Remaining: UI polish round 2, app icon, Fn/globe key, notarization-less Gatekeeper caveat, rest of Phase 7.**
+**Current position: Phase 6 hardened + Phase 7 packaging started (2026-07-11, feedback round 3 shipped). The app now has: Wispr Flow-style floating waveform overlay while dictating (top/bottom configurable), waveform menu-bar glyphs, generated app icon, Inter typography + sidebar UI, dictation-language picker, full-config Settings, Ctrl+Alt PTT default, Whisper.app/DMG packaging with tray-managed whisperd (D-0014). ⚠️ Manual verification pending (docs/install.md + phase5/6 checklists): Czech at normal volume, PTT into other apps, TCC grants, overlay behavior on the real desktop. Remaining: Fn/globe key, notarization decision, rest of Phase 7 hardening.**
 
 ## Phase 0 — Environment & tooling bootstrap ✅ (2026-07-10)
 - Capability audit (`docs/CAPABILITY_AUDIT.md`), local skills, subagents, runtimes, memory files, verification gate.
