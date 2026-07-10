@@ -1,12 +1,13 @@
 # HANDOFF
 
 ## Current state
-Phases 1–2 complete; Phase 3 (Core Engine MVP) mostly done, 2026-07-10. The headless
-pipeline runs end to end with real models: Rust workspace (D-0006) with whisper.cpp STT
-adapter (parity vs whisper-cli proven), Silero VAD streaming segmenter with per-segment
-decoding (anti-hallucination regression test green), and llama.cpp qwen3:8b cleanup
-adapter (D-0005 in-process guard: 0 traps, 0 diacritics loss, avg WER 0.069). 31 fast +
-6 real-model test suites green; clippy -D warnings; fmt clean.
+Phases 1–3 complete, 2026-07-10. The headless pipeline runs end to end with real models:
+Rust workspace (D-0006) with whisper.cpp STT adapter (parity vs whisper-cli proven),
+Silero VAD streaming segmenter with per-segment decoding (anti-hallucination regression
+test green), llama.cpp qwen3:8b cleanup adapter (KV-prefix cached: **1.1 s/call release**,
+guard avg WER 0.019, 0 traps, 0 diacritics loss — prompt frozen; llama.cpp logs silenced),
+and skip-gate `CleanupMode::Auto` (Czech marker heuristic, 22 unit tests). 53 fast +
+6 real-model test suites green; clippy -D warnings; fmt clean. Next: Phase 4 `whisperd`.
 
 ## Architecture overview
 See ARCHITECTURE.md (authoritative). Shape: Rust workspace — `whisper-core` (pure lib,
@@ -24,15 +25,15 @@ mistral-nemo disqualified), ARCHITECTURE.md + ADRs D-0004..D-0010 (cross-reviewe
 findings addressed).
 
 ## Unfinished / next steps
-1. Phase-3 remainder: cleanup skip-gate marker heuristic (currently always-run flag);
-   `--release` latency re-measurement + static-prompt KV-prefix caching (debug build
-   measured 3.11 s/call vs ~1.6 s budget — §3.4 not yet updated on purpose); Czech
-   self-correction ("ne vlastně X") still fails 2 cases — prompt NOT frozen (targeted
-   few-shot or rule pass); silence llama.cpp stderr logging before `whisperd`.
-2. Phase 4: `whisperd` — HTTP `/v1/*` + `WS /v1/events` per ARCHITECTURE §4 / D-0009,
-   bridging the existing PipelineEvent subscriber channel; CLI as thin client.
-3. Verify Parakeet v3 weights license before adopting the low-latency profile (D-0004).
-4. Grow the real-speech Czech corpus (noise, speakers) for VAD tuning + WER regression.
+1. Phase 4: `whisperd` — HTTP `/v1/*` + `WS /v1/events` per ARCHITECTURE §4 / D-0009,
+   bridging the existing PipelineEvent subscriber channel (CleanupSkipped now carries a
+   `reason`); CLI as thin client. NOTE: LlamaCleanupEngine is `!Send`/`!Sync` — pin to
+   one worker thread or front with an actor (see cleanup.rs struct doc).
+2. Verify Parakeet v3 weights license before adopting the low-latency profile (D-0004).
+3. Grow the real-speech Czech corpus (noise, speakers) for VAD tuning + WER regression;
+   tune skip-gate marker lists on it (first-pass lists, §3.2 deliverable).
+4. Housekeeping: remove redundant PlaceholderVad in whisper-platform; a stale superseded
+   `stash@{0}` sits in the repo — safe to `git stash drop` manually.
 
 ## Known issues / assumptions
 - Review-surfaced watched risks: rdev maintenance (fallback CGEventTap), Fn/globe key
