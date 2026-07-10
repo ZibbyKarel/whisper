@@ -12,6 +12,7 @@ pub mod error;
 pub mod pipeline;
 pub mod ports;
 pub mod session;
+pub mod skip_gate;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod types;

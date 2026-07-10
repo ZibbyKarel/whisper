@@ -15,9 +15,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use whisper_core::dictionary::Dictionary;
 use whisper_core::error::SttError;
-use whisper_core::pipeline::{Pipeline, PipelineConfig};
+use whisper_core::pipeline::{CleanupMode, Pipeline, PipelineConfig};
 use whisper_core::ports::SttEngine;
 use whisper_core::session::{CancellationToken, SessionState};
+use whisper_core::skip_gate::SkipGateConfig;
 use whisper_core::test_support::{CaptureSink, FixtureWavSource};
 use whisper_core::types::{AudioCfg, CleanupCtx, SttOpts, TranscriptRaw};
 use whisper_core::vad::VadConfig;
@@ -100,7 +101,8 @@ fn run_pipeline(wav: &Path, stt: SharedStt) -> (SessionState, String) {
         None,
         Box::new(sink.clone()),
         PipelineConfig {
-            cleanup_enabled: false,
+            cleanup_mode: CleanupMode::Never,
+            skip_gate: SkipGateConfig::default(),
         },
     );
     let token = CancellationToken::new();

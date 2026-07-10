@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use whisper_core::dictionary::Dictionary;
-use whisper_core::pipeline::{Pipeline, PipelineConfig};
+use whisper_core::pipeline::{CleanupMode, Pipeline, PipelineConfig};
 use whisper_core::ports::NoopVad;
 use whisper_core::session::{CancellationToken, SessionState};
+use whisper_core::skip_gate::SkipGateConfig;
 use whisper_core::test_support::{CaptureSink, FixtureWavSource};
 use whisper_core::types::{AudioCfg, CleanupCtx};
 
@@ -53,7 +54,8 @@ fn real_model_through_pipeline_transcribes_czech() {
         None,
         Box::new(sink.clone()),
         PipelineConfig {
-            cleanup_enabled: false,
+            cleanup_mode: CleanupMode::Never,
+            skip_gate: SkipGateConfig::default(),
         },
     );
 

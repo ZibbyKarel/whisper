@@ -30,6 +30,7 @@ pub fn default_pipeline_config() -> PipelineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use whisper_core::pipeline::CleanupMode;
 
     #[test]
     fn placeholder_status_reports_stub_state() {
@@ -37,7 +38,7 @@ mod tests {
     }
 
     #[test]
-    fn default_pipeline_config_has_cleanup_off() {
-        assert!(!default_pipeline_config().cleanup_enabled);
+    fn default_pipeline_config_uses_auto_cleanup_mode() {
+        assert_eq!(default_pipeline_config().cleanup_mode, CleanupMode::Auto);
     }
 }

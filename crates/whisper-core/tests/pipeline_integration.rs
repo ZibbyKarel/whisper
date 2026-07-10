@@ -7,9 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use whisper_core::dictionary::Dictionary;
 use whisper_core::error::{AudioError, CleanupError, DeliverError, SttError};
-use whisper_core::pipeline::{Pipeline, PipelineConfig, PipelineEvent};
+use whisper_core::pipeline::{
+    CleanupMode, CleanupSkipReason, Pipeline, PipelineConfig, PipelineEvent,
+};
 use whisper_core::ports::{AudioSource, AudioStream, CleanupEngine, NoopVad, SttEngine, TextSink};
 use whisper_core::session::{CancellationToken, SessionState};
+use whisper_core::skip_gate::SkipGateConfig;
 use whisper_core::types::{AudioCfg, CleanupCtx, SttOpts, TranscriptRaw};
 
 const FRAME_LEN: usize = 1600; // 100 ms @ 16 kHz mono
@@ -186,6 +189,19 @@ impl CleanupEngine for FailingCleanup {
     }
 }
 
+/// Marks whether it ran (via `ran.store(true, ...)`) and appends a marker suffix — lets
+/// `CleanupMode::Auto` tests assert whether the skip-gate actually invoked the engine.
+struct MarkingCleanup {
+    ran: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CleanupEngine for MarkingCleanup {
+    fn clean(&self, text: &str, _ctx: &CleanupCtx) -> Result<String, CleanupError> {
+        self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(format!("{text} [cleaned]"))
+    }
+}
+
 #[derive(Clone, Default)]
 struct CaptureSink {
     captured: Arc<Mutex<Option<String>>>,
@@ -219,7 +235,8 @@ fn full_pipeline_round_trips_czech_diacritics_byte_exact() {
         Some(Box::new(IdentityCleanup)),
         Box::new(sink.clone()),
         PipelineConfig {
-            cleanup_enabled: false,
+            cleanup_mode: CleanupMode::Never,
+            skip_gate: SkipGateConfig::default(),
         },
     );
 
@@ -262,7 +279,8 @@ fn dictionary_pass_fixes_merknout_to_mergnout() {
         None,
         Box::new(sink.clone()),
         PipelineConfig {
-            cleanup_enabled: false,
+            cleanup_mode: CleanupMode::Never,
+            skip_gate: SkipGateConfig::default(),
         },
     );
 
@@ -294,7 +312,8 @@ fn cancellation_mid_pipeline_stops_before_delivery() {
         None,
         Box::new(sink.clone()),
         PipelineConfig {
-            cleanup_enabled: false,
+            cleanup_mode: CleanupMode::Never,
+            skip_gate: SkipGateConfig::default(),
         },
     );
 
@@ -336,7 +355,8 @@ fn cleanup_failure_carries_best_text_so_far() {
         Some(Box::new(FailingCleanup)),
         Box::new(sink.clone()),
         PipelineConfig {
-            cleanup_enabled: true,
+            cleanup_mode: CleanupMode::Always,
+            skip_gate: SkipGateConfig::default(),
         },
     );
 
@@ -373,7 +393,8 @@ fn device_loss_surfaces_as_failed_with_partial_text() {
         None,
         Box::new(sink.clone()),
         PipelineConfig {
-            cleanup_enabled: false,
+            cleanup_mode: CleanupMode::Never,
+            skip_gate: SkipGateConfig::default(),
         },
     );
 
@@ -388,4 +409,91 @@ fn device_loss_surfaces_as_failed_with_partial_text() {
         other => panic!("expected Failed state, got {other:?}"),
     }
     assert!(sink.captured.lock().unwrap().is_none());
+}
+
+#[test]
+fn auto_mode_skips_cleanup_engine_for_clean_czech_text() {
+    // No disfluency/self-correction markers (`skip_gate` unit tests own the heuristic
+    // itself) — the gate must keep the LLM off the fast path (`ARCHITECTURE.md` §3.4).
+    let clean = "Otevři si terminál a spusť npm install.";
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let audio = FixtureAudioSource::new(fixture_path("mix-01.wav"));
+    let stt = FakeStt {
+        text: clean.to_string(),
+        lang: "cs".to_string(),
+    };
+    let sink = CaptureSink::default();
+
+    let mut pipeline = Pipeline::new(
+        Box::new(audio),
+        Box::new(NoopVad::default()),
+        Box::new(stt),
+        Dictionary::empty(),
+        Some(Box::new(MarkingCleanup { ran: ran.clone() })),
+        Box::new(sink.clone()),
+        PipelineConfig {
+            cleanup_mode: CleanupMode::Auto,
+            skip_gate: SkipGateConfig::default(),
+        },
+    );
+
+    let rx = pipeline.subscribe();
+    let token = CancellationToken::new();
+    let state = pipeline.run(AudioCfg::default(), &CleanupCtx::default(), &token);
+
+    assert_eq!(state, SessionState::Idle);
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "clean text must not reach the CleanupEngine in Auto mode"
+    );
+    assert_eq!(sink.captured.lock().unwrap().as_deref(), Some(clean));
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        PipelineEvent::CleanupSkipped {
+            reason: CleanupSkipReason::GateClean
+        }
+    )));
+}
+
+#[test]
+fn auto_mode_runs_cleanup_engine_for_disfluent_czech_text() {
+    // Contains a self-correction marker ("ne vlastně") — the gate must route this to the
+    // CleanupEngine rather than deliver it raw.
+    let disfluent = "Pošli mi ten soubor zítra, ne vlastně dneska večer.";
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let audio = FixtureAudioSource::new(fixture_path("mix-01.wav"));
+    let stt = FakeStt {
+        text: disfluent.to_string(),
+        lang: "cs".to_string(),
+    };
+    let sink = CaptureSink::default();
+
+    let mut pipeline = Pipeline::new(
+        Box::new(audio),
+        Box::new(NoopVad::default()),
+        Box::new(stt),
+        Dictionary::empty(),
+        Some(Box::new(MarkingCleanup { ran: ran.clone() })),
+        Box::new(sink.clone()),
+        PipelineConfig {
+            cleanup_mode: CleanupMode::Auto,
+            skip_gate: SkipGateConfig::default(),
+        },
+    );
+
+    let token = CancellationToken::new();
+    let state = pipeline.run(AudioCfg::default(), &CleanupCtx::default(), &token);
+
+    assert_eq!(state, SessionState::Idle);
+    assert!(
+        ran.load(std::sync::atomic::Ordering::SeqCst),
+        "disfluent text must reach the CleanupEngine in Auto mode"
+    );
+    assert_eq!(
+        sink.captured.lock().unwrap().as_deref(),
+        Some(format!("{disfluent} [cleaned]").as_str())
+    );
 }

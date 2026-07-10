@@ -4,9 +4,10 @@
 //! emitting [`PipelineEvent`]s through a subscriber channel — the seam `whisper-iface`
 //! will bridge to WebSocket events.
 //!
-//! The cleanup gate here is the Phase-3 stub called out in the mission: a simple
-//! always-run flag from [`PipelineConfig`]. The real marker-heuristic skip-gate
-//! (`ARCHITECTURE.md` §3.2, "cleanup gate") is a later Phase-3 deliverable.
+//! The cleanup gate (`ARCHITECTURE.md` §3.2, "cleanup gate", D-0005) is
+//! [`CleanupMode`]-driven: `Always`/`Never` are explicit overrides, and the default `Auto`
+//! calls [`crate::skip_gate`]'s marker heuristic on the dictionary-passed text to decide
+//! per session.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -14,13 +15,32 @@ use crate::dictionary::Dictionary;
 use crate::error::{PipelineError, SttError};
 use crate::ports::{AudioSource, CleanupEngine, SttEngine, TextSink, Vad, VadEvent};
 use crate::session::{CancellationToken, FailureInfo, SessionFsm, SessionState};
+use crate::skip_gate::SkipGateConfig;
 use crate::types::{AudioCfg, CleanupCtx, SttOpts};
 
-/// Pipeline behavior knobs. `cleanup_enabled` is the Phase-3 stub for the cleanup gate
-/// described in `ARCHITECTURE.md` §3.2 — a real marker-heuristic skip-gate lands later.
-#[derive(Debug, Clone, Copy, Default)]
+/// How the cleanup stage is gated for a session (`ARCHITECTURE.md` §3.2, D-0005).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CleanupMode {
+    /// Always attempt cleanup (if a [`CleanupEngine`] is configured).
+    Always,
+    /// Never attempt cleanup; the dictionary-passed text is delivered as-is.
+    Never,
+    /// Run the skip-gate heuristic ([`crate::skip_gate::needs_cleanup`]) on the
+    /// dictionary-passed text and only attempt cleanup when it says the text needs it.
+    /// This is the default: it keeps the ~40% clean-dictation case on the fast path
+    /// (`ARCHITECTURE.md` §3.4) without ever missing an explicit override.
+    #[default]
+    Auto,
+}
+
+/// Pipeline behavior knobs.
+#[derive(Debug, Clone, Default)]
 pub struct PipelineConfig {
-    pub cleanup_enabled: bool,
+    /// Cleanup gating mode; defaults to [`CleanupMode::Auto`].
+    pub cleanup_mode: CleanupMode,
+    /// Marker lists/thresholds the `Auto` mode's skip-gate heuristic uses; defaults to
+    /// [`SkipGateConfig::default`]. Ignored in `Always`/`Never` mode.
+    pub skip_gate: SkipGateConfig,
 }
 
 /// Events emitted by the pipeline as a session progresses. This is the seam
@@ -42,7 +62,9 @@ pub enum PipelineEvent {
     DictionaryApplied {
         text: String,
     },
-    CleanupSkipped,
+    CleanupSkipped {
+        reason: CleanupSkipReason,
+    },
     Cleaned {
         text: String,
     },
@@ -56,6 +78,22 @@ pub enum PipelineEvent {
         error: String,
         partial_text: Option<String>,
     },
+}
+
+/// Why the cleanup stage did not run for a session (`ARCHITECTURE.md` §3.2 cleanup gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupSkipReason {
+    /// [`CleanupMode::Never`]: cleanup is off for this session/profile.
+    ModeDisabled,
+    /// [`CleanupMode::Auto`]: the skip-gate heuristic
+    /// ([`crate::skip_gate::SkipGateConfig::needs_cleanup`]) found no disfluency/self-
+    /// correction markers in the dictionary-passed text — the fast path
+    /// (`ARCHITECTURE.md` §3.4).
+    GateClean,
+    /// Cleanup was wanted (`Always`, or `Auto` with the gate saying it's needed) but no
+    /// [`CleanupEngine`] is configured — degrade gracefully rather than fail the session
+    /// (`ARCHITECTURE.md` §3.2, "the engine never dies with a session").
+    NoEngineConfigured,
 }
 
 /// Drives one dictation session end to end through the ports it is constructed with.
@@ -204,7 +242,14 @@ impl Pipeline {
 
         fsm.transition(SessionState::Cleaning)
             .expect("Transcribing->Cleaning is always valid here");
-        let final_text = if self.config.cleanup_enabled {
+        // Cleanup gate (`ARCHITECTURE.md` §3.2, D-0005): `Always`/`Never` are explicit
+        // overrides; `Auto` asks the skip-gate heuristic about the dictionary-passed text.
+        let wants_cleanup = match self.config.cleanup_mode {
+            CleanupMode::Always => true,
+            CleanupMode::Never => false,
+            CleanupMode::Auto => self.config.skip_gate.needs_cleanup(&dict_text),
+        };
+        let final_text = if wants_cleanup {
             match &self.cleanup {
                 Some(engine) => match engine.clean(&dict_text, cleanup_ctx) {
                     Ok(cleaned) => {
@@ -218,12 +263,19 @@ impl Pipeline {
                     }
                 },
                 None => {
-                    self.emit(PipelineEvent::CleanupSkipped);
+                    self.emit(PipelineEvent::CleanupSkipped {
+                        reason: CleanupSkipReason::NoEngineConfigured,
+                    });
                     dict_text
                 }
             }
         } else {
-            self.emit(PipelineEvent::CleanupSkipped);
+            let reason = match self.config.cleanup_mode {
+                CleanupMode::Never => CleanupSkipReason::ModeDisabled,
+                CleanupMode::Auto => CleanupSkipReason::GateClean,
+                CleanupMode::Always => unreachable!("Always always sets wants_cleanup = true"),
+            };
+            self.emit(PipelineEvent::CleanupSkipped { reason });
             dict_text
         };
 

@@ -81,6 +81,13 @@ Append-only. Newest at bottom. Absolute dates.
 - Gates: build / 31 fast + 6 real-model suites (cleanup guard, STT parity, VAD anti-hallucination ×2, e2e ×2) / clippy -D warnings / fmt — all green.
 - Open (tracked): Czech self-correction "ne vlastně X" still keeps the retracted value (2 cases) — prompt NOT frozen, needs targeted few-shot or rule pass; latency 3.11 s in debug build — re-measure in `--release` + cache the static prompt-prefix KV state before updating §3.4; silence llama.cpp stderr logging when `whisperd` lands.
 
+## 2026-07-10 — Phase 3: cleanup skip-gate heuristic (CleanupMode::Auto)
+- New `whisper-core/src/skip_gate.rs`: deterministic, dependency-free `needs_cleanup(&str)` heuristic — Czech-first self-correction markers ("ne vlastně", "pardon", "škrtni to", …), filler words ("ehm", "prostě", …), immediate word repetition ("to to"), long run-on with zero punctuation (>30 words). Whole-word/whole-phrase UTF-8-safe matching mirrors dictionary.rs boundary logic; gate is read-only. Implemented by sonnet-implementer, reviewed by Fable.
+- `PipelineConfig.cleanup_enabled` (bool stub) → `cleanup_mode: CleanupMode { Always, Never, Auto(default) }` + swappable `SkipGateConfig`; `PipelineEvent::CleanupSkipped` now carries `reason: CleanupSkipReason { ModeDisabled, GateClean, NoEngineConfigured }` for the future WS bridge.
+- Gates: 46 whisper-core tests (22 new skip-gate incl. false-positive traps prostěradlo/umyji/trojúhelník/opravář + 2 new Auto-mode pipeline integration tests) / clippy -D warnings / fmt / workspace check — all clean.
+- Noted: marker lists are a first pass — tune on the growing real-speech corpus (§3.2 deliverable); heuristic biases toward cleanup (false "needs cleanup" costs only latency, false "clean" costs quality).
+- Incident: a mid-task `git reset` in the shared tree wiped uncommitted work (redone + re-verified); concurrent-agent git hygiene tightened — commit reviewed work immediately.
+
 ## Debt register
 
 (empty)
