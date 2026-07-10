@@ -75,6 +75,12 @@ Append-only. Newest at bottom. Absolute dates.
 - Gates: build / 27 fast + 5 real-model tests / clippy -D warnings / fmt — all clean.
 - Noted: `ort` fetches its onnxruntime binary at build time (cached; no runtime network) — flagged in D-0008 for air-gapped builds; VadConfig defaults need tuning on a bigger real corpus; PlaceholderVad in whisper-platform is now redundant (cleanup later).
 
+## 2026-07-10 — Phase 3: llama.cpp cleanup adapter + D-0005 guard re-measured in-process
+- `LlamaCleanupEngine` in whisper-iface: llama-cpp-2 (Metal), official Qwen/Qwen3-8B-GGUF Q4_K_M (Apache-2.0, 5.03 GB, gitignored), model resident + fresh context per call, thinking disabled via prefilled empty `<think>` block, greedy, UTF-8-safe detokenization + NFC. Few-shot prompt (5 examples, disjoint from eval set): anti-paraphrase + self-correction rules, never-answer contract. Implemented by opus-implementer, reviewed by Fable (pipeline order dictionary→cleanup confirmed).
+- **D-0005 evidence-transfer guard PASSED in-process**: 13/13 cases — 0/4 trap failures (hard), 0 diacritics lost (hard), **avg WER 0.069 (vs 0.15 Ollama zero-shot)**; the round-1 semantic substitution class is gone (adapter correctly leaves "merknout" to the dictionary pass).
+- Gates: build / 31 fast + 6 real-model suites (cleanup guard, STT parity, VAD anti-hallucination ×2, e2e ×2) / clippy -D warnings / fmt — all green.
+- Open (tracked): Czech self-correction "ne vlastně X" still keeps the retracted value (2 cases) — prompt NOT frozen, needs targeted few-shot or rule pass; latency 3.11 s in debug build — re-measure in `--release` + cache the static prompt-prefix KV state before updating §3.4; silence llama.cpp stderr logging when `whisperd` lands.
+
 ## Debt register
 
 (empty)

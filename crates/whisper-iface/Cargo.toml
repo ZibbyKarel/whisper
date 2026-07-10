@@ -17,12 +17,20 @@ hound = "3.5"
 # Silero VAD (D-0008): bundles the Silero V5 ONNX model (MIT); ONNX inference via `ort`.
 # No network at runtime — the model is embedded in the crate.
 voice_activity_detector = "0.2"
-# Error type for the VAD adapter.
+# Error type for the VAD/cleanup adapters.
 thiserror = "2"
+# Production cleanup LLM adapter (D-0005): llama.cpp bindings, in-process. MIT-licensed;
+# builds llama.cpp from source (needs cmake + a C++ compiler). No daemon dependency (rules
+# out shelling out to llama-cli/-server). `default-features = false` drops `openmp` (a macOS
+# build-friction point; unneeded — Metal + Accelerate do the work on Apple Silicon); `metal`
+# is added in the macOS target block below.
+llama-cpp-2 = { version = "0.1", default-features = false, features = ["common"] }
 
 # whisper.cpp on Apple Silicon runs on Metal (D-0004).
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16", features = ["metal"] }
+# llama.cpp on Apple Silicon runs on Metal too (D-0005: qwen3:8b Q4_K_M resident).
+llama-cpp-2 = { version = "0.1", default-features = false, features = ["common", "metal"] }
 
 [dev-dependencies]
 # Enable the shared fixture adapters for the real-model integration tests.

@@ -6,9 +6,11 @@
 //! crate currently only proves the downward dependency on `whisper-core` compiles and is
 //! reachable.
 
+pub mod cleanup;
 pub mod stt;
 pub mod vad;
 
+pub use cleanup::LlamaCleanupEngine;
 pub use stt::{transcribe_file, WhisperCppEngine};
 pub use vad::{SileroVad, VadError};
 
