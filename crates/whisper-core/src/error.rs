@@ -17,8 +17,14 @@ pub enum AudioError {
 }
 
 /// Errors surfaced by an [`crate::ports::SttEngine`].
+///
+/// `ModelLoadFailed` is kept distinct from `Failed` because model-lifecycle failures are
+/// first-class in `ARCHITECTURE.md` §3.2 (`model.load_failed`): a missing/corrupt GGUF or
+/// OOM at load time is reported differently from a per-utterance decode failure.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SttError {
+    #[error("model load failed: {0}")]
+    ModelLoadFailed(String),
     #[error("transcription failed: {0}")]
     Failed(String),
 }

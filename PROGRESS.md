@@ -63,6 +63,12 @@ Append-only. Newest at bottom. Absolute dates.
 - Noted for later: per-VAD-segment decoding lands with the real Silero/whisper adapters; NFC normalization is the STT-adapter boundary's job (§3.3); token checked between stages, in-loop capture cancellation arrives with real mic stream.
 - Next: whisper-rs STT adapter + parity test vs whisper-cli (opus task).
 
+## 2026-07-10 — Phase 3: whisper.cpp STT adapter + parity vs whisper-cli
+- `WhisperCppEngine` in whisper-iface (whisper-rs 0.16 + Metal, model resident, NFC boundary per §3.3, `SttError::ModelLoadFailed` for D-0004/§3.2 semantics). Shared test adapters via whisper-core `test-support` feature. Implemented by opus-implementer, reviewed by Fable.
+- **Parity vs whisper-cli: 6/6 fixtures PASS** (4 byte-identical; cs-01/mix-02 differ by 1 benign token each — cross-build FP drift between brew whisper-cpp 1.9.1/BLAS and whisper-rs's bundled whisper.cpp/Metal; engine output on cs-01 actually closer to reference). Accepted tolerance: sim ≥ 0.95 OR ≤ 1 token diff.
+- Gates: build/test (23 fast + 3 real-model)/clippy -D warnings/fmt clean. Real-model tests are `#[ignore]`d (run via `cargo test -p whisper-iface -- --ignored`).
+- Watched: whisper-cli's true default is beam-5 (our benchmark numbers) vs adapter greedy (byte-identical on fixtures, faster) — re-check on a bigger real corpus.
+
 ## Debt register
 
 (empty)

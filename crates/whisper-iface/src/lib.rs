@@ -6,6 +6,10 @@
 //! crate currently only proves the downward dependency on `whisper-core` compiles and is
 //! reachable.
 
+pub mod stt;
+
+pub use stt::{transcribe_file, WhisperCppEngine};
+
 use whisper_core::pipeline::PipelineConfig;
 
 /// Placeholder for the future `/v1/health` handler.
