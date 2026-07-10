@@ -18,7 +18,7 @@ delivery = "paste"        # inject via pasteboard + Cmd-V (D-0007)
 
 [hotkey]
 enabled = true
-combo = "Ctrl+Alt+Space"  # default; push-to-talk
+combo = "Ctrl+Alt"        # default; push-to-talk; modifier-only so PTT leaks nothing printable
 mode = "push_to_talk"     # or "toggle"
 ```
 
@@ -50,7 +50,7 @@ The first mic/hotkey use will prompt if not pre-granted; grant, then restart `wh
 
 ## 2. Hotkey (push-to-talk and toggle)
 
-1. Push-to-talk: hold `Ctrl+Alt+Space`, speak, release → a session runs while held and the text is
+1. Push-to-talk: hold `Ctrl+Alt`, speak, release → a session runs while held and the text is
    pasted on release.
 2. Set `mode = "toggle"`, restart: press once to start, press again to stop.
 3. **Expect:** WS `session.started` / `delivered` events on `ws://localhost:8737/v1/events`.

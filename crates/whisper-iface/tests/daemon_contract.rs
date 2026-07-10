@@ -13,7 +13,7 @@ use whisper_iface::daemon::config::{AudioTuning, Config, HistoryConfig, VadTunin
 
 use support::{
     call, call_with_headers, fake_builder, fake_builder_with_cleanup, gate_builder, harness,
-    tiny_wav_b64, tiny_wav_bytes, CZECH_TEXT,
+    harness_with_config_path, tiny_wav_b64, tiny_wav_bytes, CZECH_TEXT,
 };
 
 fn cfg(mode: CleanupModeDto) -> Config {
@@ -316,6 +316,87 @@ async fn config_put_rejects_out_of_range_vad_threshold() {
     // The rejected edit did not mutate the live config (still the 0.35 default).
     let (_s, cbody) = call(&router, "GET", "/v1/config", None).await;
     assert_eq!(cbody["vad"]["threshold"], 0.35);
+}
+
+#[tokio::test]
+async fn config_put_creates_missing_parent_dir() {
+    // Real user hit: PUT /v1/config 500'd with "No such file or directory" because the config's
+    // parent directory (e.g. a fresh `~/Library/Application Support/whisper-engine/`) did not
+    // exist yet. The write must create it instead of failing.
+    let dir = std::env::temp_dir().join(format!(
+        "whisperd-config-put-{}-{}",
+        std::process::id(),
+        now_ns()
+    ));
+    let nested = dir.join("nested").join("config.toml");
+    assert!(!nested.parent().unwrap().exists());
+
+    let (_state, router) = harness_with_config_path(
+        cfg(CleanupModeDto::Auto),
+        fake_builder(),
+        Some(nested.clone()),
+        None,
+    );
+
+    let new = Config {
+        port: 0,
+        language: "en".to_string(),
+        ..Config::default()
+    };
+    let (status, body) = call(
+        &router,
+        "PUT",
+        "/v1/config",
+        Some(serde_json::to_value(&new).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(nested.exists(), "config file was not written");
+    let written = std::fs::read_to_string(&nested).unwrap();
+    assert!(written.contains("language = \"en\""));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn dictionary_put_creates_missing_parent_dir() {
+    // Same fix as config_put_creates_missing_parent_dir, but for the dictionary write path.
+    let dir = std::env::temp_dir().join(format!(
+        "whisperd-dict-put-{}-{}",
+        std::process::id(),
+        now_ns()
+    ));
+    let nested = dir.join("nested").join("dictionary.json");
+    assert!(!nested.parent().unwrap().exists());
+
+    let config = Config {
+        port: 0,
+        dictionary_path: Some(nested.clone()),
+        ..cfg(CleanupModeDto::Auto)
+    };
+    let (_state, router) = harness(config, fake_builder());
+
+    // Czech diacritics in the substitution pair (byte-exact UTF-8, §3.3).
+    let (status, body) = call(
+        &router,
+        "PUT",
+        "/v1/dictionary",
+        Some(json!({ "pairs": [{ "from": "kun", "to": "kůň" }] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(nested.exists(), "dictionary file was not written");
+    let written = std::fs::read_to_string(&nested).unwrap();
+    assert!(written.contains("kůň"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn now_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }
 
 #[tokio::test]

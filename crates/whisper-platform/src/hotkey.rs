@@ -79,11 +79,15 @@ impl HotkeyCombo {
 }
 
 impl Default for HotkeyCombo {
-    /// The default combination (`ARCHITECTURE.md` §5, D-0012): `Ctrl+Alt+Space` — three keys, no
-    /// clash with common single-modifier shortcuts, and reachable on any Mac keyboard (unlike
-    /// Fn/globe, which is out of rdev's scope, §8).
+    /// The default combination (`ARCHITECTURE.md` §5, D-0012): `Ctrl+Alt` — modifier-only. rdev
+    /// listens without suppressing events, so a combo containing a printable key (e.g. `Space`)
+    /// leaks that literal character into whatever text field has focus every time push-to-talk is
+    /// pressed (observed in real user testing). A modifier-only combo has no printable
+    /// representation, so nothing leaks; it's still two keys, so it does not clash with common
+    /// single-modifier shortcuts, and is reachable on any Mac keyboard (unlike Fn/globe, which is
+    /// out of rdev's scope, §8).
     fn default() -> Self {
-        Self::parse("Ctrl+Alt+Space").expect("valid default combo")
+        Self::parse("Ctrl+Alt").expect("valid default combo")
     }
 }
 
@@ -206,9 +210,15 @@ mod mac {
     /// Spawn a background thread running the rdev listener, feeding a [`ComboTracker`] and sending
     /// each [`HotkeyEvent`] to `tx`. Blocking (`rdev::listen` never returns until error); requires
     /// macOS Input Monitoring (TCC) — manual-only (D-0012). Returns the thread handle.
+    ///
+    /// If `rdev::listen` returns `Err` (most commonly a missing Input Monitoring grant), the
+    /// listener thread would otherwise die silently and the hotkey would just appear broken to the
+    /// user (observed in real user testing). `on_error` is called once with the debug-formatted
+    /// error (`rdev::ListenError` is `Debug`-only, not `Display`) so the caller can surface it.
     pub fn spawn_listener(
         combo: HotkeyCombo,
         tx: Sender<HotkeyEvent>,
+        on_error: Box<dyn FnOnce(String) + Send>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::Builder::new()
             .name("whisper-hotkey".to_string())
@@ -227,8 +237,10 @@ mod mac {
                     }
                 };
                 // Returns Err only if the listen loop cannot be established (e.g. missing Input
-                // Monitoring grant); nothing to do but exit the thread.
-                let _ = rdev::listen(callback);
+                // Monitoring grant); surface it instead of exiting silently.
+                if let Err(e) = rdev::listen(callback) {
+                    on_error(format!("{e:?}"));
+                }
             })
             .expect("spawn hotkey listener thread")
     }
@@ -315,10 +327,21 @@ mod tests {
     }
 
     #[test]
-    fn default_combo_is_ctrl_alt_space() {
+    fn default_combo_is_ctrl_alt() {
         let c = HotkeyCombo::default();
-        assert!(c.is_satisfied(&down(&["ctrl", "alt", "space"])));
-        assert!(!c.is_satisfied(&down(&["ctrl", "space"])));
+        assert!(c.is_satisfied(&down(&["ctrl", "alt"])));
+        assert!(!c.is_satisfied(&down(&["ctrl"])));
+        assert!(!c.is_satisfied(&down(&["alt"])));
+    }
+
+    #[test]
+    fn tracker_default_combo_ptt_edges() {
+        // Ctrl+Alt push-to-talk: partial press fires nothing, the second modifier completes the
+        // combo (Pressed), releasing either modifier breaks it (Released).
+        let mut t = ComboTracker::new(HotkeyCombo::default());
+        assert_eq!(t.on_key("ctrl", true), None);
+        assert_eq!(t.on_key("alt", true), Some(HotkeyEvent::Pressed));
+        assert_eq!(t.on_key("alt", false), Some(HotkeyEvent::Released));
     }
 
     #[test]

@@ -363,6 +363,13 @@ pub async fn put_config(
         let toml = cfg
             .to_toml_string()
             .map_err(|e| ApiErr::internal(format!("serialize config: {e}")))?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    ApiErr::internal(format!("create config dir {}: {e}", parent.display()))
+                })?;
+            }
+        }
         std::fs::write(path, toml)
             .map_err(|e| ApiErr::internal(format!("write config {}: {e}", path.display())))?;
     }
@@ -394,6 +401,13 @@ pub async fn put_dictionary(
     };
     if let Some(path) = path {
         let pretty = serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string());
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    ApiErr::internal(format!("create dictionary dir {}: {e}", parent.display()))
+                })?;
+            }
+        }
         std::fs::write(&path, pretty)
             .map_err(|e| ApiErr::internal(format!("write dictionary {}: {e}", path.display())))?;
     }

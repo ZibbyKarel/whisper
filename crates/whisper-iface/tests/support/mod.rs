@@ -308,7 +308,18 @@ pub fn harness_with_live(
     builder: EngineBuilder,
     live_source: Option<LiveSourceProvider>,
 ) -> (Arc<AppState>, Router) {
-    let state = build_state(config, None, builder, live_source).expect("build state");
+    harness_with_config_path(config, builder, None, live_source)
+}
+
+/// Like [`harness`] but with an explicit `config_path` — used to test `PUT /v1/config` persistence
+/// (e.g. that a missing parent directory is created rather than a 500).
+pub fn harness_with_config_path(
+    config: Config,
+    builder: EngineBuilder,
+    config_path: Option<std::path::PathBuf>,
+    live_source: Option<LiveSourceProvider>,
+) -> (Arc<AppState>, Router) {
+    let state = build_state(config, config_path, builder, live_source).expect("build state");
     // Wait for the worker thread to finish its (instant) model-load phase.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {

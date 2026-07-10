@@ -81,7 +81,8 @@ fn secure_input_query_runs() {
 fn hotkey_listener_reports_events() {
     let (tx, rx) = std::sync::mpsc::channel();
     let combo = whisper_platform::HotkeyCombo::parse("Ctrl+Alt+Space").unwrap();
-    let _listener = whisper_platform::spawn_listener(combo, tx);
+    let on_error = Box::new(|msg: String| panic!("rdev::listen failed to start: {msg}"));
+    let _listener = whisper_platform::spawn_listener(combo, tx, on_error);
     eprintln!("press Ctrl+Alt+Space a few times (grant Input Monitoring)…");
     for _ in 0..4 {
         match rx.recv_timeout(Duration::from_secs(30)) {

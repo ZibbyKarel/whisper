@@ -188,8 +188,27 @@ pub fn spawn_hotkey(
     };
 
     let (tx, rx) = std::sync::mpsc::channel::<HotkeyEvent>();
+    // If the rdev listen loop cannot start (most commonly a missing Input Monitoring TCC grant),
+    // whisper-platform would otherwise die silently and the hotkey would just appear broken to
+    // the user (observed in real user testing) — surface it on stderr and as a WS event so a UI
+    // shell can show it.
+    let err_state = state.clone();
+    let on_error: Box<dyn FnOnce(String) + Send> = Box::new(move |msg: String| {
+        eprintln!(
+            "whisperd: hotkey listener failed to start ({msg}). This usually means macOS \
+             Input Monitoring permission is missing — grant it in System Settings › Privacy \
+             & Security › Input Monitoring, then restart whisperd."
+        );
+        let _ = err_state.events.send(ApiEvent::PlatformPermission {
+            session_id: None,
+            permission: "input_monitoring".to_string(),
+            granted: false,
+            detail: Some(msg),
+            ts_ms: now_ms(),
+        });
+    });
     // The rdev listener runs on its own (detached) thread inside `whisper-platform`.
-    let _listener = spawn_listener(combo, tx);
+    let _listener = spawn_listener(combo, tx, on_error);
 
     let handle = std::thread::Builder::new()
         .name("whisperd-hotkey-driver".to_string())

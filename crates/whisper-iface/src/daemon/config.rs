@@ -82,15 +82,26 @@ pub enum HotkeyModeDto {
     Toggle,
 }
 
+/// The default combo is modifier-only (`Ctrl+Alt`, no `Space`): rdev listens without suppressing
+/// events, so a combo that includes a printable key like `Space` leaks a literal character into
+/// whatever text field has focus every time push-to-talk is pressed (a real user-testing hit).
+/// Modifier-only combos have no printable representation, so nothing leaks.
 fn default_hotkey_combo() -> String {
-    "Ctrl+Alt+Space".to_string()
+    "Ctrl+Alt".to_string()
+}
+
+fn default_hotkey_enabled() -> bool {
+    // The hotkey only exists in `--features platform` builds (headless builds ignore this
+    // field), and a dictation app whose hotkey is off by default fails the out-of-box test (a
+    // real user-testing hit: the daemon started but nothing happened on the documented combo).
+    true
 }
 
 /// Global hotkey configuration (`ARCHITECTURE.md` §5, D-0012). Effective only with the `platform`
 /// feature; the listener starts at daemon startup, so changes are staged for the next restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HotkeyConfig {
-    #[serde(default)]
+    #[serde(default = "default_hotkey_enabled")]
     pub enabled: bool,
     #[serde(default = "default_hotkey_combo")]
     pub combo: String,
@@ -101,7 +112,7 @@ pub struct HotkeyConfig {
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_hotkey_enabled(),
             combo: default_hotkey_combo(),
             mode: HotkeyModeDto::default(),
         }
@@ -364,8 +375,10 @@ mod tests {
     #[test]
     fn hotkey_defaults_and_parses() {
         let def = Config::default().hotkey;
-        assert!(!def.enabled);
-        assert_eq!(def.combo, "Ctrl+Alt+Space");
+        // Default is on (out-of-box the hotkey should just work) with a modifier-only combo (no
+        // Space) so push-to-talk never leaks a literal character into the focused field.
+        assert!(def.enabled);
+        assert_eq!(def.combo, "Ctrl+Alt");
         assert_eq!(def.mode, HotkeyModeDto::PushToTalk);
 
         let cfg = Config::from_toml_str(
