@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Package the local-first dictation engine as a drag-to-Applications macOS app +
+# DMG (D-0014). Builds whisperd (release, --features platform) and whisper-tray,
+# assembles Whisper.app with both binaries as siblings (so the tray's sibling
+# resolver finds whisperd), ad-hoc signs it, and wraps it in a UDZO DMG.
+#
+# Models are NOT bundled (6+ GB, D-0014). Pass --link-models to symlink the repo
+# models/ into the app-support dir and drop a starter config there (never
+# overwriting an existing one).
+#
+# Usage: scripts/package.sh [--link-models]
+set -euo pipefail
+
+export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DIST="$REPO/dist"
+APP="$DIST/Whisper.app"
+BUNDLE_ID="cz.zibby.whisper"
+MIN_MACOS="12.0"
+
+LINK_MODELS=0
+for arg in "$@"; do
+  case "$arg" in
+    --link-models) LINK_MODELS=1 ;;
+    -h|--help)
+      echo "Usage: scripts/package.sh [--link-models]"
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Workspace version drives CFBundleShortVersionString.
+VERSION="$(grep -m1 '^version' "$REPO/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+echo "==> Packaging Whisper $VERSION"
+
+# 1. Build release binaries.
+echo "==> Building whisperd (release, --features platform)"
+cargo build --release -p whisper-iface --features platform --bin whisperd
+echo "==> Building whisper-tray (release)"
+cargo build --release -p whisper-ux --bin whisper-tray
+
+WHISPERD="$REPO/target/release/whisperd"
+TRAY="$REPO/target/release/whisper-tray"
+[ -x "$WHISPERD" ] || { echo "missing $WHISPERD" >&2; exit 1; }
+[ -x "$TRAY" ] || { echo "missing $TRAY" >&2; exit 1; }
+
+# 2. Assemble the .app bundle.
+echo "==> Assembling $APP"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+# CFBundleExecutable = whisper-tray; whisperd is its sibling (Task-1 resolver).
+cp "$TRAY" "$APP/Contents/MacOS/whisper-tray"
+cp "$WHISPERD" "$APP/Contents/MacOS/whisperd"
+
+# Optional icon: use a pre-provided AppIcon.icns if present. Generating one from
+# scratch with only stock tools (sips/iconutil need a source raster we cannot
+# author deterministically without extra tooling) is skipped by design (D-0014).
+ICON_KEY=""
+if [ -f "$REPO/assets/AppIcon.icns" ]; then
+  cp "$REPO/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+  ICON_KEY="  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>"
+  echo "    icon: assets/AppIcon.icns"
+else
+  echo "    icon: none (drop assets/AppIcon.icns to embed one)"
+fi
+
+# Info.plist. LSUIElement=true → menu-bar-only (no Dock icon), matching the tray
+# app's ActivationPolicy::Accessory. NSMicrophoneUsageDescription is required for
+# the TCC mic prompt (the daemon captures audio inside the bundle).
+cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Whisper</string>
+  <key>CFBundleDisplayName</key>
+  <string>Whisper</string>
+  <key>CFBundleIdentifier</key>
+  <string>$BUNDLE_ID</string>
+  <key>CFBundleVersion</key>
+  <string>$VERSION</string>
+  <key>CFBundleShortVersionString</key>
+  <string>$VERSION</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleExecutable</key>
+  <string>whisper-tray</string>
+$ICON_KEY
+  <key>LSMinimumSystemVersion</key>
+  <string>$MIN_MACOS</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Voice dictation captures audio from your microphone.</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+
+# 3. Ad-hoc codesign (no Developer ID; Gatekeeper needs right-click → Open on
+# first launch — see docs/install.md).
+echo "==> Ad-hoc codesigning"
+codesign --force --deep --sign - "$APP"
+codesign -dv "$APP" 2>&1 | sed 's/^/    /' || true
+
+# 4. Build the DMG: a staging dir with the app + an /Applications symlink so the
+# mounted window offers the standard drag-to-install gesture.
+echo "==> Building DMG"
+DMG="$DIST/Whisper.dmg"
+STAGE="$(mktemp -d)"
+cp -R "$APP" "$STAGE/Whisper.app"
+ln -s /Applications "$STAGE/Applications"
+rm -f "$DMG"
+hdiutil create -volname "Whisper" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+rm -rf "$STAGE"
+
+# 5. Optional: link repo models into the app-support dir + starter config.
+if [ "$LINK_MODELS" -eq 1 ]; then
+  DATA="$HOME/Library/Application Support/whisper-engine"
+  echo "==> Linking models into $DATA"
+  mkdir -p "$DATA"
+  ln -sfn "$REPO/models" "$DATA/models"
+  CFG="$DATA/config.toml"
+  if [ ! -f "$CFG" ]; then
+    echo "    writing starter config $CFG"
+    cat > "$CFG" <<'TOML'
+# Starter config written by scripts/package.sh --link-models. Model paths are
+# relative to this app-support dir; whisperd rebases them at startup (Task 2).
+bind = "127.0.0.1"
+port = 8737
+language = "cs"
+delivery = "paste"
+
+[models]
+stt = "models/ggml-large-v3-turbo-q5_0.bin"
+cleanup = "models/Qwen3-8B-Q4_K_M.gguf"
+
+[hotkey]
+enabled = true
+combo = "Ctrl+Alt"
+mode = "push_to_talk"
+TOML
+  else
+    echo "    config exists — leaving it untouched"
+  fi
+fi
+
+echo
+echo "==> Done."
+echo "    app: $APP ($(du -sh "$APP" | cut -f1))"
+echo "    dmg: $DMG ($(du -sh "$DMG" | cut -f1))"
+echo "    First launch is Gatekeeper-blocked (ad-hoc signed): right-click → Open."

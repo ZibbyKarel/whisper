@@ -22,6 +22,7 @@ use tungstenite::Message;
 
 use whisper_ux::api::{ApiEvent, CleanupMode, Config, DeliveryMode, HotkeyMode, Incoming};
 use whisper_ux::client::{backoff_delay, events_ws_url, Api, ApiError, HttpClient};
+use whisper_ux::daemon_ctl::DaemonController;
 use whisper_ux::dict_editor::DictEditor;
 use whisper_ux::icons::{self, IconImage};
 use whisper_ux::onboarding::{self, OnboardingState};
@@ -90,6 +91,9 @@ pub struct ShellApp {
     client: HttpClient,
     base_url: String,
 
+    // --- daemon lifecycle (managed vs adopted) ---
+    daemon: DaemonController,
+
     // --- live state from WS ---
     rx: Receiver<WsMsg>,
     tray_state: TrayState,
@@ -132,6 +136,13 @@ impl ShellApp {
 
         let client = HttpClient::new(base_url.clone(), token.clone());
 
+        // Daemon lifecycle: if nothing answers /v1/health, spawn whisperd as a
+        // child (managed mode) so launching the app is enough; otherwise adopt the
+        // already-running daemon and never touch it (external mode). See
+        // `daemon_ctl` and D-0014.
+        let reachable = client.health().is_ok();
+        let daemon = DaemonController::start(reachable);
+
         // WS listener: reconnect forever with backoff, waking the UI on each frame.
         let (tx, rx) = mpsc::channel();
         let ws_url = events_ws_url(&base_url, token.as_deref());
@@ -162,6 +173,7 @@ impl ShellApp {
         let mut app = Self {
             client,
             base_url,
+            daemon,
             rx,
             tray_state: TrayState::Idle,
             connected: false,
@@ -312,6 +324,29 @@ impl ShellApp {
         }
     }
 
+    /// Restart the tray-managed daemon (SIGINT → wait → respawn). Only reachable
+    /// from the UI when [`DaemonController::is_managed`]; refuses otherwise.
+    fn restart_daemon(&mut self) {
+        match self.daemon.restart() {
+            Ok(()) => self.status_msg = Some("Restarting whisperd…".to_string()),
+            Err(e) => self.status_msg = Some(format!("restart: {e}")),
+        }
+    }
+
+    /// A "Restart whisperd" button, enabled only in managed mode; in external mode
+    /// it is disabled with an explanatory tooltip (the tray does not own that
+    /// daemon). Shared by the Status card and the staged-config notice.
+    fn ui_restart_button(&mut self, ui: &mut egui::Ui) {
+        if self.daemon.is_managed() {
+            if ui.button("Restart whisperd").clicked() {
+                self.restart_daemon();
+            }
+        } else {
+            ui.add_enabled(false, egui::Button::new("Restart whisperd"))
+                .on_disabled_hover_text("daemon not managed by this app");
+        }
+    }
+
     // -- WS + tray event draining ----------------------------------------
 
     fn drain_ws(&mut self) {
@@ -397,6 +432,9 @@ impl ShellApp {
                 self.section = Section::Status;
                 show_window(ctx);
             } else if ev.id == quit {
+                // process::exit skips Drop, so kill a managed daemon explicitly
+                // (external daemons are left running).
+                self.daemon.shutdown();
                 std::process::exit(0);
             }
         }
@@ -448,9 +486,12 @@ impl ShellApp {
     /// The persistent "restart to apply" notice (feedback item 2): stays
     /// visible on every section, not just the one that triggered the save,
     /// until the next save clears it.
-    fn ui_staged_notice(&self, ui: &mut egui::Ui) {
+    fn ui_staged_notice(&mut self, ui: &mut egui::Ui) {
         if let Some(notice) = self.save_report.staged_notice() {
-            ui.colored_label(egui::Color32::from_rgb(0xF2, 0x9D, 0x1C), notice);
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::from_rgb(0xF2, 0x9D, 0x1C), notice);
+                self.ui_restart_button(ui);
+            });
             ui.add_space(4.0);
         }
         if let Some(applied) = self.save_report.applied_summary() {
@@ -480,14 +521,35 @@ impl ShellApp {
             ui.label("Input level");
             level_meter(ui, self.last_rms, self.last_peak, 260.0);
             ui.add_space(6.0);
-            let label = if self.active_session.is_some() {
-                "Stop dictation"
+            ui.horizontal(|ui| {
+                let label = if self.active_session.is_some() {
+                    "Stop dictation"
+                } else {
+                    "Start dictation"
+                };
+                if ui.button(label).clicked() {
+                    self.toggle_dictation();
+                }
+                self.ui_restart_button(ui);
+            });
+            ui.add_space(6.0);
+            let mode = if self.daemon.is_managed() {
+                "managed by this app"
+            } else if self.daemon.is_external() {
+                "external (started elsewhere)"
             } else {
-                "Start dictation"
+                "not running"
             };
-            if ui.button(label).clicked() {
-                self.toggle_dictation();
-            }
+            ui.label(
+                egui::RichText::new(format!("Process: {mode}"))
+                    .weak()
+                    .small(),
+            );
+            ui.label(
+                egui::RichText::new(format!("Log: {}", self.daemon.log_path().display()))
+                    .weak()
+                    .small(),
+            );
         });
         ui.add_space(8.0);
         theme::card_frame().show(ui, |ui| {

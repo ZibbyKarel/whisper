@@ -6,5 +6,7 @@ __pycache__/
 .DS_Store
 graphify-out/
 target/
+# packaged app + DMG (scripts/package.sh output, D-0014)
+dist/
 # local daemon config (user-specific; example lives in docs/phase5-manual-verification.md)
 /config.toml

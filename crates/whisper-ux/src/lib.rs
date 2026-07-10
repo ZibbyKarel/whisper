@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod client;
+pub mod daemon_ctl;
 pub mod dict_editor;
 pub mod icons;
 pub mod onboarding;

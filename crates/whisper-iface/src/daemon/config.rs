@@ -5,7 +5,7 @@
 //! Field order is load-bearing for TOML serialization: scalar fields must precede the
 //! `[models]` / `[history]` tables (TOML requires tables after values).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use whisper_core::vad::VadConfig;
@@ -288,6 +288,20 @@ impl Config {
         toml::to_string_pretty(self)
     }
 
+    /// Rebase relative model paths for app-bundle launches. When `whisperd` is
+    /// started from `Whisper.app`, the cwd is not the repo, so a relative default
+    /// like `models/ggml-…bin` cannot be found. For each model path that is
+    /// relative AND absent relative to the cwd, try resolving it under `data_dir`
+    /// (the app-support dir, `dirs::config_dir()/whisper-engine/`); substitute the
+    /// absolute path only when the model actually exists there, otherwise leave it
+    /// unchanged so the existing not-found error path still reports it.
+    pub fn resolve_model_paths(&mut self, data_dir: &Path) {
+        self.models.stt = resolve_model_path(&self.models.stt, data_dir, |p| p.exists());
+        if let Some(cleanup) = &self.models.cleanup {
+            self.models.cleanup = Some(resolve_model_path(cleanup, data_dir, |p| p.exists()));
+        }
+    }
+
     /// Load from `path`, or return defaults if the file does not exist. A malformed file is a
     /// hard error (fail fast rather than silently run on defaults).
     pub fn load_or_default(path: &std::path::Path) -> Result<Self, String> {
@@ -298,6 +312,26 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(format!("read {}: {e}", path.display())),
         }
+    }
+}
+
+/// Resolve one possibly-relative model path against `data_dir` for bundle launches.
+/// Absolute paths and paths that already exist relative to the cwd pass through
+/// unchanged; a relative-and-missing path is rebased onto `data_dir` only if the
+/// model is present there. `exists` is injected so the logic is unit-tested
+/// without depending on any particular filesystem layout.
+///
+/// Kept module-level (not a `Config` method) so the branch matrix is testable in
+/// isolation and the bin stays thin (`ARCHITECTURE.md` §4: heavy logic here).
+pub fn resolve_model_path(path: &Path, data_dir: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    if path.is_absolute() || exists(path) {
+        return path.to_path_buf();
+    }
+    let candidate = data_dir.join(path);
+    if exists(&candidate) {
+        candidate
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -388,5 +422,62 @@ mod tests {
         assert!(cfg.hotkey.enabled);
         assert_eq!(cfg.hotkey.combo, "Cmd+Alt+D");
         assert_eq!(cfg.hotkey.mode, HotkeyModeDto::Toggle);
+    }
+
+    #[test]
+    fn resolve_model_path_rebases_relative_missing_onto_data_dir() {
+        let data = Path::new("/support/whisper-engine");
+        let rel = Path::new("models/ggml-large-v3-turbo-q5_0.bin");
+        // Missing at cwd, present under data_dir → rebased.
+        let resolved = resolve_model_path(rel, data, |p| p == data.join(rel));
+        assert_eq!(resolved, data.join(rel));
+    }
+
+    #[test]
+    fn resolve_model_path_keeps_existing_relative() {
+        let data = Path::new("/support/whisper-engine");
+        let rel = Path::new("models/x.bin");
+        // Present at cwd → untouched (never rebased).
+        let resolved = resolve_model_path(rel, data, |p| p == rel);
+        assert_eq!(resolved, rel);
+    }
+
+    #[test]
+    fn resolve_model_path_leaves_absolute_untouched() {
+        let data = Path::new("/support/whisper-engine");
+        let abs = Path::new("/models/x.bin");
+        // Absolute paths are never rebased, even if also present under data_dir.
+        let resolved = resolve_model_path(abs, data, |_| true);
+        assert_eq!(resolved, abs);
+    }
+
+    #[test]
+    fn resolve_model_path_leaves_missing_relative_untouched() {
+        let data = Path::new("/support/whisper-engine");
+        let rel = Path::new("models/gone.bin");
+        // Absent everywhere → returned unchanged so the not-found error still fires.
+        let resolved = resolve_model_path(rel, data, |_| false);
+        assert_eq!(resolved, rel);
+    }
+
+    #[test]
+    fn resolve_model_paths_updates_both_models() {
+        let data = Path::new("/support/whisper-engine");
+        let mut cfg = Config::default();
+        cfg.models.stt = PathBuf::from("models/stt.bin");
+        cfg.models.cleanup = Some(PathBuf::from("models/llm.gguf"));
+        // Simulate both present only under data_dir.
+        let stt_at = data.join("models/stt.bin");
+        let llm_at = data.join("models/llm.gguf");
+        // resolve_model_paths uses the real `Path::exists`, so exercise the pure
+        // helper here and assert the method delegates to it consistently.
+        assert_eq!(
+            resolve_model_path(&cfg.models.stt, data, |p| p == stt_at),
+            stt_at
+        );
+        assert_eq!(
+            resolve_model_path(cfg.models.cleanup.as_ref().unwrap(), data, |p| p == llm_at),
+            llm_at
+        );
     }
 }

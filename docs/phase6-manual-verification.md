@@ -129,12 +129,46 @@ Drive the daemon over HTTP or the hotkey and watch the icon color:
    (does not quit); the tray icon remains. Re-open via **Settings…**.
 2. **Quit** from the tray menu terminates the process (the tray icon disappears).
 
+## 9. Packaged app + managed daemon (D-0014)
+
+Covers the `Whisper.app`/DMG path and the tray-owned daemon lifecycle. The
+GUI-free logic (binary resolution order, spawn/SIGINT/SIGKILL, model-path
+rebasing) is unit-tested; this checklist covers the bundle + live process seams.
+Full end-user steps live in `docs/install.md`.
+
+1. **Build:** `scripts/package.sh` → `dist/Whisper.app` and `dist/Whisper.dmg`
+   exist; `codesign -dv dist/Whisper.app` reports `Signature=adhoc`,
+   `Identifier=cz.zibby.whisper`. (Do **not** launch it from CI — TCC/GUI.)
+2. **Install:** open the DMG → drag `Whisper.app` to `Applications`.
+3. **First launch (Gatekeeper):** right-click → Open (ad-hoc, un-notarized).
+   A normal double-click is expected to be blocked the first time.
+4. **Managed mode:** with no `whisperd` already running, launch the app. Expect
+   the menu-bar icon to appear and, after model load, go idle — the tray spawned
+   `whisperd` itself. Status section shows **Process: managed by this app** and
+   the **Log:** path (`~/Library/Logs/whisper-engine/whisperd.log`, which should
+   be growing). **Restart whisperd** is enabled; clicking it SIGINTs and respawns
+   the engine (icon briefly reconnects).
+5. **External mode:** quit the app, start `whisperd` manually in a terminal, then
+   launch the app. Expect **Process: external (started elsewhere)** and the
+   **Restart whisperd** button **disabled** with tooltip "daemon not managed by
+   this app". Quitting the app must **not** kill the terminal's daemon.
+6. **Quit teardown (managed):** in managed mode, choose **Quit** from the tray.
+   Expect the spawned `whisperd` to exit (SIGINT; SIGKILL only if it ignores it);
+   confirm with `pgrep -f whisperd` returning nothing.
+7. **Model-path rebasing:** with models under
+   `~/Library/Application Support/whisper-engine/models/` and a config using
+   relative paths (`models/…bin`), the bundle-launched engine loads them despite
+   the non-repo cwd. A missing model still surfaces the normal not-found error in
+   the log.
+
 ## Automated coverage (run in CI, no GUI)
 
 ```bash
-cargo test -p whisper-ux            # 39 tests: parsing, state machine, client, icons, onboarding, dict
+cargo test -p whisper-ux            # parsing, state machine, client, icons, onboarding, dict,
+                                    # daemon_ctl (binary resolution + spawn/SIGINT/SIGKILL)
 cargo clippy -p whisper-ux --all-targets -- -D warnings
 cargo build -p whisper-ux --bin whisper-tray   # the tray binary links
+bash -n scripts/run.sh              # dev-launcher syntax check
 ```
 
 ## Known limits (see the implementation report)

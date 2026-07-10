@@ -33,6 +33,13 @@ async fn run() -> Result<(), String> {
         config.port = port;
     }
 
+    // App-bundle launches run with a cwd that is not the repo, so rebase relative
+    // model paths onto the app-support data dir when the model lives there (Task 2,
+    // D-0014). No-op for absolute paths or models already found relative to cwd.
+    if let Some(base) = dirs::config_dir() {
+        config.resolve_model_paths(&base.join("whisper-engine"));
+    }
+
     let stt = config.models.stt.clone();
     let cleanup = config.models.cleanup.clone();
 
