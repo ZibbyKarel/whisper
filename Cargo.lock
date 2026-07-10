@@ -5190,6 +5190,7 @@ dependencies = [
  "eframe",
  "egui",
  "libc",
+ "png",
  "serde",
  "serde_json",
  "tray-icon",

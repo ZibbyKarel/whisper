@@ -26,7 +26,9 @@ use whisper_ux::daemon_ctl::DaemonController;
 use whisper_ux::dict_editor::DictEditor;
 use whisper_ux::icons::{self, IconImage};
 use whisper_ux::onboarding::{self, OnboardingState};
+use whisper_ux::overlay::{self, Overlay, OverlayPhase};
 use whisper_ux::save_report::SaveReport;
+use whisper_ux::shell_settings::{self, OverlayPosition, ShellSettings};
 use whisper_ux::theme::{self, status_pill::PillState};
 use whisper_ux::tray_state::{TrayInput, TrayState};
 use whisper_ux::validation;
@@ -114,6 +116,16 @@ pub struct ShellApp {
     onboarding: OnboardingState,
     onboarding_path: Option<PathBuf>,
 
+    // --- floating overlay (shell-local, D-0013) ---
+    shell_settings: ShellSettings,
+    shell_settings_path: Option<PathBuf>,
+    overlay: Overlay,
+    /// Latch so a post-capture `Processing` state keeps the overlay up only if a
+    /// `Recording` session actually preceded it (not on startup model-loading).
+    overlay_active: bool,
+    /// Session start, for the overlay's mm:ss timer.
+    session_start: Option<std::time::Instant>,
+
     // --- settings working copy ---
     cfg: Option<Config>,
     // `Option<String>` config fields need a free-typing text buffer that only
@@ -164,6 +176,12 @@ impl ShellApp {
             .as_ref()
             .map(|p| OnboardingState::load(p))
             .unwrap_or_default();
+
+        let shell_settings_path = shell_settings::default_shell_settings_path();
+        let shell_settings = shell_settings_path
+            .as_ref()
+            .map(|p| ShellSettings::load(p))
+            .unwrap_or_default();
         let screen = if onboarding.completed {
             Screen::App
         } else {
@@ -188,6 +206,11 @@ impl ShellApp {
             section: Section::Status,
             onboarding,
             onboarding_path,
+            shell_settings,
+            shell_settings_path,
+            overlay: Overlay::new(),
+            overlay_active: false,
+            session_start: None,
             cfg: None,
             token_input: String::new(),
             dictionary_path_input: String::new(),
@@ -390,10 +413,13 @@ impl ShellApp {
             ApiEvent::SessionStarted { session_id, .. } => {
                 self.active_session = Some(session_id.clone());
                 self.last_partial.clear();
+                self.overlay.reset();
+                self.session_start = Some(std::time::Instant::now());
             }
             ApiEvent::AudioLevel { rms, peak, .. } => {
                 self.last_rms = *rms;
                 self.last_peak = *peak;
+                self.overlay.push_level(*rms, *peak);
             }
             ApiEvent::PartialTranscript { segment_text, .. } => {
                 self.last_partial = segment_text.clone();
@@ -402,12 +428,14 @@ impl ShellApp {
                 self.active_session = None;
                 self.last_rms = 0.0;
                 self.last_peak = 0.0;
+                self.session_start = None;
                 self.test_dictation_text = text.clone();
             }
             ApiEvent::Cancelled { .. } | ApiEvent::Failed { .. } => {
                 self.active_session = None;
                 self.last_rms = 0.0;
                 self.last_peak = 0.0;
+                self.session_start = None;
             }
             _ => {}
         }
@@ -460,6 +488,93 @@ impl ShellApp {
         if let Some(p) = &self.onboarding_path {
             let _ = self.onboarding.save(p);
         }
+    }
+
+    fn persist_shell_settings(&self) {
+        if let Some(p) = &self.shell_settings_path {
+            let _ = self.shell_settings.save(p);
+        }
+    }
+
+    /// Drive the floating overlay viewport (D-0013). Visibility follows the tray
+    /// state machine: shown while `Recording` (live waveform), kept during the
+    /// post-capture `Processing` tail (frozen/dimmed + "…"), hidden on
+    /// `Idle`/`Error`. Hotkey sessions arrive via WS `session_started` like any
+    /// other, so they light the overlay for free.
+    ///
+    /// Uses an *immediate* second viewport: state (the ring + eased bars) lives
+    /// in `self.overlay` and is borrowed directly by the render closure, which a
+    /// deferred viewport's `Send + Sync + 'static` bound would forbid without an
+    /// `Arc<Mutex<_>>`. The overlay is small, so the immediate viewport's shared
+    /// parent/child repaint cost is negligible, and it only repaints while
+    /// visible.
+    fn show_overlay(&mut self, ctx: &egui::Context) {
+        if !self.shell_settings.overlay_enabled {
+            self.overlay_active = false;
+            return;
+        }
+        let phase = match self.tray_state {
+            TrayState::Recording => {
+                self.overlay_active = true;
+                OverlayPhase::Recording
+            }
+            TrayState::Processing if self.overlay_active => OverlayPhase::Processing,
+            _ => {
+                // Not rendering this frame closes the viewport (hide on idle/error).
+                self.overlay_active = false;
+                return;
+            }
+        };
+
+        // Recompute placement each show so a monitor/resolution change is picked
+        // up; fall back to a sane size when the platform reports none.
+        let monitor = ctx
+            .input(|i| i.viewport().monitor_size)
+            .unwrap_or(overlay::FALLBACK_MONITOR);
+        let pos = overlay::overlay_rect(
+            monitor,
+            overlay::OVERLAY_SIZE,
+            self.shell_settings.overlay_position,
+        );
+
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Whisper overlay")
+            .with_inner_size(overlay::OVERLAY_SIZE)
+            .with_min_inner_size(egui::vec2(280.0, 64.0))
+            .with_position(pos)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(false)
+            .with_always_on_top()
+            // Request the OS not to focus the overlay on show, and let clicks
+            // fall through to whatever the user is typing in. Honoring of both is
+            // platform-dependent (see the manual-verification note).
+            .with_active(false)
+            .with_mouse_passthrough(true);
+
+        let t = ctx.input(|i| i.time) as f32;
+        let elapsed = self.session_start.map_or(0, |s| s.elapsed().as_secs());
+        let overlay_state = &mut self.overlay;
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("whisper-overlay"),
+            builder,
+            move |vctx, class| {
+                // A backend without multi-viewport support would embed this in a
+                // window inside the settings viewport; that can't be a borderless
+                // floating capsule, so skip rendering rather than draw it wrong.
+                if class == egui::ViewportClass::EmbeddedWindow {
+                    return;
+                }
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(vctx, |ui| {
+                        overlay_state.paint(ui, phase, t, elapsed);
+                    });
+                // Animate at ~60 fps, but only while the overlay is on screen.
+                vctx.request_repaint_after(std::time::Duration::from_millis(16));
+            },
+        );
     }
 
     fn pill_state(&self) -> PillState {
@@ -596,6 +711,51 @@ impl ShellApp {
                     "Paste into focused app",
                 );
             });
+        });
+        ui.add_space(8.0);
+        self.ui_overlay_card(ui);
+    }
+
+    /// "Floating overlay" card: enable toggle + Top/Bottom edge. Persisted to the
+    /// shell-local settings file immediately on change (not daemon `/v1` config).
+    fn ui_overlay_card(&mut self, ui: &mut egui::Ui) {
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Floating overlay");
+            let mut changed = false;
+            let mut enabled = self.shell_settings.overlay_enabled;
+            if ui
+                .horizontal(|ui| {
+                    let r = toggle_switch(ui, &mut enabled);
+                    ui.label("Show waveform while dictating");
+                    r.changed()
+                })
+                .inner
+            {
+                self.shell_settings.overlay_enabled = enabled;
+                changed = true;
+            }
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Position");
+                let mut pos = self.shell_settings.overlay_position;
+                changed |= ui
+                    .selectable_value(&mut pos, OverlayPosition::Top, "Top")
+                    .clicked();
+                changed |= ui
+                    .selectable_value(&mut pos, OverlayPosition::Bottom, "Bottom")
+                    .clicked();
+                self.shell_settings.overlay_position = pos;
+            });
+            ui.label(
+                egui::RichText::new("Always centered horizontally. Applies to the next session.")
+                    .weak()
+                    .small(),
+            );
+
+            if changed {
+                self.persist_shell_settings();
+            }
         });
     }
 
@@ -958,6 +1118,11 @@ impl eframe::App for ShellApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Drive the floating overlay viewport before the main window UI (it is a
+        // sibling viewport, not nested in these panels).
+        let ctx = ui.ctx().clone();
+        self.show_overlay(&ctx);
+
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Whisper");

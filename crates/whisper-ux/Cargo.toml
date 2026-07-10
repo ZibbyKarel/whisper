@@ -17,6 +17,13 @@ path = "src/lib.rs"
 name = "whisper-tray"
 path = "src/main.rs"
 
+# Dev tool: renders assets/AppIcon.icns's source PNGs programmatically (no
+# external art). Not shipped; run on demand via `cargo run -p whisper-ux
+# --bin gen_app_icon`. See src/bin/gen_app_icon.rs.
+[[bin]]
+name = "gen_app_icon"
+path = "src/bin/gen_app_icon.rs"
+
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -25,6 +32,9 @@ ureq = { version = "3.3.0", features = ["json"] }
 # drop the TLS default features — no wss:// on loopback.
 tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
 dirs = "6.0.0"
+# PNG encoding for gen_app_icon (MIT/Apache-2.0, local/offline). Only used by
+# that dev-tool binary; small enough to keep as a regular dependency.
+png = "0.18.1"
 
 # GUI stack (D-0013). tray-icon = NSStatusItem; eframe/egui = settings+onboarding
 # window; winit is eframe's event-loop backend, pinned here only for the macOS
