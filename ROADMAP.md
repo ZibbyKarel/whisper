@@ -2,12 +2,12 @@
 
 Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-first, built as an embeddable platform component.
 
-**Current position: Phase 1 (research) effectively complete — `docs/RESEARCH.md` + STT rounds 1–2 (ITN-aware; default large-v3-turbo q5_0, Parakeet = low-latency profile) + LLM cleanup round 1 (default qwen3:8b). Sole remaining gate: real-microphone Czech validation (needs user recordings) before the Phase-2 model ADRs.**
+**Current position: Phase 1 ✅ complete (2026-07-10) — RESEARCH.md, STT rounds 1–2 + real-mic validation (default large-v3-turbo q5_0 confirmed), LLM cleanup round 1 (default qwen3:8b), VAD silence-trimming = measured hard requirement. Phase 2 (architecture) starting.**
 
 ## Phase 0 — Environment & tooling bootstrap ✅ (2026-07-10)
 - Capability audit (`docs/CAPABILITY_AUDIT.md`), local skills, subagents, runtimes, memory files, verification gate.
 
-## Phase 1 — Research 🔜
+## Phase 1 — Research ✅ (2026-07-10)
 - Wispr Flow product/UX/pipeline analysis
 - Local STT comparison with Czech focus (whisper.cpp large-v3, faster-whisper, alternatives) — measured on Czech fixtures
 - Local LLM comparison for Czech text cleanup (Qwen, Gemma, Mistral tiers on 24 GB budget)

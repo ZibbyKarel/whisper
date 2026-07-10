@@ -45,6 +45,12 @@ Append-only. Newest at bottom. Absolute dates.
 - Verdict: mikr beats turbo modestly but not stock large-v3, loses whisper's number ITN, no speed win → only a niche "best code-switching" profile (mix 0.22). **Parakeet ties best Czech at ~10× speed** (~0.15 s/clip) with correct ITN, but worst code-switching (mix 0.38) blocks it as default. **Default stays large-v3-turbo q5_0**; Parakeet = low-latency profile candidate.
 - RESEARCH.md §3 shortlist updated accordingly. Phase 1 automatable work done; real-mic Czech validation (user recordings) is the remaining gate before the model ADR.
 
+## 2026-07-10 — Phase 1: real-microphone validation → gate PASSED, Phase 1 closed
+- User recorded `dev-diktat.m4a` (31.7 s spontaneous Czech dev dictation, heavy code-switching); converted to `fixtures/audio/real/dev-diktat.wav`; all 4 STT candidates run. Write-up `docs/stt-real-validation.md`.
+- **large-v3-turbo q5_0 confirmed default** (near-perfect, diacritics intact; residual errors = custom-vocab class). mikr fine-tune regressed on real speech ("refakturovat", "jason payload") → out of default consideration. Parakeet collapsed on real code-switching incl. a negation inversion → monolingual low-latency option only.
+- **Measured hallucination finding:** all whisper models appended "Titulky vytvořil JohnyX." on 3 s of trailing silence; trimming silence removes it → VAD silence-trimming before STT is a hard Phase-2/3 requirement. Parakeet did not hallucinate.
+- Phase 1 complete. Next: Phase 2 architecture (ARCHITECTURE.md + ADRs; model ADR now unblocked).
+
 ## Debt register
 
 (empty)

@@ -26,11 +26,12 @@ See PROGRESS.md 2026-07-10 entries. Key artifacts:
   trap cases (dictated questions/commands must be transcribed, never answered).
 
 ## Unfinished / next steps
-1. Real-microphone Czech validation of the STT finalist (blocks the model ADR). Needs the
-   user: a few sentences of real Czech dictation recorded on the target machine.
+1. ~~Real-mic validation~~ DONE (`docs/stt-real-validation.md`): gate passed,
+   large-v3-turbo q5_0 confirmed default; VAD silence-trimming = measured hard
+   requirement (whisper hallucinates "Titulky vytvořil JohnyX." on trailing silence).
 2. Round 2 of the LLM cleanup eval belongs to Phase 2 (engineered prompt: few-shot
    self-correction + anti-paraphrase; try qwen3:4b; cleanup-skip gate).
-3. Then Phase 2 architecture: ARCHITECTURE.md full design + ADRs (STT model, LLM model,
+3. Phase 2 architecture (STARTING): ARCHITECTURE.md full design + ADRs (STT model, LLM model,
    stack language, insertion method — RESEARCH.md has the evidence base).
 
 ## Known issues / assumptions
