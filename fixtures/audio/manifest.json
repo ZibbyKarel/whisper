@@ -11,7 +11,10 @@
       "file": "cs-02.wav",
       "lang": "cs",
       "voice": "Zuzana",
-      "reference": "Dobrý den, chtěl bych objednat dvě stě třicet sedm kusů zboží a doručit je do Ústí nad Labem příští středu."
+      "reference": "Dobrý den, chtěl bych objednat dvě stě třicet sedm kusů zboží a doručit je do Ústí nad Labem příští středu.",
+      "accepted_references": [
+        "Dobrý den, chtěl bych objednat 237 kusů zboží a doručit je do Ústí nad Labem příští středu."
+      ]
     },
     {
       "file": "cs-03.wav",

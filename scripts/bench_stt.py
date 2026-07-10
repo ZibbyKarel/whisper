@@ -51,6 +51,22 @@ def cer(ref: str, hyp: str) -> float:
     return edit_distance(r, h) / max(len(r), 1)
 
 
+def score_fixture(fx: dict, hyp: str) -> dict:
+    """Score hyp against the primary reference and any accepted_references
+    (alternative acceptable renderings, e.g. ITN digit-forms of spoken
+    numbers). Returns the minimum-WER match, so correct ITN isn't counted
+    as an error, plus which reference it matched.
+    """
+    candidates = [("primary", fx["reference"])]
+    candidates += [("itn", r) for r in fx.get("accepted_references", [])]
+    scored_against, best_ref = min(candidates, key=lambda c: wer(c[1], hyp))
+    return {
+        "wer": round(wer(best_ref, hyp), 3),
+        "cer": round(cer(best_ref, hyp), 3),
+        "scored_against": scored_against,
+    }
+
+
 def transcribe(model: Path, wav: Path, lang: str) -> tuple[str, float]:
     # Mixed-language fixtures use Czech as primary language (code-switching case).
     lang_arg = "cs" if lang.startswith("cs") else "en"
@@ -73,18 +89,21 @@ def main():
         for fx in manifest:
             wav = FIXTURES / fx["file"]
             hyp, dt = transcribe(model, wav, fx["lang"])
+            score = score_fixture(fx, hyp)
             row = {
                 "model": model.name,
                 "fixture": fx["file"],
                 "lang": fx["lang"],
                 "reference": fx["reference"],
                 "hypothesis": hyp,
-                "wer": round(wer(fx["reference"], hyp), 3),
-                "cer": round(cer(fx["reference"], hyp), 3),
+                "wer": score["wer"],
+                "cer": score["cer"],
+                "scored_against": score["scored_against"],
                 "seconds": round(dt, 2),
             }
             results.append(row)
-            print(f"{model.name:34s} {fx['file']:12s} WER={row['wer']:.2f} CER={row['cer']:.2f} {dt:5.1f}s")
+            print(f"{model.name:34s} {fx['file']:12s} WER={row['wer']:.2f} CER={row['cer']:.2f} "
+                  f"[{row['scored_against']}] {dt:5.1f}s")
     OUT.write_text(json.dumps(results, ensure_ascii=False, indent=2))
     print(f"\nwrote {OUT}")
 

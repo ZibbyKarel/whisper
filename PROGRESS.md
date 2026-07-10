@@ -35,6 +35,10 @@ Append-only. Newest at bottom. Absolute dates.
 - Every claim tagged MEASURED / VERIFIED / PLAUSIBLE / SNIPPET; verification debt and unresearched topics (Superwhisper, Vosk, code-switching mechanics) listed in §6.
 - Phase 1 remaining: run LLM cleanup benchmark, benchmark mikr fine-tune + Parakeet on our fixtures, real-mic Czech validation, ITN-aware scoring.
 
+## 2026-07-10 — Phase 1: ITN-aware STT scoring
+- `scripts/bench_stt.py` now scores against the primary reference plus optional `accepted_references` (manifest) and reports the min-WER match (`scored_against: primary|itn`); cs-02 gained the digit-form alternative. Implemented by sonnet-implementer, reviewed by Fable.
+- Re-ran all 4 whisper models: ITN-aware cs WER — large-v3 0.11 (was 0.18), large-v3-turbo 0.17 (was 0.23), medium 0.28, small 0.32. cs-02 is now 0.00 for large/turbo/medium; ranking unchanged, large-v3-turbo stays the provisional default. Docs updated (`docs/stt-benchmark.{md,json}`).
+
 ## Debt register
 
 (empty)
