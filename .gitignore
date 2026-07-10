@@ -5,4 +5,5 @@ __pycache__/
 *.log
 .DS_Store
 graphify-out/
-target/
+target/# local daemon config (user-specific; example lives in docs/phase5-manual-verification.md)
+/config.toml

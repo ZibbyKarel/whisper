@@ -1,0 +1,35 @@
+[package]
+name = "whisper-ux"
+description = "Wispr Flow-style tray/settings UX shell. Talks ONLY to the whisperd /v1 API (HTTP+WS); no engine/platform deps. See D-0013, ARCHITECTURE.md §4."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Split lib/bin so the pure logic (api mirror, client seam, tray state machine,
+# icon raster, onboarding persistence, dictionary editor) is unit-testable with
+# `cargo test -p whisper-ux` without ever launching the GUI or the event loop.
+[lib]
+name = "whisper_ux"
+path = "src/lib.rs"
+
+[[bin]]
+name = "whisper-tray"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+ureq = { version = "3.3.0", features = ["json"] }
+# Localhost ws:// only: keep the `handshake` feature (needed for `connect`) but
+# drop the TLS default features — no wss:// on loopback.
+tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
+dirs = "6.0.0"
+
+# GUI stack (D-0013). tray-icon = NSStatusItem; eframe/egui = settings+onboarding
+# window; winit is eframe's event-loop backend, pinned here only for the macOS
+# ActivationPolicy::Accessory hook (dockless menu-bar app).
+tray-icon = "0.24.1"
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.35.0"
+winit = "0.30.13"

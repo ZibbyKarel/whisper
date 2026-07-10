@@ -5,6 +5,7 @@ members = [
     "crates/whisper-iface",
     "crates/whisper-platform",
     "crates/whisper-cli",
+    "crates/whisper-ux",
 ]
 
 [workspace.package]
