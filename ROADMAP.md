@@ -2,7 +2,7 @@
 
 Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-first, built as an embeddable platform component.
 
-**Current position: Phase 0 complete → starting Phase 1.**
+**Current position: Phase 1 (research) in progress — STT benchmark round 1 done; Wispr Flow analysis, LLM comparison, VAD/capture/injection research, and `docs/RESEARCH.md` still open.**
 
 ## Phase 0 — Environment & tooling bootstrap ✅ (2026-07-10)
 - Capability audit (`docs/CAPABILITY_AUDIT.md`), local skills, subagents, runtimes, memory files, verification gate.
