@@ -18,8 +18,8 @@ use whisper_core::ports::{AudioSource, TextSink};
 use whisper_core::session::CancellationToken;
 
 use whisper_platform::{
-    macos_pasteboard_sink, spawn_listener, CpalAudioSource, HotkeyCombo, HotkeyEvent, HotkeyMode,
-    HotkeySession, SessionIntent,
+    macos_pasteboard_sink, spawn_listener, AudioLevel, AutoGainConfig, CpalAudioSource,
+    HotkeyCombo, HotkeyEvent, HotkeyMode, HotkeySession, SessionIntent,
 };
 
 use super::api::{ApiEvent, SessionRecord};
@@ -31,10 +31,11 @@ use super::state::{
 use super::worker::{null_sink_builder, EngineBuilder, SinkBuilder};
 
 /// Live mic capture backed by CoreAudio (D-0012). Each session builds a [`CpalAudioSource`] that
-/// resamples to 16 kHz mono; permission denial and mid-session device loss reach WS as
-/// `platform.permission` / `audio.device_lost`.
-pub fn cpal_live_source() -> LiveSourceProvider {
-    Box::new(|ctx: LiveSourceCtx| {
+/// resamples to 16 kHz mono and boosts quiet input via AGC-lite (`agc`); permission denial and
+/// mid-session device loss reach WS as `platform.permission` / `audio.device_lost`, and the
+/// throttled post-gain input level reaches WS as `audio.level` (D-0013 level meter).
+pub fn cpal_live_source(agc: AutoGainConfig) -> LiveSourceProvider {
+    Box::new(move |ctx: LiveSourceCtx| {
         let LiveSourceCtx {
             session_id,
             events,
@@ -50,7 +51,17 @@ pub fn cpal_live_source() -> LiveSourceProvider {
                     ts_ms: now_ms(),
                 });
             });
-            match CpalAudioSource::open(stop, on_device_lost) {
+            let sid_lvl = session_id.clone();
+            let lvl_events = events.clone();
+            let on_level = Box::new(move |lvl: AudioLevel| {
+                let _ = lvl_events.send(ApiEvent::AudioLevel {
+                    session_id: sid_lvl.clone(),
+                    rms: lvl.rms,
+                    peak: lvl.peak,
+                    ts_ms: now_ms(),
+                });
+            });
+            match CpalAudioSource::open(stop, agc, on_device_lost, on_level) {
                 Ok(source) => Ok(Box::new(source) as Box<dyn AudioSource>),
                 Err(err) => {
                     if err.is_permission_denied() {
@@ -90,14 +101,8 @@ pub fn pasteboard_sink_builder() -> SinkBuilder {
 pub fn platform_engine_builder(
     stt_path: std::path::PathBuf,
     cleanup_path: Option<std::path::PathBuf>,
-    vad_config: whisper_core::vad::VadConfig,
 ) -> EngineBuilder {
-    super::production_engine_builder_with_sink(
-        stt_path,
-        cleanup_path,
-        vad_config,
-        pasteboard_sink_builder(),
-    )
+    super::production_engine_builder_with_sink(stt_path, cleanup_path, pasteboard_sink_builder())
 }
 
 /// Start a live mic session synchronously (from the hotkey thread — outside the tokio runtime).

@@ -39,6 +39,9 @@ pub struct BuildCtx {
     /// Shared effective language; the STT wrapper reads it per decode so `/v1/config` language
     /// edits take effect on the next session.
     pub lang: Arc<RwLock<String>>,
+    /// Shared VAD tuning; the per-session `vad_builder` reads it each session, so a `/v1/config`
+    /// `[vad]` edit takes effect on the next session without a restart (D-0008).
+    pub vad: Arc<RwLock<whisper_core::vad::VadConfig>>,
 }
 
 /// The resident engines the worker keeps loaded for the process lifetime. STT is required;
@@ -91,11 +94,12 @@ pub fn spawn_weak(
             let engines = {
                 let Some(state) = state.upgrade() else { return };
                 let lang = state.lang.clone();
+                let vad = state.vad.clone();
                 state.emit(ApiEvent::ModelLoading {
                     model: "stt".to_string(),
                     ts_ms: now_ms(),
                 });
-                match builder(BuildCtx { lang }) {
+                match builder(BuildCtx { lang, vad }) {
                     Ok(engines) => {
                         update_status_ready(&state, &engines);
                         Some(engines)

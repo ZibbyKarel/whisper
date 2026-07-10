@@ -276,6 +276,15 @@ pub enum ApiEvent {
         reason: String,
         ts_ms: u128,
     },
+    /// Throttled (~10 Hz) input-level telemetry for a live mic session (`ARCHITECTURE.md` §5,
+    /// D-0013 level meter). `rms`/`peak` are post-gain linear amplitude in `[0.0, 1.0]`.
+    #[serde(rename = "audio.level")]
+    AudioLevel {
+        session_id: String,
+        rms: f32,
+        peak: f32,
+        ts_ms: u128,
+    },
     /// A platform permission the engine needs is missing (`ARCHITECTURE.md` §5: surfaced as an
     /// event, never a blocking dialog in core). `permission` is e.g. `"microphone"`.
     #[serde(rename = "platform.permission")]
@@ -301,4 +310,27 @@ pub struct ErrorEnvelope {
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_level_event_wire_shape() {
+        let ev = ApiEvent::AudioLevel {
+            session_id: "sess-1".to_string(),
+            rms: 0.25,
+            peak: 0.5,
+            ts_ms: 42,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "audio.level");
+        assert_eq!(v["session_id"], "sess-1");
+        assert_eq!(v["rms"], 0.25);
+        assert_eq!(v["peak"], 0.5);
+        assert_eq!(v["ts_ms"], 42);
+        // Exactly the five documented keys, no more.
+        assert_eq!(v.as_object().unwrap().len(), 5);
+    }
 }

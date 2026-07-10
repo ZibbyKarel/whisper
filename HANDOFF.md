@@ -31,10 +31,13 @@ mistral-nemo disqualified), ARCHITECTURE.md + ADRs D-0004..D-0010 (cross-reviewe
 findings addressed).
 
 ## Unfinished / next steps
-1. **Manual Phase-5 verification (user, blocks Phase-5 sign-off):**
-   `docs/phase5-manual-verification.md` — grant mic + accessibility + input monitoring
-   to whisperd, live Czech dictation via hotkey, byte-exact diacritics paste, Secure
-   Input password-field test, device unplug, permission-denied event.
+1. **Manual Phase-5 verification (user) — first pass done 2026-07-10:** live dictation
+   works; English great; Czech acceptable but ONLY when speaking loudly — quiet speech
+   drops out (VAD threshold 0.5 too strict for quiet mics + no input gain). Fix in
+   flight: AGC-lite in the capture path, configurable `[vad]` sensitivity (default
+   threshold lowered), `audio.level` WS event for a UI meter. Re-verify Czech quality
+   at normal speaking volume after the fix; rest of the checklist
+   (`docs/phase5-manual-verification.md`: Secure Input, device unplug) still pending.
 2. Phase-5 remainder: Fn/globe-key capture (NSEvent flagsChanged/IOKit path behind the
    same hotkey port); tray/menu-bar (with Phase 6 UX shell).
 3. Phase 6: UX layer — settings/onboarding/visualization shell talking only to the

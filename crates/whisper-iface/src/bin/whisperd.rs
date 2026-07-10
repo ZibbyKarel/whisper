@@ -8,7 +8,6 @@
 
 use std::path::PathBuf;
 
-use whisper_core::vad::VadConfig;
 use whisper_iface::daemon::config::Config;
 #[cfg(not(feature = "platform"))]
 use whisper_iface::production_engine_builder;
@@ -41,20 +40,21 @@ async fn run() -> Result<(), String> {
     // default headless build keeps the null delivery sink and no mic/hotkey capture.
     #[cfg(feature = "platform")]
     let hotkey_cfg = config.hotkey.clone();
+    // AGC-lite tuning from `[audio]`; the capture stream is built at startup, so it is fixed for
+    // the process lifetime (edits are staged for the next restart).
+    #[cfg(feature = "platform")]
+    let agc = whisper_platform::AutoGainConfig {
+        enabled: config.audio.agc_enabled,
+        target_peak: config.audio.agc_target_peak,
+        max_gain: config.audio.agc_max_gain,
+    };
     #[cfg(feature = "platform")]
     let (builder, live_source) = (
-        whisper_iface::daemon::platform::platform_engine_builder(
-            stt,
-            cleanup,
-            VadConfig::default(),
-        ),
-        Some(whisper_iface::daemon::platform::cpal_live_source()),
+        whisper_iface::daemon::platform::platform_engine_builder(stt, cleanup),
+        Some(whisper_iface::daemon::platform::cpal_live_source(agc)),
     );
     #[cfg(not(feature = "platform"))]
-    let (builder, live_source) = (
-        production_engine_builder(stt, cleanup, VadConfig::default()),
-        None,
-    );
+    let (builder, live_source) = (production_engine_builder(stt, cleanup), None);
 
     let daemon = Daemon::start(config, Some(config_path), builder, live_source).await?;
     println!("whisperd listening on http://{}", daemon.addr);

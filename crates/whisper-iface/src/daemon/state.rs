@@ -19,6 +19,7 @@ use whisper_core::error::AudioError;
 use whisper_core::pipeline::CleanupMode;
 use whisper_core::ports::AudioSource;
 use whisper_core::session::CancellationToken;
+use whisper_core::vad::VadConfig;
 
 use super::api::{ApiEvent, SessionRecord};
 use super::config::Config;
@@ -192,6 +193,9 @@ pub struct AppState {
     /// Effective STT language, shared with the STT adapter wrapper so `/v1/config` language
     /// edits reach per-segment decoding without rebuilding the model.
     pub lang: std::sync::Arc<RwLock<String>>,
+    /// Effective VAD tuning, shared with the per-session `vad_builder` so `/v1/config` `[vad]`
+    /// edits reach the next session's VAD without a restart (D-0008).
+    pub vad: std::sync::Arc<RwLock<VadConfig>>,
     pub store: SessionStore,
     pub status: RwLock<EngineStatus>,
     id_counter: AtomicU64,
@@ -207,6 +211,7 @@ impl AppState {
         config_path: Option<PathBuf>,
         dictionary: DictionaryState,
         lang: std::sync::Arc<RwLock<String>>,
+        vad: std::sync::Arc<RwLock<VadConfig>>,
         store: SessionStore,
         live_source: Option<LiveSourceProvider>,
     ) -> Self {
@@ -224,6 +229,7 @@ impl AppState {
             config_path,
             dictionary: RwLock::new(dictionary),
             lang,
+            vad,
             store,
             status: RwLock::new(EngineStatus::default()),
             id_counter: AtomicU64::new(0),

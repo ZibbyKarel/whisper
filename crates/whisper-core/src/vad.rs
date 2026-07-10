@@ -25,7 +25,9 @@ pub struct VadConfig {
     /// pipeline runs at 16 kHz mono (`ARCHITECTURE.md` §3.2).
     pub sample_rate_hz: u32,
     /// Silero speech-probability threshold in `[0.0, 1.0]`; at/above is speech. Used by the
-    /// adapter, carried here so all VAD tunables live in one struct.
+    /// adapter, carried here so all VAD tunables live in one struct. Default 0.35 (lowered from
+    /// Silero's 0.5) so quiet mics/soft speech still trigger; digital silence still scores ~0.0,
+    /// so the D-0008 anti-hallucination trimming is unaffected.
     pub speech_threshold: f32,
     /// Trailing silence kept in a closed segment so the last word is not clipped (~300 ms).
     /// Bounds the silence whisper sees at a segment's end — always < 1 s (D-0008).
@@ -39,7 +41,7 @@ impl Default for VadConfig {
     fn default() -> Self {
         Self {
             sample_rate_hz: 16_000,
-            speech_threshold: 0.5,
+            speech_threshold: 0.35,
             hangover_ms: 300,
             max_silence_ms: 1_000,
         }

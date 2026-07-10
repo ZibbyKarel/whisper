@@ -93,6 +93,5 @@ fn production_builder_constructs() {
     let _builder = production_engine_builder(
         std::path::PathBuf::from("models/ggml-large-v3-turbo-q5_0.bin"),
         Some(std::path::PathBuf::from("models/Qwen3-8B-Q4_K_M.gguf")),
-        whisper_core::vad::VadConfig::default(),
     );
 }

@@ -134,6 +134,174 @@ impl StreamResampler {
     }
 }
 
+/// AGC-lite tuning (`ARCHITECTURE.md` §3.2/§5): a boost-only automatic gain so a quiet mic is
+/// lifted toward a usable level before the VAD/STT ever see it. Amplify-only (`gain >= 1.0`) so
+/// loud input is never attenuated — the measured failure was *quiet* speech being lost, not loud
+/// speech clipping. Dependency-free and deterministic.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoGainConfig {
+    /// Off ⇒ [`AutoGain::process`] is a pass-through. On by default.
+    pub enabled: bool,
+    /// Peak the gain chases the signal toward, in `[0.0, 1.0]`. ~0.7 leaves headroom below clip.
+    pub target_peak: f32,
+    /// Upper bound on the gain multiplier; the lower bound is fixed at 1.0 (boost-only).
+    pub max_gain: f32,
+}
+
+impl Default for AutoGainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            target_peak: 0.7,
+            max_gain: 12.0,
+        }
+    }
+}
+
+/// Boost-only automatic gain control (AGC-lite). Runs on the 16 kHz mono capture stream after
+/// downmix/resample, before chunks reach the pipeline. Per block it estimates the peak, chases a
+/// target level with a fast attack (gain *down*, clip protection) / slow release (gain *up*), and
+/// hard-limits the output so a transient during the attack ramp cannot clip. An RMS activity gate
+/// stops the gain ratcheting up on silence/noise.
+#[derive(Debug, Clone)]
+pub struct AutoGain {
+    cfg: AutoGainConfig,
+    gain: f32,
+}
+
+impl AutoGain {
+    /// Fixed lower bound: amplify-only, never attenuate below unity.
+    const MIN_GAIN: f32 = 1.0;
+    /// RMS below this (~ -46 dBFS) is treated as silence/room-noise: the gain is *held*, never
+    /// raised, so a quiet room does not drive the gain to `max_gain`.
+    const NOISE_FLOOR: f32 = 0.005;
+    /// Guards the `target/peak` division against a near-zero peak inside an "active" block.
+    const EPS: f32 = 1e-6;
+    /// Attack time constant (samples ≈ 100 ms @ 16 kHz): how fast the gain *drops* when the signal
+    /// gets louder — fast, so a sudden onset does not clip.
+    const ATTACK_TAU: f32 = 1_600.0;
+    /// Release time constant (samples ≈ 750 ms @ 16 kHz): how slowly the gain *rises* for quiet
+    /// speech — slow, to avoid pumping and to keep noise from being amplified between words.
+    const RELEASE_TAU: f32 = 12_000.0;
+    /// Hard-limiter ceiling: post-gain samples are clamped to `±CEILING` so nothing clips.
+    const CEILING: f32 = 0.99;
+
+    pub fn new(cfg: AutoGainConfig) -> Self {
+        Self { cfg, gain: 1.0 }
+    }
+
+    /// Current smoothed gain multiplier (for tests/telemetry).
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    /// Apply gain to one block in place. `buf` is 16 kHz mono f32; length is arbitrary (a capture
+    /// callback delivers variable-size chunks), and the smoothing is length-aware so behaviour does
+    /// not depend on the block size.
+    pub fn process(&mut self, buf: &mut [f32]) {
+        if !self.cfg.enabled || buf.is_empty() {
+            return;
+        }
+        let n = buf.len();
+        let mut peak = 0.0f32;
+        let mut sum_sq = 0.0f64;
+        for &s in buf.iter() {
+            let a = s.abs();
+            if a > peak {
+                peak = a;
+            }
+            sum_sq += (s as f64) * (s as f64);
+        }
+        let rms = (sum_sq / n as f64).sqrt() as f32;
+
+        let max_gain = self.cfg.max_gain.max(Self::MIN_GAIN);
+        // Only chase a new target when the block carries speech-level energy (activity gate);
+        // otherwise hold the current gain so silence/noise never ratchets it up.
+        let target_gain = if rms > Self::NOISE_FLOOR && peak > Self::EPS {
+            (self.cfg.target_peak / peak).clamp(Self::MIN_GAIN, max_gain)
+        } else {
+            self.gain
+        };
+
+        // Fast attack when reducing gain (loud onset → clip risk), slow release when raising it.
+        let tau = if target_gain < self.gain {
+            Self::ATTACK_TAU
+        } else {
+            Self::RELEASE_TAU
+        };
+        let alpha = 1.0 - (-(n as f32) / tau).exp();
+        let new_gain = self.gain + alpha * (target_gain - self.gain);
+
+        // Per-sample linear ramp old→new avoids a zipper artefact at the block boundary.
+        let step = (new_gain - self.gain) / n as f32;
+        let mut g = self.gain;
+        for s in buf.iter_mut() {
+            g += step;
+            *s = (*s * g).clamp(-Self::CEILING, Self::CEILING);
+        }
+        self.gain = new_gain;
+    }
+}
+
+/// A post-gain level sample (`audio.level` telemetry). Both fields are linear amplitude in
+/// `[0.0, 1.0]`; the daemon turns this into the `audio.level` WS event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioLevel {
+    pub rms: f32,
+    pub peak: f32,
+}
+
+/// Windowed RMS/peak meter feeding the throttled `audio.level` event. Accumulates samples and
+/// emits one [`AudioLevel`] every `window` samples (default ~10 Hz), so the capture path reports
+/// input level without flooding the WS channel.
+#[derive(Debug, Clone)]
+pub struct LevelMeter {
+    window: usize,
+    count: usize,
+    sum_sq: f64,
+    peak: f32,
+}
+
+impl LevelMeter {
+    pub fn new(window: usize) -> Self {
+        Self {
+            window: window.max(1),
+            count: 0,
+            sum_sq: 0.0,
+            peak: 0.0,
+        }
+    }
+
+    /// ~10 Hz at the pipeline's 16 kHz working rate (one sample per 100 ms).
+    pub fn at_10hz() -> Self {
+        Self::new(TARGET_SAMPLE_RATE_HZ as usize / 10)
+    }
+
+    /// Feed a block; returns one [`AudioLevel`] per completed window (usually 0 or 1, but a block
+    /// larger than the window can complete several).
+    pub fn push(&mut self, samples: &[f32]) -> Vec<AudioLevel> {
+        let mut out = Vec::new();
+        for &s in samples {
+            let a = s.abs();
+            if a > self.peak {
+                self.peak = a;
+            }
+            self.sum_sq += (s as f64) * (s as f64);
+            self.count += 1;
+            if self.count >= self.window {
+                out.push(AudioLevel {
+                    rms: (self.sum_sq / self.count as f64).sqrt() as f32,
+                    peak: self.peak,
+                });
+                self.count = 0;
+                self.sum_sq = 0.0;
+                self.peak = 0.0;
+            }
+        }
+        out
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub use mac::CpalAudioSource;
 
@@ -149,11 +317,18 @@ mod mac {
     use whisper_core::ports::{AudioSource, AudioStream};
     use whisper_core::types::{AudioCfg, AudioFrame};
 
-    use super::{downmix_to_mono, CaptureError, StreamResampler};
+    use super::{
+        downmix_to_mono, AudioLevel, AutoGain, AutoGainConfig, CaptureError, LevelMeter,
+        StreamResampler,
+    };
 
     /// Called (once) from the CoreAudio error callback when the device drops mid-session. The
     /// daemon wires this to a `audio.device_lost` WS event; this crate stays iface-free (D-0012).
     pub type DeviceLostCb = Box<dyn Fn(String) + Send + 'static>;
+
+    /// Called (throttled, ~10 Hz) from the capture callback with the post-gain input level. The
+    /// daemon maps it to an `audio.level` WS event; this crate stays iface-free (D-0012).
+    pub type LevelCb = Box<dyn Fn(AudioLevel) + Send + 'static>;
 
     /// Live microphone [`AudioSource`]: opens the default CoreAudio input device eagerly and
     /// streams 16 kHz mono f32 frames pulled by the pipeline. Eager open means a permission /
@@ -178,7 +353,9 @@ mod mac {
         /// fires if the device drops mid-session.
         pub fn open(
             stop: Arc<AtomicBool>,
+            agc: AutoGainConfig,
             on_device_lost: DeviceLostCb,
+            on_level: LevelCb,
         ) -> Result<Self, CaptureError> {
             let host = cpal::default_host();
             let device = host
@@ -206,10 +383,14 @@ mod mac {
             };
 
             let resampler = StreamResampler::new(in_rate)?;
+            let agc = AutoGain::new(agc);
+            let meter = LevelMeter::at_10hz();
 
             let stream = match sample_format {
                 cpal::SampleFormat::F32 => {
                     let mut resampler = resampler;
+                    let mut agc = agc;
+                    let mut meter = meter;
                     let stop = stop.clone();
                     let tx = tx.clone();
                     device.build_input_stream(
@@ -220,9 +401,7 @@ mod mac {
                             }
                             let mono = downmix_to_mono(data, channels);
                             if let Ok(res) = resampler.push(&mono) {
-                                if !res.is_empty() {
-                                    let _ = tx.send(res);
-                                }
+                                emit(&mut agc, &mut meter, &on_level, &tx, res);
                             }
                         },
                         err_fn,
@@ -231,6 +410,8 @@ mod mac {
                 }
                 cpal::SampleFormat::I16 => {
                     let mut resampler = resampler;
+                    let mut agc = agc;
+                    let mut meter = meter;
                     let stop = stop.clone();
                     let tx = tx.clone();
                     device.build_input_stream(
@@ -243,9 +424,7 @@ mod mac {
                                 data.iter().map(|&s| s as f32 / 32768.0).collect();
                             let mono = downmix_to_mono(&floats, channels);
                             if let Ok(res) = resampler.push(&mono) {
-                                if !res.is_empty() {
-                                    let _ = tx.send(res);
-                                }
+                                emit(&mut agc, &mut meter, &on_level, &tx, res);
                             }
                         },
                         err_fn,
@@ -254,6 +433,8 @@ mod mac {
                 }
                 cpal::SampleFormat::U16 => {
                     let mut resampler = resampler;
+                    let mut agc = agc;
+                    let mut meter = meter;
                     let stop = stop.clone();
                     let tx = tx.clone();
                     device.build_input_stream(
@@ -268,9 +449,7 @@ mod mac {
                                 .collect();
                             let mono = downmix_to_mono(&floats, channels);
                             if let Ok(res) = resampler.push(&mono) {
-                                if !res.is_empty() {
-                                    let _ = tx.send(res);
-                                }
+                                emit(&mut agc, &mut meter, &on_level, &tx, res);
                             }
                         },
                         err_fn,
@@ -339,6 +518,26 @@ mod mac {
                 }
             }
         }
+    }
+
+    /// Post-process one resampled 16 kHz block: apply AGC in place, feed the throttled level
+    /// meter (firing `on_level` per completed window), then hand the boosted chunk to the pull
+    /// side. Empty blocks (the resampler is still accumulating) are dropped.
+    fn emit(
+        agc: &mut AutoGain,
+        meter: &mut LevelMeter,
+        on_level: &LevelCb,
+        tx: &std::sync::mpsc::Sender<Vec<f32>>,
+        mut res: Vec<f32>,
+    ) {
+        if res.is_empty() {
+            return;
+        }
+        agc.process(&mut res);
+        for lvl in meter.push(&res) {
+            (on_level)(lvl);
+        }
+        let _ = tx.send(res);
     }
 
     /// Classify a `default_input_config` error string as permission vs. other.
@@ -428,6 +627,164 @@ mod tests {
         let expected = n_in * 2;
         let diff = (out.len() as isize - expected as isize).unsigned_abs();
         assert!(diff <= 2 * StreamResampler::CHUNK, "got {}", out.len());
+    }
+
+    // ---- AGC-lite (AutoGain) ----------------------------------------------------------------
+
+    fn sine_block(peak: f32, n: usize, phase: &mut f32) -> Vec<f32> {
+        let step = 440.0 / TARGET_SAMPLE_RATE_HZ as f32 * std::f32::consts::TAU;
+        (0..n)
+            .map(|_| {
+                let s = peak * phase.sin();
+                *phase += step;
+                s
+            })
+            .collect()
+    }
+
+    fn block_peak(buf: &[f32]) -> f32 {
+        buf.iter().fold(0.0, |m, &s| m.max(s.abs()))
+    }
+
+    #[test]
+    fn agc_amplifies_quiet_signal_toward_target() {
+        let cfg = AutoGainConfig::default();
+        let mut agc = AutoGain::new(cfg);
+        let mut phase = 0.0f32;
+        // Quiet input (peak 0.1) whose target gain (0.7/0.1 = 7×) is within [1, 12].
+        let mut last = Vec::new();
+        for _ in 0..80 {
+            let mut b = sine_block(0.1, 1_600, &mut phase);
+            agc.process(&mut b);
+            last = b;
+        }
+        let peak = block_peak(&last);
+        assert!(
+            (0.6..=0.78).contains(&peak),
+            "quiet signal not lifted toward target: peak {peak}, gain {}",
+            agc.gain()
+        );
+    }
+
+    #[test]
+    fn agc_leaves_loud_signal_unchanged() {
+        let cfg = AutoGainConfig::default();
+        let mut agc = AutoGain::new(cfg);
+        let mut phase = 0.0f32;
+        // Loud input (peak 0.9): desired gain < 1, so the boost-only AGC holds unity.
+        for _ in 0..40 {
+            let mut b = sine_block(0.9, 1_600, &mut phase);
+            agc.process(&mut b);
+            assert!(block_peak(&b) <= 0.99, "loud signal clipped past ceiling");
+        }
+        assert!(
+            (agc.gain() - 1.0).abs() < 1e-3,
+            "loud signal was amplified: gain {}",
+            agc.gain()
+        );
+    }
+
+    #[test]
+    fn agc_gate_holds_gain_on_silence() {
+        let cfg = AutoGainConfig::default();
+        let mut agc = AutoGain::new(cfg);
+        // Pure digital silence must never ratchet the gain up.
+        for _ in 0..200 {
+            let mut b = vec![0.0f32; 1_600];
+            agc.process(&mut b);
+        }
+        assert!(
+            (agc.gain() - 1.0).abs() < 1e-6,
+            "silence raised the gain to {}",
+            agc.gain()
+        );
+        // Sub-floor noise is also gated (no runaway gain).
+        let mut phase = 0.0f32;
+        for _ in 0..200 {
+            let mut b = sine_block(0.002, 1_600, &mut phase);
+            agc.process(&mut b);
+        }
+        assert!(
+            agc.gain() < 1.001,
+            "sub-floor noise ratcheted the gain to {}",
+            agc.gain()
+        );
+    }
+
+    #[test]
+    fn agc_hard_limiter_never_clips() {
+        let cfg = AutoGainConfig::default();
+        let mut agc = AutoGain::new(cfg);
+        let mut phase = 0.0f32;
+        // Ramp gain up on quiet speech, then hit it with a loud onset: the attack ramp could
+        // momentarily over-apply gain, but the hard limiter must keep every sample in range.
+        for _ in 0..80 {
+            let mut b = sine_block(0.08, 1_600, &mut phase);
+            agc.process(&mut b);
+        }
+        let mut loud = sine_block(0.9, 1_600, &mut phase);
+        agc.process(&mut loud);
+        assert!(
+            loud.iter().all(|&s| s.abs() <= 0.99 + 1e-6),
+            "limiter allowed clipping"
+        );
+    }
+
+    #[test]
+    fn agc_disabled_is_passthrough() {
+        let cfg = AutoGainConfig {
+            enabled: false,
+            ..AutoGainConfig::default()
+        };
+        let mut agc = AutoGain::new(cfg);
+        let mut phase = 0.0f32;
+        let original = sine_block(0.05, 512, &mut phase);
+        let mut b = original.clone();
+        agc.process(&mut b);
+        assert_eq!(b, original, "disabled AGC altered the signal");
+    }
+
+    #[test]
+    fn agc_respects_max_gain_ceiling() {
+        let cfg = AutoGainConfig {
+            max_gain: 4.0,
+            ..AutoGainConfig::default()
+        };
+        let mut agc = AutoGain::new(cfg);
+        let mut phase = 0.0f32;
+        // Target would want 0.7/0.05 = 14×, but max_gain caps it at 4×.
+        for _ in 0..300 {
+            let mut b = sine_block(0.05, 1_600, &mut phase);
+            agc.process(&mut b);
+        }
+        assert!(
+            (agc.gain() - 4.0).abs() < 0.05,
+            "gain exceeded max_gain: {}",
+            agc.gain()
+        );
+    }
+
+    // ---- LevelMeter -------------------------------------------------------------------------
+
+    #[test]
+    fn level_meter_emits_once_per_window() {
+        let mut meter = LevelMeter::new(1_600);
+        assert!(meter.push(&vec![0.0; 800]).is_empty(), "partial: no emit");
+        let out = meter.push(&vec![0.0; 800]);
+        assert_eq!(out.len(), 1, "window completed exactly once");
+        // A block spanning several windows emits one level each.
+        let out = meter.push(&vec![0.0; 3_200]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn level_meter_computes_rms_and_peak() {
+        let mut meter = LevelMeter::new(4);
+        // Constant 0.5 → rms 0.5, peak 0.5.
+        let out = meter.push(&[0.5, -0.5, 0.5, -0.5]);
+        assert_eq!(out.len(), 1);
+        assert!((out[0].rms - 0.5).abs() < 1e-6);
+        assert!((out[0].peak - 0.5).abs() < 1e-6);
     }
 
     #[test]

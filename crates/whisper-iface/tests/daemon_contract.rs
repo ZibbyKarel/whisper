@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use serde_json::json;
 
 use whisper_iface::daemon::api::CleanupModeDto;
-use whisper_iface::daemon::config::{Config, HistoryConfig};
+use whisper_iface::daemon::config::{AudioTuning, Config, HistoryConfig, VadTuning};
 
 use support::{
     call, call_with_headers, fake_builder, fake_builder_with_cleanup, gate_builder, harness,
@@ -244,6 +244,78 @@ async fn config_put_applies_runtime_fields_and_stages_infra() {
     let (_s, sbody) = call(&router, "GET", "/v1/status", None).await;
     assert_eq!(sbody["language"], "en");
     assert_eq!(sbody["cleanup_mode"], "never");
+}
+
+#[tokio::test]
+async fn config_put_vad_is_applied_and_audio_is_staged() {
+    let (_state, router) = harness(cfg(CleanupModeDto::Auto), fake_builder());
+
+    let new = Config {
+        port: 0,
+        vad: VadTuning {
+            threshold: 0.4,
+            hangover_ms: 250,
+            ..VadTuning::default()
+        },
+        audio: AudioTuning {
+            agc_max_gain: 8.0,
+            ..AudioTuning::default()
+        },
+        ..Config::default()
+    };
+
+    let (status, body) = call(
+        &router,
+        "PUT",
+        "/v1/config",
+        Some(serde_json::to_value(&new).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let applied: Vec<String> = serde_json::from_value(body["applied"].clone()).unwrap();
+    let staged: Vec<String> = serde_json::from_value(body["staged"].clone()).unwrap();
+    // VAD is rebuilt per session → applied; the capture stream is built at startup → staged.
+    assert!(
+        applied.contains(&"vad".to_string()),
+        "vad should be applied"
+    );
+    assert!(
+        staged.contains(&"audio".to_string()),
+        "audio should be staged"
+    );
+
+    // The stored config reflects the new VAD tuning.
+    let (_s, cbody) = call(&router, "GET", "/v1/config", None).await;
+    assert_eq!(cbody["vad"]["threshold"], 0.4);
+    assert_eq!(cbody["vad"]["hangover_ms"], 250);
+}
+
+#[tokio::test]
+async fn config_put_rejects_out_of_range_vad_threshold() {
+    let (_state, router) = harness(cfg(CleanupModeDto::Auto), fake_builder());
+
+    let new = Config {
+        port: 0,
+        vad: VadTuning {
+            threshold: 0.99, // out of [0.05, 0.95]
+            ..VadTuning::default()
+        },
+        ..Config::default()
+    };
+
+    let (status, body) = call(
+        &router,
+        "PUT",
+        "/v1/config",
+        Some(serde_json::to_value(&new).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "bad_request");
+
+    // The rejected edit did not mutate the live config (still the 0.35 default).
+    let (_s, cbody) = call(&router, "GET", "/v1/config", None).await;
+    assert_eq!(cbody["vad"]["threshold"], 0.35);
 }
 
 #[tokio::test]

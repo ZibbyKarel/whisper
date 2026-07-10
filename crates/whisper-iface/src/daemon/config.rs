@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use whisper_core::vad::VadConfig;
 
 use super::api::CleanupModeDto;
 
@@ -107,6 +108,99 @@ impl Default for HotkeyConfig {
     }
 }
 
+fn default_vad_threshold() -> f32 {
+    // Lowered from Silero's 0.5 to 0.35 so quiet mics/soft speech still trigger speech detection
+    // (the measured "must speak loudly" failure). Digital silence still scores ~0.0, so the D-0008
+    // anti-hallucination trimming is unaffected (verified by `vad_antihallucination.rs`).
+    0.35
+}
+
+fn default_hangover_ms() -> u32 {
+    300
+}
+
+fn default_max_silence_ms() -> u32 {
+    1_000
+}
+
+/// VAD sensitivity tuning (`[vad]` in config.toml, D-0008). Mapped to
+/// [`whisper_core::vad::VadConfig`] when a session's VAD is built, so an edit takes effect on the
+/// next session (reported `applied` by `PUT /v1/config`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VadTuning {
+    /// Silero speech-probability threshold in `[0.0, 1.0]`; at/above is speech. Lower = more
+    /// sensitive (quieter speech detected). Validated to `[0.05, 0.95]` by `PUT /v1/config`.
+    #[serde(default = "default_vad_threshold")]
+    pub threshold: f32,
+    /// Trailing silence kept in a closed segment (~300 ms) so the last word is not clipped.
+    #[serde(default = "default_hangover_ms")]
+    pub hangover_ms: u32,
+    /// Contiguous silence that closes an open segment (~1 s, D-0008); silence beyond the hangover
+    /// is never decoded.
+    #[serde(default = "default_max_silence_ms")]
+    pub max_silence_ms: u32,
+}
+
+impl Default for VadTuning {
+    fn default() -> Self {
+        Self {
+            threshold: default_vad_threshold(),
+            hangover_ms: default_hangover_ms(),
+            max_silence_ms: default_max_silence_ms(),
+        }
+    }
+}
+
+impl VadTuning {
+    /// Project onto the core [`VadConfig`] (the pipeline's fixed 16 kHz working rate is kept).
+    pub fn to_vad_config(&self) -> VadConfig {
+        VadConfig {
+            speech_threshold: self.threshold,
+            hangover_ms: self.hangover_ms,
+            max_silence_ms: self.max_silence_ms,
+            ..VadConfig::default()
+        }
+    }
+}
+
+fn default_agc_enabled() -> bool {
+    true
+}
+
+fn default_agc_target_peak() -> f32 {
+    0.7
+}
+
+fn default_agc_max_gain() -> f32 {
+    12.0
+}
+
+/// Capture input-gain tuning (`[audio]` in config.toml). Boost-only AGC-lite applied in the
+/// capture path (`whisper-platform`) so a quiet mic is lifted before the VAD/STT see it. The
+/// capture stream is built at daemon startup, so edits are *staged* for the next restart.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AudioTuning {
+    /// Enable AGC-lite. On by default.
+    #[serde(default = "default_agc_enabled")]
+    pub agc_enabled: bool,
+    /// Peak the gain chases toward, in `(0.0, 1.0]`. Validated by `PUT /v1/config`.
+    #[serde(default = "default_agc_target_peak")]
+    pub agc_target_peak: f32,
+    /// Upper bound on the gain multiplier (lower bound is a fixed 1×). Validated by `PUT`.
+    #[serde(default = "default_agc_max_gain")]
+    pub agc_max_gain: f32,
+}
+
+impl Default for AudioTuning {
+    fn default() -> Self {
+        Self {
+            agc_enabled: default_agc_enabled(),
+            agc_target_peak: default_agc_target_peak(),
+            agc_max_gain: default_agc_max_gain(),
+        }
+    }
+}
+
 /// Opt-in transcript history (D-0010: strictly opt-in SQLite).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct HistoryConfig {
@@ -118,7 +212,8 @@ pub struct HistoryConfig {
 }
 
 /// The full daemon configuration. Also the `/v1/config` JSON body.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` is intentionally not derived: `[vad]`/`[audio]` carry `f32` tunables.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     #[serde(default = "default_bind")]
@@ -146,6 +241,10 @@ pub struct Config {
     pub history: HistoryConfig,
     #[serde(default)]
     pub hotkey: HotkeyConfig,
+    #[serde(default)]
+    pub vad: VadTuning,
+    #[serde(default)]
+    pub audio: AudioTuning,
 }
 
 impl Default for Config {
@@ -161,6 +260,8 @@ impl Default for Config {
             models: ModelsConfig::default(),
             history: HistoryConfig::default(),
             hotkey: HotkeyConfig::default(),
+            vad: VadTuning::default(),
+            audio: AudioTuning::default(),
         }
     }
 }
@@ -221,6 +322,43 @@ mod tests {
         assert_eq!(Config::default().delivery, DeliveryMode::None);
         let cfg = Config::from_toml_str("delivery = \"paste\"\n").unwrap();
         assert_eq!(cfg.delivery, DeliveryMode::Paste);
+    }
+
+    #[test]
+    fn vad_defaults_and_parses() {
+        let def = Config::default().vad;
+        assert_eq!(def.threshold, 0.35);
+        assert_eq!(def.hangover_ms, 300);
+        assert_eq!(def.max_silence_ms, 1_000);
+
+        let cfg = Config::from_toml_str(
+            "[vad]\nthreshold = 0.42\nhangover_ms = 250\nmax_silence_ms = 800\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.vad.threshold, 0.42);
+        assert_eq!(cfg.vad.hangover_ms, 250);
+        assert_eq!(cfg.vad.max_silence_ms, 800);
+
+        // Projection onto the core VadConfig keeps the 16 kHz working rate.
+        let vc = cfg.vad.to_vad_config();
+        assert_eq!(vc.speech_threshold, 0.42);
+        assert_eq!(vc.sample_rate_hz, 16_000);
+    }
+
+    #[test]
+    fn audio_agc_defaults_and_parses() {
+        let def = Config::default().audio;
+        assert!(def.agc_enabled);
+        assert_eq!(def.agc_target_peak, 0.7);
+        assert_eq!(def.agc_max_gain, 12.0);
+
+        let cfg = Config::from_toml_str(
+            "[audio]\nagc_enabled = false\nagc_target_peak = 0.6\nagc_max_gain = 8.0\n",
+        )
+        .unwrap();
+        assert!(!cfg.audio.agc_enabled);
+        assert_eq!(cfg.audio.agc_target_peak, 0.6);
+        assert_eq!(cfg.audio.agc_max_gain, 8.0);
     }
 
     #[test]

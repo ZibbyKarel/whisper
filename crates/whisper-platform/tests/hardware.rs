@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use whisper_core::ports::{AudioSource, TextSink};
-use whisper_platform::{secure_input_enabled, CpalAudioSource};
+use whisper_platform::{secure_input_enabled, AutoGainConfig, CpalAudioSource};
 
 /// Grant: System Settings → Privacy & Security → Microphone → (your terminal / the test binary).
 /// Expect: at least one non-empty 16 kHz mono frame within a couple of seconds, then a graceful
@@ -25,7 +25,9 @@ fn mic_capture_opens_and_streams() {
     let stop = Arc::new(AtomicBool::new(false));
     let source = CpalAudioSource::open(
         stop.clone(),
+        AutoGainConfig::default(),
         Box::new(|reason| eprintln!("device lost: {reason}")),
+        Box::new(|lvl| eprintln!("level: rms={} peak={}", lvl.rms, lvl.peak)),
     )
     .expect("open default input device (grant Microphone permission)");
     let mut stream = source.start(Default::default()).expect("start capture");

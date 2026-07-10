@@ -30,7 +30,6 @@ use axum::Router;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use whisper_core::ports::{CleanupEngine, Vad};
-use whisper_core::vad::VadConfig;
 
 use self::config::Config;
 use self::handlers::ApiErr;
@@ -63,6 +62,7 @@ pub fn build_state(
     };
     let store = SessionStore::new(db_path)?;
     let lang = Arc::new(RwLock::new(config.language.clone()));
+    let vad = Arc::new(RwLock::new(config.vad.to_vad_config()));
 
     let state = Arc::new(AppState::new(
         env!("CARGO_PKG_VERSION").to_string(),
@@ -72,6 +72,7 @@ pub fn build_state(
         config_path,
         dictionary,
         lang,
+        vad,
         store,
         live_source,
     ));
@@ -293,10 +294,9 @@ fn resolve_history_path(config: &Config) -> PathBuf {
 pub fn production_engine_builder(
     stt_path: PathBuf,
     cleanup_path: Option<PathBuf>,
-    vad_config: VadConfig,
 ) -> EngineBuilder {
     // Headless default: delivery is "available via the API".
-    production_engine_builder_with_sink(stt_path, cleanup_path, vad_config, null_sink_builder())
+    production_engine_builder_with_sink(stt_path, cleanup_path, null_sink_builder())
 }
 
 /// Like [`production_engine_builder`] but with an explicit delivery [`SinkBuilder`](worker::SinkBuilder)
@@ -304,7 +304,6 @@ pub fn production_engine_builder(
 pub fn production_engine_builder_with_sink(
     stt_path: PathBuf,
     cleanup_path: Option<PathBuf>,
-    vad_config: VadConfig,
     sink_builder: worker::SinkBuilder,
 ) -> EngineBuilder {
     let stt_label = file_label(&stt_path);
@@ -327,8 +326,12 @@ pub fn production_engine_builder_with_sink(
             None => (None, None, None),
         };
 
+        // Read the shared VAD tuning each session, so a `/v1/config` `[vad]` edit applies to the
+        // next session's VAD without a restart (D-0008).
+        let vad_shared = ctx.vad.clone();
         let vad_builder = Box::new(move || {
-            SileroVad::new(vad_config)
+            let cfg = *vad_shared.read().expect("vad lock");
+            SileroVad::new(cfg)
                 .map(|v| Box::new(v) as Box<dyn Vad>)
                 .map_err(|e| e.to_string())
         });

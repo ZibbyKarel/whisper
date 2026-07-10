@@ -108,6 +108,12 @@ Append-only. Newest at bottom. Absolute dates.
 - Gates (independently re-run by Fable): default config **96 tests** / platform config **33 tests**, clippy -D warnings + fmt clean in both; 11+7 `#[ignore]` (real-model + hardware). New deps: cpal Apache-2.0, rubato MIT, rdev MIT, arboard MIT/Apache-2.0, core-graphics MIT/Apache-2.0 (D-0012 license note satisfied).
 - **Hardware paths need manual verification** — CI/agents cannot grant macOS TCC (mic, accessibility, input monitoring): follow `docs/phase5-manual-verification.md` (grant permissions → live Czech dictation → diacritics paste byte-exact → Secure Input in password field → device unplug → permission-denied event). Remaining Phase-5 items: Fn/globe key (flagsChanged/IOKit), tray/menu-bar (Phase 5/6 boundary → Phase 6).
 
+## 2026-07-10 — Quiet-mic fix: AGC-lite + VAD sensitivity + audio.level event (user feedback)
+- User's first live test: English great, Czech fine **but only when speaking loudly** — quiet speech dropped. Root causes: VAD threshold 0.5 too strict for quiet mics, no input gain in the capture path.
+- `AutoGain` in whisper-platform (post-resample, pre-VAD): boost-only (1×–12×), target peak 0.7, activity gate (RMS > 0.005 — silence never ratchets gain), fast attack ~100 ms / slow release ~750 ms, per-sample ramp, hard limiter ±0.99. 7 unit tests on synthetic signals. Configurable via `[audio]` (staged — capture built at startup).
+- VAD default threshold **0.5 → 0.35**; new `[vad]` config section (threshold/hangover/max_silence), validated in PUT /v1/config (400 on out-of-range), applied per next session via shared `Arc<RwLock<VadConfig>>`. **Anti-hallucination regression re-proven at 0.35** (4 s silence → identical transcript; pure silence → empty) + e2e + daemon real-model tests green.
+- New WS event `audio.level {rms, peak}` (post-gain, 10 Hz) for the tray app's level meter. Implemented by opus-implementer, reviewed by Fable (AutoGain math + wiring); gates independently re-run: 109 fast tests, clippy -D warnings both configs, fmt.
+
 ## Debt register
 
 (empty)

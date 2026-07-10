@@ -306,6 +306,7 @@ pub async fn put_config(
     State(state): State<Arc<AppState>>,
     Json(new): Json<Config>,
 ) -> Result<Json<ConfigUpdateResponse>, ApiErr> {
+    validate_config(&new)?;
     let mut applied = Vec::new();
     let mut staged = Vec::new();
     {
@@ -316,6 +317,16 @@ pub async fn put_config(
         if new.language != cur.language {
             *state.lang.write().expect("lang lock") = new.language.clone();
             applied.push("language".to_string());
+        }
+        if new.vad != cur.vad {
+            // The VAD is rebuilt per session from the shared tuning, so an edit is applied to the
+            // next session (no restart) — hence `applied`, not `staged` (D-0008).
+            *state.vad.write().expect("vad lock") = new.vad.to_vad_config();
+            applied.push("vad".to_string());
+        }
+        if new.audio != cur.audio {
+            // The capture stream (and its AGC) is built once at startup; a change needs a restart.
+            staged.push("audio".to_string());
         }
         if new.token != cur.token {
             applied.push("token".to_string());
@@ -392,6 +403,44 @@ pub async fn put_dictionary(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Validate the tunable ranges of an incoming config before it is applied (`PUT /v1/config`).
+/// Out-of-range values are a structured `400`, so a bad edit never destabilises the VAD/capture.
+fn validate_config(cfg: &Config) -> Result<(), ApiErr> {
+    let v = &cfg.vad;
+    if !(0.05..=0.95).contains(&v.threshold) {
+        return Err(ApiErr::bad_request(format!(
+            "vad.threshold {} out of range [0.05, 0.95]",
+            v.threshold
+        )));
+    }
+    if !(50..=10_000).contains(&v.max_silence_ms) {
+        return Err(ApiErr::bad_request(format!(
+            "vad.max_silence_ms {} out of range [50, 10000]",
+            v.max_silence_ms
+        )));
+    }
+    if v.hangover_ms > v.max_silence_ms {
+        return Err(ApiErr::bad_request(format!(
+            "vad.hangover_ms {} must be <= vad.max_silence_ms {}",
+            v.hangover_ms, v.max_silence_ms
+        )));
+    }
+    let a = &cfg.audio;
+    if !(0.1..=1.0).contains(&a.agc_target_peak) {
+        return Err(ApiErr::bad_request(format!(
+            "audio.agc_target_peak {} out of range [0.1, 1.0]",
+            a.agc_target_peak
+        )));
+    }
+    if !(1.0..=64.0).contains(&a.agc_max_gain) {
+        return Err(ApiErr::bad_request(format!(
+            "audio.agc_max_gain {} out of range [1.0, 64.0]",
+            a.agc_max_gain
+        )));
+    }
+    Ok(())
+}
 
 fn ensure_stt_ready(state: &AppState) -> Result<(), ApiErr> {
     match state.status.read().expect("status lock").phase {

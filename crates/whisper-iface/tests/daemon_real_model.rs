@@ -6,7 +6,6 @@
 
 use std::path::{Path, PathBuf};
 
-use whisper_core::vad::VadConfig;
 use whisper_iface::daemon::config::Config;
 use whisper_iface::daemon::state::EnginePhase;
 use whisper_iface::{production_engine_builder, Daemon};
@@ -29,7 +28,7 @@ async fn real_daemon_transcribes_czech_fixture() {
         ..Config::default()
     };
     // STT only (no cleanup LLM) keeps the test light — the transcribe path is what we assert.
-    let builder = production_engine_builder(stt_model, None, VadConfig::default());
+    let builder = production_engine_builder(stt_model, None);
     let daemon = Daemon::start(config, None, builder, None)
         .await
         .expect("start daemon");

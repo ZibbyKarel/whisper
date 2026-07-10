@@ -19,7 +19,10 @@ pub mod audio;
 pub mod hotkey;
 pub mod paste;
 
-pub use audio::{downmix_to_mono, CaptureError, StreamResampler, TARGET_SAMPLE_RATE_HZ};
+pub use audio::{
+    downmix_to_mono, AudioLevel, AutoGain, AutoGainConfig, CaptureError, LevelMeter,
+    StreamResampler, TARGET_SAMPLE_RATE_HZ,
+};
 pub use hotkey::{
     ComboTracker, HotkeyCombo, HotkeyEvent, HotkeyMode, HotkeySession, SessionIntent,
 };
