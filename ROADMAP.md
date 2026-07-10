@@ -2,7 +2,7 @@
 
 Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-first, built as an embeddable platform component.
 
-**Current position: Phase 6 MVP implemented (2026-07-10) — `whisper-tray` UX shell (D-0013: tray icon with live states, settings + dictionary editor, level meter, onboarding) talking only to `/v1`; plus quiet-mic fix from the user's first live test (AGC-lite input gain, VAD threshold 0.5→0.35 configurable, `audio.level` event). ⚠️ Manual verification pending: re-test Czech at normal volume, tray app walkthrough (`docs/phase6-manual-verification.md`), rest of phase-5 checklist. Remaining: Fn/globe key, Phase 7 hardening.**
+**Current position: Phase 6 hardened + Phase 7 packaging started (2026-07-10). Feedback round 2 shipped: PUT-config 500 fix, default hotkey Ctrl+Alt (modifier-only, on by default), surfaced Input-Monitoring failure, modern dark sectioned UI with every config field editable (incl. VAD/AGC sliders), and Whisper.app/DMG packaging with tray-managed whisperd (D-0014: `scripts/package.sh`, `scripts/run.sh`, `docs/install.md`). ⚠️ Manual verification pending (docs/install.md + phase5/6 checklists): Czech at normal volume, Ctrl+Alt PTT into other apps, TCC grants. Remaining: UI polish round 2, app icon, Fn/globe key, notarization-less Gatekeeper caveat, rest of Phase 7.**
 
 ## Phase 0 — Environment & tooling bootstrap ✅ (2026-07-10)
 - Capability audit (`docs/CAPABILITY_AUDIT.md`), local skills, subagents, runtimes, memory files, verification gate.
@@ -36,7 +36,8 @@ Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-fi
 - Settings, onboarding, visualization; replaceable UI shell — `whisper-tray` (D-0013), API-only, needs no TCC
 - Sign-off gate: `docs/phase6-manual-verification.md`; polish items tracked in HANDOFF
 
-## Phase 7 — Hardening & release
-- Deploy checklist, packaging, docs, performance/latency tuning, plugin system maturity
+## Phase 7 — Hardening & release 🔶 packaging landed (2026-07-10)
+- ✅ Packaging: Whisper.app bundle + DMG, tray-managed daemon lifecycle, install docs (D-0014)
+- Remaining: deploy checklist, app icon + UI polish round 2, performance/latency tuning, plugin system maturity, signing/notarization decision
 
 Milestone rule: after every milestone — update this file + CHANGELOG, commit.
