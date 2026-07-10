@@ -24,11 +24,11 @@ See PROGRESS.md 2026-07-10 entries. Key artifacts:
 ## Unfinished / next steps
 1. Benchmark mikr/whisper-large-v3-czech-cv13 (needs GGML conversion) and Parakeet v3
    (sherpa-onnx) on our fixtures — extend `scripts/bench_stt.py`.
-2. Real-microphone Czech validation of the STT finalist (blocks the model ADR).
-3. ITN-aware WER scoring mode in `bench_stt.py`.
-4. Round 2 of the LLM cleanup eval belongs to Phase 2 (engineered prompt: few-shot
+2. Real-microphone Czech validation of the STT finalist (blocks the model ADR). Needs the
+   user: a few sentences of real Czech dictation recorded on the target machine.
+3. Round 2 of the LLM cleanup eval belongs to Phase 2 (engineered prompt: few-shot
    self-correction + anti-paraphrase; try qwen3:4b; cleanup-skip gate).
-5. Then Phase 2 architecture: ARCHITECTURE.md full design + ADRs (STT model, LLM model,
+4. Then Phase 2 architecture: ARCHITECTURE.md full design + ADRs (STT model, LLM model,
    stack language, insertion method — RESEARCH.md has the evidence base).
 
 ## Known issues / assumptions
