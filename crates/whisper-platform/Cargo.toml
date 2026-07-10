@@ -1,0 +1,10 @@
+[package]
+name = "whisper-platform"
+description = "macOS adapters implementing whisper-core's ports (mic, hotkeys, text insertion). See ARCHITECTURE.md §5."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+whisper-core = { path = "../whisper-core" }

@@ -1,0 +1,9 @@
+[package]
+name = "whisper-cli"
+description = "Thin HTTP client of the whisperd /v1/* API. See ARCHITECTURE.md §4, D-0009."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

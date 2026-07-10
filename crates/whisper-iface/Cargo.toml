@@ -1,0 +1,10 @@
+[package]
+name = "whisper-iface"
+description = "whisperd host: HTTP/WS interface layer over whisper-core. See ARCHITECTURE.md §4."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+whisper-core = { path = "../whisper-core" }

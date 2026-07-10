@@ -57,6 +57,12 @@ Append-only. Newest at bottom. Absolute dates.
 - Cross-agent review (opus, adversarial): 16 findings, 0 blockers, 8 MAJOR — all addressed: streaming partials rescoped to per-segment, long-session latency solved by incremental decoding, Ollama→llama.cpp parity guard added, Fn-key infeasibility via rdev documented, concurrency/WS-disconnect/model-load-failure semantics specified, latency header reconciled, Parakeet weights license flagged for verification, plugin hook deferred to Phase 4.
 - Review-surfaced risk register: rdev maintenance, whisper-rs↔whisper-cli parity, qwen3 GGUF re-measurement in-process, clipboard NFD round-trip.
 
+## 2026-07-10 — Phase 3: Rust workspace scaffold (Core Engine skeleton)
+- Rust 1.97 stable installed (brew rustup). Workspace scaffolded per D-0006: `crates/whisper-core` (ports AudioSource/SttEngine/CleanupEngine/TextSink/Vad, session FSM with Cancelled/Failed(best-text-so-far), pipeline orchestrator with event subscriber channel, JSON dictionary pass with whole-word UTF-8-safe substitutions) + stub crates whisper-iface/-platform/-cli. Implemented by sonnet-implementer, reviewed by Fable.
+- Gates: build/test/clippy -D warnings/fmt all clean; **23/23 tests** incl. byte-exact Czech diacritics round-trip, dictionary "merknout"→"mergnout", mid-pipeline cancellation, device-loss → Failed with partial text.
+- Noted for later: per-VAD-segment decoding lands with the real Silero/whisper adapters; NFC normalization is the STT-adapter boundary's job (§3.3); token checked between stages, in-loop capture cancellation arrives with real mic stream.
+- Next: whisper-rs STT adapter + parity test vs whisper-cli (opus task).
+
 ## Debt register
 
 (empty)
