@@ -14,6 +14,11 @@ whisper-rs = "0.16"
 unicode-normalization = "0.1"
 # WAV loading for the transcribe_file helper.
 hound = "3.5"
+# Silero VAD (D-0008): bundles the Silero V5 ONNX model (MIT); ONNX inference via `ort`.
+# No network at runtime — the model is embedded in the crate.
+voice_activity_detector = "0.2"
+# Error type for the VAD adapter.
+thiserror = "2"
 
 # whisper.cpp on Apple Silicon runs on Metal (D-0004).
 [target.'cfg(target_os = "macos")'.dependencies]

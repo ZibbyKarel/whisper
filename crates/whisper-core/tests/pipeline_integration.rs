@@ -213,7 +213,7 @@ fn full_pipeline_round_trips_czech_diacritics_byte_exact() {
 
     let mut pipeline = Pipeline::new(
         Box::new(audio),
-        Box::new(NoopVad),
+        Box::new(NoopVad::default()),
         Box::new(stt),
         Dictionary::empty(),
         Some(Box::new(IdentityCleanup)),
@@ -256,7 +256,7 @@ fn dictionary_pass_fixes_merknout_to_mergnout() {
 
     let mut pipeline = Pipeline::new(
         Box::new(audio),
-        Box::new(NoopVad),
+        Box::new(NoopVad::default()),
         Box::new(stt),
         dictionary,
         None,
@@ -288,7 +288,7 @@ fn cancellation_mid_pipeline_stops_before_delivery() {
 
     let mut pipeline = Pipeline::new(
         Box::new(audio),
-        Box::new(NoopVad),
+        Box::new(NoopVad::default()),
         Box::new(stt),
         Dictionary::empty(),
         None,
@@ -330,7 +330,7 @@ fn cleanup_failure_carries_best_text_so_far() {
 
     let mut pipeline = Pipeline::new(
         Box::new(audio),
-        Box::new(NoopVad),
+        Box::new(NoopVad::default()),
         Box::new(stt),
         dictionary,
         Some(Box::new(FailingCleanup)),
@@ -367,7 +367,7 @@ fn device_loss_surfaces_as_failed_with_partial_text() {
 
     let mut pipeline = Pipeline::new(
         Box::new(audio),
-        Box::new(NoopVad),
+        Box::new(NoopVad::default()),
         Box::new(stt),
         Dictionary::empty(),
         None,

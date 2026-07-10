@@ -47,7 +47,7 @@ fn real_model_through_pipeline_transcribes_czech() {
 
     let mut pipeline = Pipeline::new(
         Box::new(FixtureWavSource::new(&cs01)),
-        Box::new(NoopVad),
+        Box::new(NoopVad::default()),
         Box::new(stt),
         Dictionary::empty(),
         None,

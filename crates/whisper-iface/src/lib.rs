@@ -7,8 +7,10 @@
 //! reachable.
 
 pub mod stt;
+pub mod vad;
 
 pub use stt::{transcribe_file, WhisperCppEngine};
+pub use vad::{SileroVad, VadError};
 
 use whisper_core::pipeline::PipelineConfig;
 

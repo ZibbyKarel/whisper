@@ -6,21 +6,26 @@
 //! a later Phase-3 (opus) task. This crate currently only proves the downward dependency
 //! on `whisper-core`'s port traits compiles and is reachable.
 
-use whisper_core::ports::Vad;
+use whisper_core::ports::{NoopVad, Vad, VadEvent};
 
 /// Placeholder confirming the port surface is reachable from the platform crate.
 pub fn placeholder_status() -> &'static str {
     "whisper-platform: not yet implemented"
 }
 
-/// Trivial stand-in for the future platform VAD wiring; not the real Silero adapter
-/// (D-0008 lands later).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PlaceholderVad;
+/// Trivial stand-in confirming the streaming [`Vad`] port is reachable from the platform
+/// crate; the real Silero adapter (D-0008) lives in `whisper-iface`. Delegates to the core
+/// pass-through [`NoopVad`] (single segment over the whole stream).
+#[derive(Debug, Default)]
+pub struct PlaceholderVad(NoopVad);
 
 impl Vad for PlaceholderVad {
-    fn is_speech(&mut self, _frame: &[f32]) -> bool {
-        true
+    fn push(&mut self, frame: &[f32]) -> Vec<VadEvent> {
+        self.0.push(frame)
+    }
+
+    fn flush(&mut self) -> Vec<VadEvent> {
+        self.0.flush()
     }
 }
 
@@ -37,8 +42,10 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_vad_passes_everything_through() {
-        let mut vad = PlaceholderVad;
-        assert!(vad.is_speech(&[0.0_f32; 4]));
+    fn placeholder_vad_passes_everything_through_as_one_segment() {
+        let mut vad = PlaceholderVad::default();
+        let events = vad.push(&[0.0_f32; 4]);
+        assert_eq!(events.first(), Some(&VadEvent::SpeechStart));
+        assert_eq!(vad.flush(), vec![VadEvent::SpeechEnd]);
     }
 }

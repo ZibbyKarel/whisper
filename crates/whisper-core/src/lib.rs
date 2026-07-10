@@ -15,3 +15,4 @@ pub mod session;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod types;
+pub mod vad;

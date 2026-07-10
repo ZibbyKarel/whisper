@@ -69,6 +69,12 @@ Append-only. Newest at bottom. Absolute dates.
 - Gates: build/test (23 fast + 3 real-model)/clippy -D warnings/fmt clean. Real-model tests are `#[ignore]`d (run via `cargo test -p whisper-iface -- --ignored`).
 - Watched: whisper-cli's true default is beam-5 (our benchmark numbers) vs adapter greedy (byte-identical on fixtures, faster) — re-check on a bigger real corpus.
 
+## 2026-07-10 — Phase 3: Silero VAD + per-segment decoding + anti-hallucination proof
+- `Vad` port redesigned to a streaming segmenter (`push→VadEvent::{SpeechStart,SpeechFrame,SpeechEnd}` + `flush`); model-free trimming FSM in core (`vad.rs`, defaults: threshold 0.5, hangover 300 ms, max-silence 1 s), Silero V5 adapter in whisper-iface via `voice_activity_detector` 0.2.1 (MIT, model bundled, no runtime network). Pipeline decodes each segment at SpeechEnd during recording and emits `PartialTranscript` (§3.2 per-segment design now real). Implemented by opus-implementer, reviewed by Fable.
+- **Anti-hallucination test passes**: cs-03 + 4 s appended silence ⇒ byte-identical transcript to trimmed version, no "Titulky vytvořil JohnyX."; pure silence ⇒ empty text + clean Idle. D-0008's measured requirement is now enforced by code + regression test.
+- Gates: build / 27 fast + 5 real-model tests / clippy -D warnings / fmt — all clean.
+- Noted: `ort` fetches its onnxruntime binary at build time (cached; no runtime network) — flagged in D-0008 for air-gapped builds; VadConfig defaults need tuning on a bigger real corpus; PlaceholderVad in whisper-platform is now redundant (cleanup later).
+
 ## Debt register
 
 (empty)

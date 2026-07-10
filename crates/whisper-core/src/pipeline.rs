@@ -11,8 +11,8 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::dictionary::Dictionary;
-use crate::error::PipelineError;
-use crate::ports::{AudioSource, CleanupEngine, SttEngine, TextSink, Vad};
+use crate::error::{PipelineError, SttError};
+use crate::ports::{AudioSource, CleanupEngine, SttEngine, TextSink, Vad, VadEvent};
 use crate::session::{CancellationToken, FailureInfo, SessionFsm, SessionState};
 use crate::types::{AudioCfg, CleanupCtx, SttOpts};
 
@@ -28,6 +28,13 @@ pub struct PipelineConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineEvent {
     SessionStarted,
+    /// One VAD segment finished decoding during recording (`ARCHITECTURE.md` §3.2,
+    /// per-VAD-segment decoding). Emitted as segments close, before the joined
+    /// [`RawTranscript`](PipelineEvent::RawTranscript). This is the v1 partial: segment-
+    /// granular, not word-level.
+    PartialTranscript {
+        segment_text: String,
+    },
     RawTranscript {
         text: String,
         lang: String,
@@ -120,13 +127,25 @@ impl Pipeline {
             Err(err) => return self.fail(&mut fsm, PipelineError::from(err), None),
         };
 
-        let mut pcm: Vec<f32> = Vec::new();
+        // Streaming VAD segmentation with per-segment decoding (`ARCHITECTURE.md` §3.2,
+        // D-0008): frames flow through the VAD, and each segment is decoded as it closes —
+        // during the capture loop — so whisper never sees the multi-second silence that
+        // triggers the "Titulky vytvořil JohnyX." hallucination, and earlier segments'
+        // decode overlaps recording.
+        let mut segment_texts: Vec<String> = Vec::new();
+        let mut current: Vec<f32> = Vec::new(); // PCM of the currently-open segment
+        let mut lang: Option<String> = None;
         let mut device_error = None;
         loop {
             match stream.next_frame() {
                 Ok(Some(frame)) => {
-                    if self.vad.is_speech(&frame) {
-                        pcm.extend_from_slice(&frame);
+                    let events = self.vad.push(&frame);
+                    if let Err(err) =
+                        self.drain_vad_events(events, &mut current, &mut segment_texts, &mut lang)
+                    {
+                        // Segment decode failed mid-recording: fail carrying what decoded.
+                        let partial = Self::join_nonempty(&segment_texts);
+                        return self.fail(&mut fsm, PipelineError::from(err), partial);
                     }
                 }
                 Ok(None) => break,
@@ -138,26 +157,43 @@ impl Pipeline {
         }
 
         if let Some(err) = device_error {
-            let partial_text = self.best_effort_transcript(&pcm);
+            // Best-effort: already-decoded segments plus a decode of the open segment's
+            // buffer ("raw transcript beats nothing", `ARCHITECTURE.md` §3.2).
+            let mut parts = segment_texts.clone();
+            if !current.is_empty() {
+                if let Ok(t) = self.stt.transcribe(&current, &SttOpts::default()) {
+                    parts.push(t.text);
+                }
+            }
+            let partial_text = Self::join_nonempty(&parts);
             return self.fail(&mut fsm, PipelineError::from(err), partial_text);
         }
 
+        // End of stream: close any segment the VAD still holds open.
+        let flush_events = self.vad.flush();
+        if let Err(err) =
+            self.drain_vad_events(flush_events, &mut current, &mut segment_texts, &mut lang)
+        {
+            let partial = Self::join_nonempty(&segment_texts);
+            return self.fail(&mut fsm, PipelineError::from(err), partial);
+        }
+
         if token.is_cancelled() {
-            return self.cancel(&mut fsm, None);
+            return self.cancel(&mut fsm, Self::join_nonempty(&segment_texts));
         }
 
         fsm.transition(SessionState::Transcribing)
             .expect("Recording->Transcribing is always valid here");
-        let transcript = match self.stt.transcribe(&pcm, &SttOpts::default()) {
-            Ok(t) => t,
-            Err(err) => return self.fail(&mut fsm, PipelineError::from(err), None),
-        };
+        // Final text = segments joined with a single space (formatting pass handles
+        // punctuation/casing joins later, `ARCHITECTURE.md` §3.2). An all-silence session
+        // yields no segments and an empty transcript — a clean result, not an error.
+        let raw_text = segment_texts.join(" ");
         self.emit(PipelineEvent::RawTranscript {
-            text: transcript.text.clone(),
-            lang: transcript.lang.clone(),
+            text: raw_text.clone(),
+            lang: lang.clone().unwrap_or_default(),
         });
 
-        let dict_text = self.dictionary.apply(&transcript.text);
+        let dict_text = self.dictionary.apply(&raw_text);
         self.emit(PipelineEvent::DictionaryApplied {
             text: dict_text.clone(),
         });
@@ -210,16 +246,46 @@ impl Pipeline {
         }
     }
 
-    /// Best-effort transcript of whatever PCM was captured before a failure (e.g. device
-    /// loss mid-recording) — "raw transcript beats nothing" (`ARCHITECTURE.md` §3.2).
-    fn best_effort_transcript(&self, pcm: &[f32]) -> Option<String> {
-        if pcm.is_empty() {
-            return None;
+    /// Apply a batch of [`VadEvent`]s: accumulate `SpeechFrame` PCM into the open segment,
+    /// and on `SpeechEnd` decode that segment, emit its [`PipelineEvent::PartialTranscript`]
+    /// and record it. `SpeechStart` resets the open-segment buffer.
+    fn drain_vad_events(
+        &self,
+        events: Vec<VadEvent>,
+        current: &mut Vec<f32>,
+        segment_texts: &mut Vec<String>,
+        lang: &mut Option<String>,
+    ) -> Result<(), SttError> {
+        for event in events {
+            match event {
+                VadEvent::SpeechStart => current.clear(),
+                VadEvent::SpeechFrame(frame) => current.extend_from_slice(&frame),
+                VadEvent::SpeechEnd => {
+                    if !current.is_empty() {
+                        let transcript = self.stt.transcribe(current, &SttOpts::default())?;
+                        if lang.is_none() {
+                            *lang = Some(transcript.lang.clone());
+                        }
+                        self.emit(PipelineEvent::PartialTranscript {
+                            segment_text: transcript.text.clone(),
+                        });
+                        segment_texts.push(transcript.text);
+                    }
+                    current.clear();
+                }
+            }
         }
-        self.stt
-            .transcribe(pcm, &SttOpts::default())
-            .ok()
-            .map(|t| t.text)
+        Ok(())
+    }
+
+    /// Join decoded segments with single spaces, or `None` if there are none — used for the
+    /// best-text-so-far carried on `Cancelled`/`Failed` (`ARCHITECTURE.md` §3.2).
+    fn join_nonempty(segment_texts: &[String]) -> Option<String> {
+        if segment_texts.is_empty() {
+            None
+        } else {
+            Some(segment_texts.join(" "))
+        }
     }
 
     fn fail(

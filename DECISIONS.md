@@ -59,7 +59,7 @@ Format defined in `.claude/skills/architecture-adr/SKILL.md`. Never renumber; su
 - **Context:** Measured on the user's real recording: 3 s of trailing silence made every whisper model hallucinate "Titulky vytvořil JohnyX."; trimming the silence removed it. Silero VAD is the de-facto local standard (Handy ships it via vad-rs; MIT).
 - **Decision:** Streaming Silero VAD gates capture: whisper receives speech segments only, never >~1 s of contiguous silence; VAD also provides utterance segmentation for streaming partials.
 - **Alternatives:** No VAD / energy threshold — rejected: hallucination measured, and Whisper wastes compute on silence. Parakeet-style silence-robust model — not applicable to the whisper default.
-- **Consequences:** Anti-hallucination test joins the fixture suite (silence-padded clips must transcribe identically to trimmed ones). VAD params (thresholds, hangover) need tuning on real recordings in Phase 3.
+- **Consequences:** Anti-hallucination test joins the fixture suite (silence-padded clips must transcribe identically to trimmed ones). VAD params (thresholds, hangover) need tuning on real recordings in Phase 3. Implementation note (2026-07-10): shipped via `voice_activity_detector` 0.2.1 (MIT, Silero V5 bundled — no runtime network); its `ort` dependency downloads the onnxruntime binary at **build** time (cached) — vendor it if fully air-gapped builds become a requirement.
 
 ## D-0009: Interface = localhost HTTP (control) + WebSocket (events) with JSON; CLI as client
 - **Date:** 2026-07-10 · **Status:** accepted
