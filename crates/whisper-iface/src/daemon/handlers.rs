@@ -97,7 +97,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
     Json(StatusResponse {
         phase: s.phase.as_str().to_string(),
         version: state.version.clone(),
-        uptime_ms: state.started.elapsed().as_millis(),
+        uptime_ms: state.started.elapsed().as_millis() as u64,
         active_session: state.active_session(),
         stt: ModelStatus {
             ready: s.stt_ready,

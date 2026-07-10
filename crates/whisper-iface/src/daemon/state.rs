@@ -26,10 +26,10 @@ use super::config::Config;
 use super::store::SessionStore;
 
 /// Unix-epoch milliseconds, the timestamp unit used across the `/v1` contract.
-pub fn now_ms() -> u128 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 

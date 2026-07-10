@@ -1,8 +1,11 @@
 # HANDOFF
 
 ## Current state
-Phases 1–4 complete; Phase 5 implemented, **pending manual hardware verification**
-(2026-07-10). Full stack: core pipeline (whisper.cpp STT parity-proven, Silero VAD
+Phases 1–4 complete; Phases 5–6 implemented, **pending manual verification**
+(2026-07-10). User's first live test: English great, Czech needed loud speech → fixed
+same day (AGC-lite gain, VAD threshold 0.35, `audio.level` meter event). Phase 6 MVP:
+`whisper-tray` (D-0013) — tray states, settings + dictionary editor, level meter,
+onboarding; API-only, no TCC needed by the shell. Full stack: core pipeline (whisper.cpp STT parity-proven, Silero VAD
 per-segment + anti-hallucination test, qwen3:8b cleanup KV-prefix cached 1.1 s/call
 release, guard WER 0.019/0 traps — prompt frozen, skip-gate Auto) → `whisperd` daemon
 (axum 127.0.0.1, actor over `!Send` engines, 409 semantics, SQLite history opt-in,
@@ -39,9 +42,12 @@ findings addressed).
    at normal speaking volume after the fix; rest of the checklist
    (`docs/phase5-manual-verification.md`: Secure Input, device unplug) still pending.
 2. Phase-5 remainder: Fn/globe-key capture (NSEvent flagsChanged/IOKit path behind the
-   same hotkey port); tray/menu-bar (with Phase 6 UX shell).
-3. Phase 6: UX layer — settings/onboarding/visualization shell talking only to the
-   Interface Layer (replaceable per constitution).
+   same hotkey port).
+3. Phase 6 follow-ups: manual walkthrough of `whisper-tray`
+   (`docs/phase6-manual-verification.md` — onboarding, icon states, settings round-trip,
+   dockless Accessory policy on real desktop); async HTTP off the UI thread; contract
+   mirror (ux/api.rs ↔ daemon/api.rs) has no compile-time link — update both on any /v1
+   change (JSON fixtures fail loudly).
 4. Phase-4 follow-ups (tracked, not blocking): queued one-shot transcribe behind active
    session (now immediate 409); config sentinel to disable cleanup via config.toml;
    HTTP-input sample-rate check/resample (16 kHz WAV assumed on audio_b64/path — mic

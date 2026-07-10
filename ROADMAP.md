@@ -2,7 +2,7 @@
 
 Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-first, built as an embeddable platform component.
 
-**Current position: Phase 5 (macOS platform layer) implemented (2026-07-10) — cpal mic → live `{"source":"mic"}` sessions, rdev hotkey (PTT/toggle), pasteboard+Cmd-V with Secure Input detect-never-bypass, all behind whisperd cargo feature `platform`. ⚠️ Pending manual hardware verification (`docs/phase5-manual-verification.md` — TCC permissions need the user). Remaining: Fn/globe key, tray. Next: Phase 6 UX layer.**
+**Current position: Phase 6 MVP implemented (2026-07-10) — `whisper-tray` UX shell (D-0013: tray icon with live states, settings + dictionary editor, level meter, onboarding) talking only to `/v1`; plus quiet-mic fix from the user's first live test (AGC-lite input gain, VAD threshold 0.5→0.35 configurable, `audio.level` event). ⚠️ Manual verification pending: re-test Czech at normal volume, tray app walkthrough (`docs/phase6-manual-verification.md`), rest of phase-5 checklist. Remaining: Fn/globe key, Phase 7 hardening.**
 
 ## Phase 0 — Environment & tooling bootstrap ✅ (2026-07-10)
 - Capability audit (`docs/CAPABILITY_AUDIT.md`), local skills, subagents, runtimes, memory files, verification gate.
@@ -32,8 +32,9 @@ Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-fi
 - Global hotkey (push-to-talk / toggle), mic permissions, text insertion into focused app — done behind `platform` feature; menu-bar presence → Phase 6; Fn/globe key → follow-up work item
 - Sign-off gate: `docs/phase5-manual-verification.md` (requires user-granted TCC permissions)
 
-## Phase 6 — UX Layer + polish
-- Settings, onboarding, visualization; replaceable UI shell
+## Phase 6 — UX Layer + polish 🔶 MVP implemented, pending manual verification (2026-07-10)
+- Settings, onboarding, visualization; replaceable UI shell — `whisper-tray` (D-0013), API-only, needs no TCC
+- Sign-off gate: `docs/phase6-manual-verification.md`; polish items tracked in HANDOFF
 
 ## Phase 7 — Hardening & release
 - Deploy checklist, packaging, docs, performance/latency tuning, plugin system maturity

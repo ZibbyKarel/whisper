@@ -114,6 +114,13 @@ Append-only. Newest at bottom. Absolute dates.
 - VAD default threshold **0.5 → 0.35**; new `[vad]` config section (threshold/hangover/max_silence), validated in PUT /v1/config (400 on out-of-range), applied per next session via shared `Arc<RwLock<VadConfig>>`. **Anti-hallucination regression re-proven at 0.35** (4 s silence → identical transcript; pure silence → empty) + e2e + daemon real-model tests green.
 - New WS event `audio.level {rms, peak}` (post-gain, 10 Hz) for the tray app's level meter. Implemented by opus-implementer, reviewed by Fable (AutoGain math + wiring); gates independently re-run: 109 fast tests, clippy -D warnings both configs, fmt.
 
+## 2026-07-10 — Phase 6 (MVP): whisper-tray UX shell (D-0013)
+- New crate `whisper-ux`, binary `whisper-tray`: tray-icon NSStatusItem (idle/recording/processing/error, programmatic icons, template idle for dark mode) + eframe/egui settings window (language, cleanup mode, delivery, hotkey with applied/staged display, dictionary editor with inline validation, daemon port) + live level meter (`audio.level`) + partial-transcript display + 4-step onboarding (daemon health, permission acks, test dictation; state in config_dir/whisper-tray/state.json). Implemented by opus-implementer, reviewed by Fable (tray state machine verified pure + correct).
+- Constitution held: zero dependency on whisper-core/-iface/-platform — hand-mirrored `/v1` contract in ux `api.rs` with verbatim JSON fixtures as drift tripwires; WS listener thread with exponential backoff (0.5→10 s), resync via GET /v1/status on reconnect. Shell needs no TCC permissions (daemon owns them) — layering reinforced.
+- Gates (independently re-run): 39 ux tests, clippy --workspace -D warnings, fmt, whisper-tray links (macOS Accessory/dockless policy is compile-verified — real behavior in `docs/phase6-manual-verification.md`). Deps: tray-icon, eframe/egui, winit, tungstenite, ureq, dirs — MIT/Apache-2.0.
+- Follow-up applied: daemon `/v1` timestamps unified `u128`→`u64` (serde_json cannot deserialize u128; epoch-millis fit u64) so the mirror matches the daemon exactly.
+- Known limits: hand-kept contract mirror (no compile-time link daemon↔ux — fixtures fail loudly on drift); blocking localhost HTTP on UI thread (MVP); GUI itself is manual-verification only.
+
 ## Debt register
 
 (empty)

@@ -115,12 +115,12 @@ pub struct SessionRecord {
     pub latency: LatencyInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    pub created_at_ms: u128,
+    pub created_at_ms: u64,
 }
 
 impl SessionRecord {
     /// A freshly admitted, not-yet-run session placeholder.
-    pub fn running(session_id: String, created_at_ms: u128) -> Self {
+    pub fn running(session_id: String, created_at_ms: u64) -> Self {
         Self {
             session_id,
             status: SessionStatusDto::Running,
@@ -168,7 +168,7 @@ pub struct StatusResponse {
     /// `loading` | `ready` | `degraded` (cleanup off) | `unavailable` (STT failed).
     pub phase: String,
     pub version: String,
-    pub uptime_ms: u128,
+    pub uptime_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_session: Option<String>,
     pub stt: ModelStatus,
@@ -195,64 +195,64 @@ pub struct ConfigUpdateResponse {
 pub enum ApiEvent {
     ModelLoading {
         model: String,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     ModelReady {
         model: String,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     ModelLoadFailed {
         model: String,
         error: String,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     SessionStarted {
         session_id: String,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     PartialTranscript {
         session_id: String,
         segment_text: String,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     RawTranscript {
         session_id: String,
         text: String,
         lang: String,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     DictionaryApplied {
         session_id: String,
         text: String,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     CleanupSkipped {
         session_id: String,
         reason: String,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     Cleaned {
         session_id: String,
         text: String,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     Delivered {
         session_id: String,
         text: String,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     Cancelled {
         session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         partial_text: Option<String>,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     Failed {
         session_id: String,
         error: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         partial_text: Option<String>,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     // The three platform events below keep the dotted names `ARCHITECTURE.md` §4 lists
     // verbatim (`secure_input.blocked`, `audio.device_lost`, `platform.permission`); the
@@ -265,7 +265,7 @@ pub enum ApiEvent {
         session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         owner: Option<String>,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     /// The capture device dropped mid-session (e.g. a Bluetooth mic, `ARCHITECTURE.md` §3.1).
     /// Emitted alongside the session's `failed` event, which carries the partial transcript.
@@ -274,7 +274,7 @@ pub enum ApiEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         reason: String,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     /// Throttled (~10 Hz) input-level telemetry for a live mic session (`ARCHITECTURE.md` §5,
     /// D-0013 level meter). `rms`/`peak` are post-gain linear amplitude in `[0.0, 1.0]`.
@@ -283,7 +283,7 @@ pub enum ApiEvent {
         session_id: String,
         rms: f32,
         peak: f32,
-        ts_ms: u128,
+        ts_ms: u64,
     },
     /// A platform permission the engine needs is missing (`ARCHITECTURE.md` §5: surfaced as an
     /// event, never a blocking dialog in core). `permission` is e.g. `"microphone"`.
@@ -295,7 +295,7 @@ pub enum ApiEvent {
         granted: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
-        ts_ms: u128,
+        ts_ms: u64,
     },
 }
 
