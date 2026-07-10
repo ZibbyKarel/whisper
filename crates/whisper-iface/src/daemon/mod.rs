@@ -10,6 +10,8 @@
 pub mod api;
 pub mod config;
 pub mod handlers;
+#[cfg(feature = "platform")]
+pub mod platform;
 pub mod state;
 pub mod store;
 pub mod worker;
@@ -32,9 +34,10 @@ use whisper_core::vad::VadConfig;
 
 use self::config::Config;
 use self::handlers::ApiErr;
+use self::state::LiveSourceProvider;
 use self::state::{AppState, DictionaryState};
 use self::store::SessionStore;
-use self::worker::{BuildCtx, EngineBuilder, LangInjectingStt, ResidentEngines};
+use self::worker::{null_sink_builder, BuildCtx, EngineBuilder, LangInjectingStt, ResidentEngines};
 use crate::{LlamaCleanupEngine, SileroVad, WhisperCppEngine};
 
 /// Broadcast backlog per WS subscriber before it starts lagging (best-effort, `ARCHITECTURE.md`
@@ -47,6 +50,7 @@ pub fn build_state(
     config: Config,
     config_path: Option<PathBuf>,
     builder: EngineBuilder,
+    live_source: Option<LiveSourceProvider>,
 ) -> Result<Arc<AppState>, String> {
     let (events, _rx) = broadcast::channel(EVENT_CHANNEL_CAP);
     let (cmd_tx, cmd_rx) = mpsc::channel(4);
@@ -69,6 +73,7 @@ pub fn build_state(
         dictionary,
         lang,
         store,
+        live_source,
     ));
 
     // The worker holds only a Weak ref, so dropping the daemon (all strong Arcs) closes the
@@ -195,9 +200,10 @@ impl Daemon {
         config: Config,
         config_path: Option<PathBuf>,
         builder: EngineBuilder,
+        live_source: Option<LiveSourceProvider>,
     ) -> Result<Daemon, String> {
         let bind = format!("{}:{}", config.bind, config.port);
-        let state = build_state(config, config_path, builder)?;
+        let state = build_state(config, config_path, builder, live_source)?;
         let router = build_router(state.clone());
 
         let listener = tokio::net::TcpListener::bind(&bind)
@@ -289,6 +295,18 @@ pub fn production_engine_builder(
     cleanup_path: Option<PathBuf>,
     vad_config: VadConfig,
 ) -> EngineBuilder {
+    // Headless default: delivery is "available via the API".
+    production_engine_builder_with_sink(stt_path, cleanup_path, vad_config, null_sink_builder())
+}
+
+/// Like [`production_engine_builder`] but with an explicit delivery [`SinkBuilder`](worker::SinkBuilder)
+/// — the seam the `platform` feature uses to install the pasteboard sink (D-0012).
+pub fn production_engine_builder_with_sink(
+    stt_path: PathBuf,
+    cleanup_path: Option<PathBuf>,
+    vad_config: VadConfig,
+    sink_builder: worker::SinkBuilder,
+) -> EngineBuilder {
     let stt_label = file_label(&stt_path);
     Box::new(move |ctx: BuildCtx| {
         let stt = WhisperCppEngine::load(&stt_path).map_err(|e| e.to_string())?;
@@ -322,6 +340,7 @@ pub fn production_engine_builder(
             cleanup_model_label,
             cleanup_load_error,
             vad_builder,
+            sink_builder,
         })
     })
 }

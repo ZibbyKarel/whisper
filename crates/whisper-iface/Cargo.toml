@@ -6,8 +6,15 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Off by default so the headless build stays pure (D-0012). Enabling it composes the macOS
+# platform adapters (cpal mic, rdev hotkey, pasteboard sink) into whisperd.
+platform = ["dep:whisper-platform"]
+
 [dependencies]
 whisper-core = { path = "../whisper-core" }
+# macOS platform adapters, only linked with the `platform` feature (D-0012).
+whisper-platform = { path = "../whisper-platform", optional = true }
 # Production STT adapter (ARCHITECTURE.md §3.1: heavy native deps live here, not in core).
 whisper-rs = "0.16"
 # NFC normalization boundary for STT output (ARCHITECTURE.md §3.3).

@@ -1,51 +1,33 @@
-//! `whisper-platform` implements `whisper-core`'s ports for macOS: mic capture (cpal),
-//! global hotkeys (rdev), and pasteboard text insertion (`ARCHITECTURE.md` §5, D-0006,
-//! D-0007). Other OSes are ports-designed-for but not implemented (`ARCHITECTURE.md` §8).
+//! `whisper-platform` implements `whisper-core`'s ports for macOS (`ARCHITECTURE.md` §5,
+//! D-0006/D-0007/D-0012): mic capture (cpal → 16 kHz mono), a global hotkey listener (rdev,
+//! push-to-talk + toggle), and pasteboard text insertion (save → set → Cmd-V → restore, NFC
+//! read-back, Secure Input detect-never-bypass). Other OSes are ports-designed-for but not
+//! implemented (`ARCHITECTURE.md` §8).
 //!
-//! Not yet implemented: no real OS adapters exist yet — cpal/rdev/pasteboard bindings are
-//! a later Phase-3 (opus) task. This crate currently only proves the downward dependency
-//! on `whisper-core`'s port traits compiles and is reachable.
+//! Layering: this crate depends only on `whisper-core`'s port traits — never on
+//! `whisper-iface` (D-0012). Events it must surface upward (device loss) are delivered through
+//! caller-supplied callbacks, so the daemon owns the wire format, not this crate.
+//!
+//! Hardware paths (opening a device, synthesizing keys, listening for global input) require
+//! macOS TCC grants that CI cannot provide (D-0012); they live behind `#[cfg(target_os =
+//! "macos")]` and are only exercised by `#[ignore]` tests + the manual checklist in
+//! `docs/phase5-manual-verification.md`. All decision logic (downmix/resample math, the NFC
+//! pasteboard round-trip, the Secure-Input gate, hotkey combo parsing and the push-to-talk /
+//! toggle state machines) is factored behind trait/data seams and unit-tested without hardware.
 
-use whisper_core::ports::{NoopVad, Vad, VadEvent};
+pub mod audio;
+pub mod hotkey;
+pub mod paste;
 
-/// Placeholder confirming the port surface is reachable from the platform crate.
-pub fn placeholder_status() -> &'static str {
-    "whisper-platform: not yet implemented"
-}
+pub use audio::{downmix_to_mono, CaptureError, StreamResampler, TARGET_SAMPLE_RATE_HZ};
+pub use hotkey::{
+    ComboTracker, HotkeyCombo, HotkeyEvent, HotkeyMode, HotkeySession, SessionIntent,
+};
+pub use paste::{Clipboard, KeySynth, PasteboardSink, SecureInput, DEFAULT_RESTORE_DELAY};
 
-/// Trivial stand-in confirming the streaming [`Vad`] port is reachable from the platform
-/// crate; the real Silero adapter (D-0008) lives in `whisper-iface`. Delegates to the core
-/// pass-through [`NoopVad`] (single segment over the whole stream).
-#[derive(Debug, Default)]
-pub struct PlaceholderVad(NoopVad);
-
-impl Vad for PlaceholderVad {
-    fn push(&mut self, frame: &[f32]) -> Vec<VadEvent> {
-        self.0.push(frame)
-    }
-
-    fn flush(&mut self) -> Vec<VadEvent> {
-        self.0.flush()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn placeholder_status_reports_stub_state() {
-        assert_eq!(
-            placeholder_status(),
-            "whisper-platform: not yet implemented"
-        );
-    }
-
-    #[test]
-    fn placeholder_vad_passes_everything_through_as_one_segment() {
-        let mut vad = PlaceholderVad::default();
-        let events = vad.push(&[0.0_f32; 4]);
-        assert_eq!(events.first(), Some(&VadEvent::SpeechStart));
-        assert_eq!(vad.flush(), vec![VadEvent::SpeechEnd]);
-    }
-}
+#[cfg(target_os = "macos")]
+pub use audio::CpalAudioSource;
+#[cfg(target_os = "macos")]
+pub use hotkey::spawn_listener;
+#[cfg(target_os = "macos")]
+pub use paste::{macos_pasteboard_sink, secure_input_enabled};

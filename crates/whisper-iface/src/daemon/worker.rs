@@ -22,14 +22,16 @@ use tokio::sync::mpsc;
 use whisper_core::dictionary::Dictionary;
 use whisper_core::error::{AudioError, CleanupError, DeliverError, SttError};
 use whisper_core::pipeline::{CleanupMode, Pipeline, PipelineConfig, PipelineEvent};
-use whisper_core::ports::{AudioSource, AudioStream, CleanupEngine, SttEngine, TextSink, Vad};
+use whisper_core::ports::{
+    AudioSource, AudioStream, CleanupEngine, DeliverOutcome, SttEngine, TextSink, Vad,
+};
 use whisper_core::skip_gate::SkipGateConfig;
 use whisper_core::types::{AudioCfg, AudioFrame, CleanupCtx, SttOpts, TranscriptRaw};
 
 use super::api::{
     skip_reason_str, ApiEvent, CleanupInfo, LatencyInfo, SessionRecord, SessionStatusDto,
 };
-use super::state::{now_ms, AppState, EnginePhase, Job};
+use super::state::{now_ms, AppState, EnginePhase, Job, JobAudio, SinkKind};
 
 /// Context handed to the engine builder so it can wire runtime-configurable knobs into the
 /// resident engines without rebuilding them later (e.g. STT language, D-0004 `-l cs`).
@@ -52,6 +54,22 @@ pub struct ResidentEngines {
     pub cleanup_load_error: Option<String>,
     /// Builds a fresh VAD per session (segmenter/buffer state must start clean each time).
     pub vad_builder: Box<dyn Fn() -> Result<Box<dyn Vad>, String>>,
+    /// Builds the delivery sink for a session's [`SinkKind`] (D-0012). The default (headless)
+    /// builder ignores the kind and always returns [`NullSink`]; the `platform` builder maps
+    /// `Paste` to a pasteboard sink. Kept in the engine set so the sink is constructed on the
+    /// worker thread (a `PasteboardSink` is `!Send`).
+    pub sink_builder: SinkBuilder,
+}
+
+/// Builds a per-session delivery [`TextSink`] from a [`SinkKind`] (D-0012). `Send` because it is
+/// captured by the `Send` [`EngineBuilder`] closure and moved to the worker thread; the sink it
+/// *produces* need not be `Send` (it is built and used only on that thread).
+pub type SinkBuilder = Box<dyn Fn(SinkKind) -> Box<dyn TextSink> + Send>;
+
+/// The headless default sink builder: delivery means "available via the API", so every kind maps
+/// to [`NullSink`]. Used by [`crate::production_engine_builder`] and the contract-test fakes.
+pub fn null_sink_builder() -> SinkBuilder {
+    Box::new(|_kind| Box::new(NullSink) as Box<dyn TextSink>)
 }
 
 /// Closure that constructs the resident engines *on the worker thread*. Must be `Send` (it is
@@ -206,13 +224,37 @@ fn process_job(state: &AppState, engines: &ResidentEngines, job: Job) {
         .clone()
         .map(|c| Box::new(RcCleanup(c)) as Box<dyn CleanupEngine>);
 
+    // Build the audio source. For a live mic session the factory eager-opens the device here, so
+    // a permission/device failure is finalized cleanly (the factory already emitted
+    // `platform.permission` for a denial, D-0012).
+    let source: Box<dyn AudioSource> = match job.audio {
+        JobAudio::Pcm(pcm) => Box::new(VecAudioSource::new(pcm)),
+        JobAudio::Live(factory) => match factory() {
+            Ok(source) => source,
+            Err(err) => {
+                let msg = err.to_string();
+                let record = failed_record(&job.session_id, msg.clone());
+                state.emit(ApiEvent::Failed {
+                    session_id: job.session_id.clone(),
+                    error: msg,
+                    partial_text: None,
+                    ts_ms: now_ms(),
+                });
+                finalize(state, &job.session_id, record);
+                return;
+            }
+        },
+    };
+
+    let sink = (engines.sink_builder)(job.sink);
+
     let mut pipeline = Pipeline::new(
-        Box::new(VecAudioSource::new(job.pcm)),
+        source,
         vad,
         Box::new(RcStt(engines.stt.clone())),
         dictionary,
         cleanup,
-        Box::new(NullSink),
+        sink,
         PipelineConfig {
             cleanup_mode,
             skip_gate: SkipGateConfig::default(),
@@ -247,6 +289,7 @@ fn finalize(state: &AppState, session_id: &str, record: SessionRecord) {
         let _ = tx.send(record);
     }
     let _ = state.take_cancel(session_id);
+    let _ = state.take_capture(session_id);
     state.end_active();
 }
 
@@ -349,6 +392,13 @@ fn forward_events(
                 let _ = events.send(ApiEvent::Cleaned {
                     session_id: session_id.clone(),
                     text,
+                    ts_ms,
+                });
+            }
+            PipelineEvent::SecureInputBlocked { owner } => {
+                let _ = events.send(ApiEvent::SecureInputBlocked {
+                    session_id: session_id.clone(),
+                    owner,
                     ts_ms,
                 });
             }
@@ -456,8 +506,8 @@ impl AudioStream for VecAudioStream {
 struct NullSink;
 
 impl TextSink for NullSink {
-    fn deliver(&self, _text: &str) -> Result<(), DeliverError> {
-        Ok(())
+    fn deliver(&self, _text: &str) -> Result<DeliverOutcome, DeliverError> {
+        Ok(DeliverOutcome::Injected)
     }
 }
 

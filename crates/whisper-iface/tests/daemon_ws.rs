@@ -21,7 +21,7 @@ async fn ws_streams_session_lifecycle_events() {
         cleanup_mode: whisper_iface::daemon::api::CleanupModeDto::Never,
         ..Config::default()
     };
-    let daemon = Daemon::start(config, None, fake_builder())
+    let daemon = Daemon::start(config, None, fake_builder(), None)
         .await
         .expect("start daemon");
 

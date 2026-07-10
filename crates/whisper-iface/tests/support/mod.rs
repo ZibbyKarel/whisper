@@ -13,13 +13,18 @@ use axum::Router;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use whisper_core::error::SttError;
-use whisper_core::ports::{CleanupEngine, NoopVad, SttEngine, Vad};
-use whisper_core::types::{CleanupCtx, SttOpts, TranscriptRaw};
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use whisper_core::error::{AudioError, SttError};
+use whisper_core::ports::{AudioSource, AudioStream, CleanupEngine, NoopVad, SttEngine, Vad};
+use whisper_core::types::{AudioCfg, AudioFrame, CleanupCtx, SttOpts, TranscriptRaw};
+
+use whisper_iface::daemon::api::ApiEvent;
 use whisper_iface::daemon::config::Config;
-use whisper_iface::daemon::state::{AppState, EnginePhase};
-use whisper_iface::daemon::worker::{BuildCtx, EngineBuilder, ResidentEngines};
+use whisper_iface::daemon::state::{
+    AppState, AudioSourceFactory, EnginePhase, LiveSourceCtx, LiveSourceProvider,
+};
+use whisper_iface::daemon::worker::{null_sink_builder, BuildCtx, EngineBuilder, ResidentEngines};
 use whisper_iface::{build_router, build_state};
 
 /// The canonical Czech pangram — every diacritic in one sentence. Fake STT returns it so tests
@@ -88,6 +93,7 @@ pub fn fake_builder() -> EngineBuilder {
             cleanup_model_label: None,
             cleanup_load_error: None,
             vad_builder: Box::new(|| Ok(Box::new(NoopVad::default()) as Box<dyn Vad>)),
+            sink_builder: null_sink_builder(),
         })
     })
 }
@@ -105,6 +111,7 @@ pub fn fake_builder_with_cleanup() -> EngineBuilder {
             cleanup_model_label: Some("fake-cleanup".to_string()),
             cleanup_load_error: None,
             vad_builder: Box::new(|| Ok(Box::new(NoopVad::default()) as Box<dyn Vad>)),
+            sink_builder: null_sink_builder(),
         })
     })
 }
@@ -130,15 +137,178 @@ pub fn gate_builder() -> (
             cleanup_model_label: None,
             cleanup_load_error: None,
             vad_builder: Box::new(|| Ok(Box::new(NoopVad::default()) as Box<dyn Vad>)),
+            sink_builder: null_sink_builder(),
         })
     });
     (builder, started_rx, release_tx)
 }
 
+/// A fake live capture source (no CoreAudio): yields tiny frames until the shared `stop` flag is
+/// set (graceful stop), then reports end-of-stream. A safety cap guarantees termination.
+struct FakeMicSource {
+    stop: std::sync::Arc<AtomicBool>,
+}
+
+impl AudioSource for FakeMicSource {
+    fn start(&self, _cfg: AudioCfg) -> Result<Box<dyn AudioStream>, AudioError> {
+        Ok(Box::new(FakeMicStream {
+            stop: self.stop.clone(),
+            emitted: 0,
+        }))
+    }
+}
+
+struct FakeMicStream {
+    stop: std::sync::Arc<AtomicBool>,
+    emitted: usize,
+}
+
+impl AudioStream for FakeMicStream {
+    fn next_frame(&mut self) -> Result<Option<AudioFrame>, AudioError> {
+        if self.stop.load(Ordering::SeqCst) && self.emitted > 0 {
+            return Ok(None);
+        }
+        if self.emitted > 5000 {
+            return Ok(None); // safety cap so a test that never stops still terminates
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        self.emitted += 1;
+        Ok(Some(vec![0.0_f32; 160]))
+    }
+}
+
+/// A live-source provider that builds [`FakeMicSource`]s — injects the mic path into the actor
+/// without touching hardware (D-0012 testability).
+pub fn fake_live_source() -> LiveSourceProvider {
+    Box::new(|ctx: LiveSourceCtx| {
+        Box::new(move || Ok(Box::new(FakeMicSource { stop: ctx.stop }) as Box<dyn AudioSource>))
+            as AudioSourceFactory
+    })
+}
+
+/// A live-source provider whose factory emits a `platform.permission` denial and fails — models
+/// the microphone-permission-denied path (D-0012).
+pub fn fake_live_source_denied() -> LiveSourceProvider {
+    Box::new(|ctx: LiveSourceCtx| {
+        Box::new(move || {
+            let _ = ctx.events.send(ApiEvent::PlatformPermission {
+                session_id: Some(ctx.session_id.clone()),
+                permission: "microphone".to_string(),
+                granted: false,
+                detail: Some("test denial".to_string()),
+                ts_ms: 0,
+            });
+            Err(AudioError::StartFailed(
+                "microphone permission denied: test".to_string(),
+            ))
+        }) as AudioSourceFactory
+    })
+}
+
+/// A capturing delivery sink builder: records delivered text so a test can assert the paste path
+/// ran (stands in for the real pasteboard sink, which needs hardware). Returns the builder plus a
+/// handle to read what was delivered.
+pub fn capture_sink_builder() -> (
+    whisper_iface::daemon::worker::SinkBuilder,
+    std::sync::Arc<Mutex<Option<String>>>,
+) {
+    let captured = std::sync::Arc::new(Mutex::new(None));
+    let handle = captured.clone();
+    let builder: whisper_iface::daemon::worker::SinkBuilder = Box::new(move |kind| match kind {
+        whisper_iface::daemon::state::SinkKind::Paste => Box::new(CaptureDeliverySink {
+            captured: captured.clone(),
+        })
+            as Box<dyn whisper_core::ports::TextSink>,
+        whisper_iface::daemon::state::SinkKind::Null => {
+            Box::new(NullDeliverySink) as Box<dyn whisper_core::ports::TextSink>
+        }
+    });
+    (builder, handle)
+}
+
+struct CaptureDeliverySink {
+    captured: std::sync::Arc<Mutex<Option<String>>>,
+}
+impl whisper_core::ports::TextSink for CaptureDeliverySink {
+    fn deliver(
+        &self,
+        text: &str,
+    ) -> Result<whisper_core::ports::DeliverOutcome, whisper_core::error::DeliverError> {
+        *self.captured.lock().unwrap() = Some(text.to_string());
+        Ok(whisper_core::ports::DeliverOutcome::Injected)
+    }
+}
+
+struct NullDeliverySink;
+impl whisper_core::ports::TextSink for NullDeliverySink {
+    fn deliver(
+        &self,
+        _text: &str,
+    ) -> Result<whisper_core::ports::DeliverOutcome, whisper_core::error::DeliverError> {
+        Ok(whisper_core::ports::DeliverOutcome::Injected)
+    }
+}
+
+/// A sink builder whose `Paste` sink always reports a Secure-Input clipboard-only delivery with a
+/// fixed owner — models the D-0007 fallback so the daemon's `secure_input.blocked` WS mapping can
+/// be asserted without hardware.
+pub fn secure_input_sink_builder(owner: &str) -> whisper_iface::daemon::worker::SinkBuilder {
+    let owner = owner.to_string();
+    Box::new(move |_kind| {
+        Box::new(SecureInputDeliverySink {
+            owner: owner.clone(),
+        }) as Box<dyn whisper_core::ports::TextSink>
+    })
+}
+
+struct SecureInputDeliverySink {
+    owner: String,
+}
+impl whisper_core::ports::TextSink for SecureInputDeliverySink {
+    fn deliver(
+        &self,
+        _text: &str,
+    ) -> Result<whisper_core::ports::DeliverOutcome, whisper_core::error::DeliverError> {
+        Ok(whisper_core::ports::DeliverOutcome::ClipboardOnly {
+            owner: Some(self.owner.clone()),
+        })
+    }
+}
+
+/// A [`fake_builder`]-style engine builder that also installs a custom sink builder (for delivery
+/// tests). STT returns the fixed Czech text, VAD passes through, no cleanup.
+pub fn fake_builder_with_sink(
+    sink_builder: whisper_iface::daemon::worker::SinkBuilder,
+) -> EngineBuilder {
+    Box::new(move |_ctx: BuildCtx| {
+        Ok(ResidentEngines {
+            stt: Rc::new(FakeStt {
+                text: CZECH_TEXT.to_string(),
+            }),
+            stt_model_label: "fake-stt".to_string(),
+            cleanup: None,
+            cleanup_model_label: None,
+            cleanup_load_error: None,
+            vad_builder: Box::new(|| Ok(Box::new(NoopVad::default()) as Box<dyn Vad>)),
+            sink_builder,
+        })
+    })
+}
+
 /// Build a daemon state + router with the given config and engine builder, then block until the
 /// worker reports the engines are ready (fake engines load instantly).
 pub fn harness(config: Config, builder: EngineBuilder) -> (Arc<AppState>, Router) {
-    let state = build_state(config, None, builder).expect("build state");
+    harness_with_live(config, builder, None)
+}
+
+/// Like [`harness`] but with a live-capture provider injected — used to drive the mic session
+/// path headlessly (no CoreAudio) via [`fake_live_source`].
+pub fn harness_with_live(
+    config: Config,
+    builder: EngineBuilder,
+    live_source: Option<LiveSourceProvider>,
+) -> (Arc<AppState>, Router) {
+    let state = build_state(config, None, builder, live_source).expect("build state");
     // Wait for the worker thread to finish its (instant) model-load phase.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {

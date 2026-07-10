@@ -10,7 +10,9 @@ use whisper_core::error::{AudioError, CleanupError, DeliverError, SttError};
 use whisper_core::pipeline::{
     CleanupMode, CleanupSkipReason, Pipeline, PipelineConfig, PipelineEvent,
 };
-use whisper_core::ports::{AudioSource, AudioStream, CleanupEngine, NoopVad, SttEngine, TextSink};
+use whisper_core::ports::{
+    AudioSource, AudioStream, CleanupEngine, DeliverOutcome, NoopVad, SttEngine, TextSink,
+};
 use whisper_core::session::{CancellationToken, SessionState};
 use whisper_core::skip_gate::SkipGateConfig;
 use whisper_core::types::{AudioCfg, CleanupCtx, SttOpts, TranscriptRaw};
@@ -208,9 +210,9 @@ struct CaptureSink {
 }
 
 impl TextSink for CaptureSink {
-    fn deliver(&self, text: &str) -> Result<(), DeliverError> {
+    fn deliver(&self, text: &str) -> Result<DeliverOutcome, DeliverError> {
         *self.captured.lock().unwrap() = Some(text.to_string());
-        Ok(())
+        Ok(DeliverOutcome::Injected)
     }
 }
 
@@ -409,6 +411,72 @@ fn device_loss_surfaces_as_failed_with_partial_text() {
         other => panic!("expected Failed state, got {other:?}"),
     }
     assert!(sink.captured.lock().unwrap().is_none());
+}
+
+/// A [`TextSink`] that always reports a clipboard-only delivery (Secure Input active), naming a
+/// fixed owner — mirrors the [`whisper_platform`](../../whisper-platform) `PasteboardSink`
+/// fallback without any hardware.
+struct SecureInputSink {
+    owner: Option<String>,
+    captured: Arc<Mutex<Option<String>>>,
+}
+
+impl TextSink for SecureInputSink {
+    fn deliver(&self, text: &str) -> Result<DeliverOutcome, DeliverError> {
+        *self.captured.lock().unwrap() = Some(text.to_string());
+        Ok(DeliverOutcome::ClipboardOnly {
+            owner: self.owner.clone(),
+        })
+    }
+}
+
+#[test]
+fn secure_input_delivers_clipboard_only_and_still_completes() {
+    // Secure Input active: the text must reach the clipboard (captured), the session must still
+    // complete (Idle, not Failed), and a SecureInputBlocked event must precede Delivered
+    // (`ARCHITECTURE.md` §5, D-0007: detect, never bypass).
+    let reference = "Heslo je žluťoučký kůň.";
+    let captured = Arc::new(Mutex::new(None));
+    let sink = SecureInputSink {
+        owner: Some("Terminal".to_string()),
+        captured: captured.clone(),
+    };
+
+    let mut pipeline = Pipeline::new(
+        Box::new(FixtureAudioSource::new(fixture_path("cs-01.wav"))),
+        Box::new(NoopVad::default()),
+        Box::new(FakeStt {
+            text: reference.to_string(),
+            lang: "cs".to_string(),
+        }),
+        Dictionary::empty(),
+        None,
+        Box::new(sink),
+        PipelineConfig {
+            cleanup_mode: CleanupMode::Never,
+            skip_gate: SkipGateConfig::default(),
+        },
+    );
+
+    let rx = pipeline.subscribe();
+    let token = CancellationToken::new();
+    let state = pipeline.run(AudioCfg::default(), &CleanupCtx::default(), &token);
+
+    assert_eq!(state, SessionState::Idle);
+    assert_eq!(captured.lock().unwrap().as_deref(), Some(reference));
+    let events: Vec<_> = rx.try_iter().collect();
+    let blocked_at = events
+        .iter()
+        .position(|e| matches!(e, PipelineEvent::SecureInputBlocked { owner } if owner.as_deref() == Some("Terminal")))
+        .expect("SecureInputBlocked emitted with owner");
+    let delivered_at = events
+        .iter()
+        .position(|e| matches!(e, PipelineEvent::Delivered { .. }))
+        .expect("Delivered emitted");
+    assert!(
+        blocked_at < delivered_at,
+        "SecureInputBlocked must precede Delivered"
+    );
 }
 
 #[test]

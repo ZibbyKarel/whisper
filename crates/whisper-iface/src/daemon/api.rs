@@ -47,15 +47,26 @@ pub fn skip_reason_str(reason: CleanupSkipReason) -> &'static str {
     }
 }
 
-/// Body for `POST /v1/transcribe` and `POST /v1/sessions`. Exactly one audio source must be
-/// given: inline base64 WAV bytes (`audio_b64`) or a local WAV `path` (`ARCHITECTURE.md` §4:
-/// headless audio for Phase 4; the mic port arrives in Phase 5).
+/// Live capture source (`ARCHITECTURE.md` §5, D-0012). Only `mic` exists in v1; it selects a live
+/// microphone session instead of inline/file audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    Mic,
+}
+
+/// Body for `POST /v1/transcribe` and `POST /v1/sessions`. Provide exactly one audio input:
+/// inline base64 WAV bytes (`audio_b64`), a local WAV `path` (`ARCHITECTURE.md` §4, headless), or
+/// `"source":"mic"` for a live capture session (`POST /v1/sessions` only, D-0012).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AudioRequest {
     #[serde(default)]
     pub audio_b64: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
+    /// Live capture source; mutually exclusive with `audio_b64`/`path`.
+    #[serde(default)]
+    pub source: Option<SourceKind>,
     /// Per-request override of the configured cleanup gating mode.
     #[serde(default)]
     pub cleanup_mode: Option<CleanupModeDto>,
@@ -241,6 +252,40 @@ pub enum ApiEvent {
         error: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         partial_text: Option<String>,
+        ts_ms: u128,
+    },
+    // The three platform events below keep the dotted names `ARCHITECTURE.md` §4 lists
+    // verbatim (`secure_input.blocked`, `audio.device_lost`, `platform.permission`); the
+    // per-session lifecycle events above predate this and stay in their established
+    // snake_case form to avoid breaking the existing contract.
+    /// Injection was suppressed and text left on the clipboard (Secure Input active, D-0007).
+    /// The session still completes; `owner` names the blocking app when known.
+    #[serde(rename = "secure_input.blocked")]
+    SecureInputBlocked {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+        ts_ms: u128,
+    },
+    /// The capture device dropped mid-session (e.g. a Bluetooth mic, `ARCHITECTURE.md` §3.1).
+    /// Emitted alongside the session's `failed` event, which carries the partial transcript.
+    #[serde(rename = "audio.device_lost")]
+    AudioDeviceLost {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        reason: String,
+        ts_ms: u128,
+    },
+    /// A platform permission the engine needs is missing (`ARCHITECTURE.md` §5: surfaced as an
+    /// event, never a blocking dialog in core). `permission` is e.g. `"microphone"`.
+    #[serde(rename = "platform.permission")]
+    PlatformPermission {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        permission: String,
+        granted: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
         ts_ms: u128,
     },
 }

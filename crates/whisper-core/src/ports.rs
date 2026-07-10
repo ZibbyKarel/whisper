@@ -34,7 +34,24 @@ pub trait CleanupEngine {
 /// Delivers final text — platform text injection or an API response
 /// (`ARCHITECTURE.md` §3.1).
 pub trait TextSink {
-    fn deliver(&self, text: &str) -> Result<(), DeliverError>;
+    fn deliver(&self, text: &str) -> Result<DeliverOutcome, DeliverError>;
+}
+
+/// How a [`TextSink`] delivered the text (`ARCHITECTURE.md` §5, D-0007).
+///
+/// A clipboard-only delivery is **not** a failure: the text reached the system clipboard for
+/// the user to paste manually, so the session still completes. It exists to carry the one case
+/// the platform layer must surface but not treat as an error — Secure Input being active, where
+/// injection is detected-and-never-bypassed (D-0007). The pipeline turns a `ClipboardOnly` into
+/// a `secure_input.blocked` event (`ARCHITECTURE.md` §4) alongside the normal `Delivered`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DeliverOutcome {
+    /// Text was injected into the focused application (paste synthesized).
+    #[default]
+    Injected,
+    /// Injection was suppressed; the text was left on the clipboard only. `owner` names the app
+    /// holding Secure Input when it can be determined, else `None` (`ARCHITECTURE.md` §5).
+    ClipboardOnly { owner: Option<String> },
 }
 
 /// One event from a streaming [`Vad`] segmenter (`ARCHITECTURE.md` §3.2, D-0008).

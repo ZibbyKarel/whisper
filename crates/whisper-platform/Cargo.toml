@@ -8,3 +8,23 @@ publish.workspace = true
 
 [dependencies]
 whisper-core = { path = "../whisper-core" }
+# Resampling any device rate -> 16 kHz mono (D-0012). Pure Rust, MIT; no hardware, so it stays a
+# plain dependency and the resampler math is unit-tested on synthetic data.
+rubato = "0.16"
+# NFC read-back for the pasteboard round-trip (D-0007: macOS can hand back NFD, corrupting Czech
+# diacritics). Pure Rust, dual MIT/Apache-2.0.
+unicode-normalization = "0.1"
+thiserror = "2"
+
+# macOS-only hardware/OS adapters. The crate is macOS-first (ARCHITECTURE.md §5); these are the
+# only pieces that touch CoreAudio / CGEvent / input monitoring, and every real-hardware entry
+# point is exercised through `#[ignore]` tests (TCC cannot be granted in CI, D-0012).
+[target.'cfg(target_os = "macos")'.dependencies]
+# CoreAudio capture (D-0006/D-0012). Apache-2.0.
+cpal = "0.15"
+# Global hotkey listener (D-0007 rdev path; maintenance risk is a watched risk). MIT.
+rdev = "0.5"
+# Clipboard save/set/restore for the paste sink (D-0007). Dual MIT/Apache-2.0.
+arboard = "3"
+# Synthesized Cmd-V via CGEvent (D-0007). Dual MIT/Apache-2.0.
+core-graphics = "0.24"

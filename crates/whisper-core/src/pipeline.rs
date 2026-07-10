@@ -13,7 +13,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::dictionary::Dictionary;
 use crate::error::{PipelineError, SttError};
-use crate::ports::{AudioSource, CleanupEngine, SttEngine, TextSink, Vad, VadEvent};
+use crate::ports::{
+    AudioSource, CleanupEngine, DeliverOutcome, SttEngine, TextSink, Vad, VadEvent,
+};
 use crate::session::{CancellationToken, FailureInfo, SessionFsm, SessionState};
 use crate::skip_gate::SkipGateConfig;
 use crate::types::{AudioCfg, CleanupCtx, SttOpts};
@@ -67,6 +69,12 @@ pub enum PipelineEvent {
     },
     Cleaned {
         text: String,
+    },
+    /// Injection was suppressed and the text left on the clipboard only (Secure Input active,
+    /// D-0007). Emitted just before [`Delivered`](PipelineEvent::Delivered) — the session still
+    /// completes; this only surfaces the clipboard-only fallback (`ARCHITECTURE.md` §5).
+    SecureInputBlocked {
+        owner: Option<String>,
     },
     Delivered {
         text: String,
@@ -286,7 +294,12 @@ impl Pipeline {
         fsm.transition(SessionState::Delivering)
             .expect("Cleaning->Delivering is always valid here");
         match self.sink.deliver(&final_text) {
-            Ok(()) => {
+            Ok(outcome) => {
+                if let DeliverOutcome::ClipboardOnly { owner } = outcome {
+                    // Secure Input suppressed injection (D-0007): surface it, then still deliver
+                    // — the text is on the clipboard, so the session completes, not fails.
+                    self.emit(PipelineEvent::SecureInputBlocked { owner });
+                }
                 self.emit(PipelineEvent::Delivered {
                     text: final_text.clone(),
                 });

@@ -1,16 +1,19 @@
 # HANDOFF
 
 ## Current state
-Phases 1–4 complete, 2026-07-10. The engine is now reachable headless over the Interface
-Layer: `whisperd` (axum, 127.0.0.1, D-0009/D-0011) exposes `/v1/health|status|transcribe|
-sessions|config|dictionary` + `WS /v1/events`, with the `!Send` engines pinned to a
-dedicated worker thread (actor: bounded cmd channel + oneshot waiters + broadcast events),
-single-active-session 409 semantics, opt-in SQLite history, and `whisper-cli` as a thin
-HTTP client. Core pipeline underneath: whisper.cpp STT (parity-proven), Silero VAD
-per-segment decoding (anti-hallucination test), llama.cpp qwen3:8b cleanup (KV-prefix
-cached, 1.1 s/call release, guard WER 0.019, 0 traps — prompt frozen), skip-gate
-`CleanupMode::Auto`. 73 fast tests + 7 real-model suites green; clippy -D warnings; fmt
-clean. Next: Phase 5 macOS platform layer.
+Phases 1–4 complete; Phase 5 implemented, **pending manual hardware verification**
+(2026-07-10). Full stack: core pipeline (whisper.cpp STT parity-proven, Silero VAD
+per-segment + anti-hallucination test, qwen3:8b cleanup KV-prefix cached 1.1 s/call
+release, guard WER 0.019/0 traps — prompt frozen, skip-gate Auto) → `whisperd` daemon
+(axum 127.0.0.1, actor over `!Send` engines, 409 semantics, SQLite history opt-in,
+`whisper-cli` thin client) → macOS platform layer behind cargo feature `platform`
+(D-0012): cpal mic → live sessions (`{"source":"mic"}`), rdev hotkey (PTT/toggle),
+pasteboard+Cmd-V sink with Secure Input detect-never-bypass (D-0007), WS events
+`secure_input.blocked`/`audio.device_lost`/`platform.permission`. Gates: 96 (default) +
+33 (platform) tests, clippy -D warnings, fmt — clean in both configs.
+**USER ACTION REQUIRED:** run `docs/phase5-manual-verification.md` (TCC permissions
+cannot be granted by agents) — live Czech dictation, diacritics paste, Secure Input,
+device-unplug.
 
 ## Architecture overview
 See ARCHITECTURE.md (authoritative). Shape: Rust workspace — `whisper-core` (pure lib,
@@ -28,20 +31,24 @@ mistral-nemo disqualified), ARCHITECTURE.md + ADRs D-0004..D-0010 (cross-reviewe
 findings addressed).
 
 ## Unfinished / next steps
-1. Phase 5: macOS platform layer in whisper-platform — cpal mic AudioSource, global
-   hotkey (push-to-talk/toggle; rdev with CGEventTap fallback, Fn/globe needs
-   flagsChanged/IOKit), pasteboard+Cmd-V TextSink (D-0007: restore-after-paste, NFC
-   read-back), Secure Input detect-never-bypass, menu-bar presence. Wire into whisperd
-   as the mic-port audio source for live sessions.
-2. Phase-4 follow-ups (tracked, not blocking): queued one-shot transcribe behind active
+1. **Manual Phase-5 verification (user, blocks Phase-5 sign-off):**
+   `docs/phase5-manual-verification.md` — grant mic + accessibility + input monitoring
+   to whisperd, live Czech dictation via hotkey, byte-exact diacritics paste, Secure
+   Input password-field test, device unplug, permission-denied event.
+2. Phase-5 remainder: Fn/globe-key capture (NSEvent flagsChanged/IOKit path behind the
+   same hotkey port); tray/menu-bar (with Phase 6 UX shell).
+3. Phase 6: UX layer — settings/onboarding/visualization shell talking only to the
+   Interface Layer (replaceable per constitution).
+4. Phase-4 follow-ups (tracked, not blocking): queued one-shot transcribe behind active
    session (now immediate 409); config sentinel to disable cleanup via config.toml;
-   input sample-rate check/resample (16 kHz assumed); cap the in-memory session map;
-   silence whisper.cpp load banner.
-3. Verify Parakeet v3 weights license before adopting the low-latency profile (D-0004).
-4. Grow the real-speech Czech corpus (noise, speakers) for VAD tuning + WER regression;
+   HTTP-input sample-rate check/resample (16 kHz WAV assumed on audio_b64/path — mic
+   path resamples properly); cap the in-memory session map; silence whisper.cpp load
+   banner.
+5. Verify Parakeet v3 weights license before adopting the low-latency profile (D-0004).
+6. Grow the real-speech Czech corpus (noise, speakers) for VAD tuning + WER regression;
    tune skip-gate marker lists on it (first-pass lists, §3.2 deliverable).
-5. Housekeeping: remove redundant PlaceholderVad in whisper-platform; a stale superseded
-   `stash@{0}` sits in the repo — safe to `git stash drop` manually.
+7. Housekeeping: a stale superseded `stash@{0}` sits in the repo — safe to
+   `git stash drop` manually (PlaceholderVad already removed in Phase 5).
 
 ## Known issues / assumptions
 - Review-surfaced watched risks: rdev maintenance (fallback CGEventTap), Fn/globe key

@@ -17,10 +17,12 @@ use whisper_core::session::CancellationToken;
 
 use super::api::{
     AudioRequest, ConfigUpdateResponse, ErrorBody, ErrorEnvelope, HealthResponse, ModelStatus,
-    SessionAccepted, SessionRecord, SessionStatusDto, StatusResponse,
+    SessionAccepted, SessionRecord, SessionStatusDto, SourceKind, StatusResponse,
 };
-use super::config::Config;
-use super::state::{now_ms, AppState, EnginePhase, Job};
+use super::config::{Config, DeliveryMode};
+use super::state::{
+    now_ms, AppState, CaptureControl, EnginePhase, Job, JobAudio, LiveSourceCtx, SinkKind,
+};
 
 /// Structured error that renders as the `/v1` [`ErrorEnvelope`] with the right status code.
 pub struct ApiErr {
@@ -120,6 +122,13 @@ pub async fn transcribe(
     Json(req): Json<AudioRequest>,
 ) -> Result<Json<SessionRecord>, ApiErr> {
     ensure_stt_ready(&state)?;
+    // One-shot transcribe is a headless primitive; a live mic session (with its start/stop
+    // lifecycle) belongs on `POST /v1/sessions` (D-0012).
+    if req.source.is_some() {
+        return Err(ApiErr::bad_request(
+            "mic source is only supported on POST /v1/sessions",
+        ));
+    }
     let pcm = decode_audio(&req)?;
 
     let session_id = state.new_session_id();
@@ -137,9 +146,10 @@ pub async fn transcribe(
 
     let job = Job {
         session_id: session_id.clone(),
-        pcm,
+        audio: JobAudio::Pcm(pcm),
         cleanup_mode: req.cleanup_mode.map(Into::into),
         token,
+        sink: sink_kind(&state),
     };
     if state.cmd_tx.send(job).await.is_err() {
         release(&state, &session_id);
@@ -159,7 +169,19 @@ pub async fn create_session(
     Json(req): Json<AudioRequest>,
 ) -> Result<(StatusCode, Json<SessionAccepted>), ApiErr> {
     ensure_stt_ready(&state)?;
-    let pcm = decode_audio(&req)?;
+    let is_mic = matches!(req.source, Some(SourceKind::Mic));
+    if is_mic && state.live_source.is_none() {
+        // No capture backend compiled in (headless build) — reject before admitting.
+        return Err(ApiErr::bad_request(
+            "mic source requires the daemon to be built with the 'platform' feature",
+        ));
+    }
+    // Decode headless audio up front (before admission) so a bad request doesn't take the gate.
+    let pcm = if is_mic {
+        None
+    } else {
+        Some(decode_audio(&req)?)
+    };
 
     let session_id = state.new_session_id();
     if !state.try_begin(&session_id) {
@@ -172,11 +194,31 @@ pub async fn create_session(
         .store
         .upsert(&SessionRecord::running(session_id.clone(), now_ms()));
 
+    let audio = if is_mic {
+        // Live capture: register a graceful-stop control and build the source factory (which the
+        // worker runs on its thread). `platform.permission`/`audio.device_lost` events originate
+        // inside the factory/capture and reach WS directly (D-0012).
+        let control = CaptureControl::new();
+        state.register_capture(&session_id, control.clone());
+        let provider = state
+            .live_source
+            .as_ref()
+            .expect("live_source presence checked above");
+        JobAudio::Live(provider(LiveSourceCtx {
+            session_id: session_id.clone(),
+            events: state.events.clone(),
+            stop: control.flag(),
+        }))
+    } else {
+        JobAudio::Pcm(pcm.expect("non-mic pcm decoded above"))
+    };
+
     let job = Job {
         session_id: session_id.clone(),
-        pcm,
+        audio,
         cleanup_mode: req.cleanup_mode.map(Into::into),
         token,
+        sink: sink_kind(&state),
     };
     if state.cmd_tx.send(job).await.is_err() {
         release(&state, &session_id);
@@ -196,6 +238,12 @@ pub async fn stop_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<SessionRecord>, ApiErr> {
+    // A live mic session stops *gracefully*: end capture and let the pipeline finish STT/cleanup/
+    // delivery (D-0012). A headless PCM session has no capture to stop, so `stop` == `cancel`.
+    if let Some(control) = state.get_capture(&id) {
+        control.stop();
+        return current_record(&state, &id);
+    }
     signal_cancel(&state, &id)
 }
 
@@ -203,18 +251,37 @@ pub async fn cancel_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<SessionRecord>, ApiErr> {
+    // For a live session, also end capture so the pipeline reaches the cancel checkpoint (it is
+    // checked right after the capture loop; otherwise `next_frame` would block forever).
+    if let Some(control) = state.get_capture(&id) {
+        control.stop();
+    }
     signal_cancel(&state, &id)
 }
 
-/// Both `stop` and `cancel` set the session's cancellation token; the pipeline observes it at
-/// the next stage boundary (`ARCHITECTURE.md` §3.2). Returns the current stored record.
+/// `cancel` (and `stop` on a headless session) set the cancellation token; the pipeline observes
+/// it at the next stage boundary (`ARCHITECTURE.md` §3.2). Returns the current stored record.
 fn signal_cancel(state: &AppState, id: &str) -> Result<Json<SessionRecord>, ApiErr> {
     if let Some(token) = state.get_cancel(id) {
         token.cancel();
     }
+    current_record(state, id)
+}
+
+/// The current stored record for `id`, or 404.
+fn current_record(state: &AppState, id: &str) -> Result<Json<SessionRecord>, ApiErr> {
     match state.store.get(id) {
         Some(record) => Ok(Json(record)),
         None => Err(ApiErr::not_found(format!("unknown session {id}"))),
+    }
+}
+
+/// The delivery sink kind for a new session, from `config.delivery` (`ARCHITECTURE.md` §5,
+/// D-0012). Without the `platform` feature the worker's sink builder maps `Paste` to `Null`.
+fn sink_kind(state: &AppState) -> SinkKind {
+    match state.config.read().expect("config lock").delivery {
+        DeliveryMode::Paste => SinkKind::Paste,
+        DeliveryMode::None => SinkKind::Null,
     }
 }
 
@@ -252,6 +319,14 @@ pub async fn put_config(
         }
         if new.token != cur.token {
             applied.push("token".to_string());
+        }
+        if new.delivery != cur.delivery {
+            // Read per-session from config at admission time, so it takes effect next session.
+            applied.push("delivery".to_string());
+        }
+        if new.hotkey != cur.hotkey {
+            // The hotkey listener is started once at daemon startup; a change needs a restart.
+            staged.push("hotkey".to_string());
         }
         if new.port != cur.port {
             staged.push("port".to_string());
@@ -330,6 +405,7 @@ fn ensure_stt_ready(state: &AppState) -> Result<(), ApiErr> {
 fn release(state: &AppState, session_id: &str) {
     state.take_waiter(session_id);
     state.take_cancel(session_id);
+    state.take_capture(session_id);
     state.end_active();
 }
 

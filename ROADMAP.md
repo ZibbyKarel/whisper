@@ -2,7 +2,7 @@
 
 Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-first, built as an embeddable platform component.
 
-**Current position: Phase 4 (Interface Layer) ✅ complete (2026-07-10) — `whisperd` daemon (axum, 127.0.0.1): `/v1/health|status|transcribe|sessions|config|dictionary` + `WS /v1/events`, actor over the `!Send` engines, single-active-session 409, opt-in SQLite history, `whisper-cli` thin client; real-model contract test green. Next: Phase 5 macOS platform layer (mic capture, hotkey, text injection).**
+**Current position: Phase 5 (macOS platform layer) implemented (2026-07-10) — cpal mic → live `{"source":"mic"}` sessions, rdev hotkey (PTT/toggle), pasteboard+Cmd-V with Secure Input detect-never-bypass, all behind whisperd cargo feature `platform`. ⚠️ Pending manual hardware verification (`docs/phase5-manual-verification.md` — TCC permissions need the user). Remaining: Fn/globe key, tray. Next: Phase 6 UX layer.**
 
 ## Phase 0 — Environment & tooling bootstrap ✅ (2026-07-10)
 - Capability audit (`docs/CAPABILITY_AUDIT.md`), local skills, subagents, runtimes, memory files, verification gate.
@@ -28,8 +28,9 @@ Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-fi
 - Local HTTP + WebSocket API, CLI, event stream
 - External orchestrator can start/stop, subscribe, inject processing steps (transform hook deferred past MVP per §4)
 
-## Phase 5 — macOS Platform Layer
-- Global hotkey (push-to-talk / toggle), mic permissions, text insertion into focused app, menu-bar presence
+## Phase 5 — macOS Platform Layer 🔶 implemented, pending manual verification (2026-07-10)
+- Global hotkey (push-to-talk / toggle), mic permissions, text insertion into focused app — done behind `platform` feature; menu-bar presence → Phase 6; Fn/globe key → follow-up work item
+- Sign-off gate: `docs/phase5-manual-verification.md` (requires user-granted TCC permissions)
 
 ## Phase 6 — UX Layer + polish
 - Settings, onboarding, visualization; replaceable UI shell

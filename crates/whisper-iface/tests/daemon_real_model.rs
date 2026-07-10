@@ -30,7 +30,7 @@ async fn real_daemon_transcribes_czech_fixture() {
     };
     // STT only (no cleanup LLM) keeps the test light — the transcribe path is what we assert.
     let builder = production_engine_builder(stt_model, None, VadConfig::default());
-    let daemon = Daemon::start(config, None, builder)
+    let daemon = Daemon::start(config, None, builder, None)
         .await
         .expect("start daemon");
 

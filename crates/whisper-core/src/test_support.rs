@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{AudioError, DeliverError};
-use crate::ports::{AudioSource, AudioStream, TextSink};
+use crate::ports::{AudioSource, AudioStream, DeliverOutcome, TextSink};
 use crate::types::{AudioCfg, AudioFrame};
 
 const FRAME_LEN: usize = 1600; // 100 ms @ 16 kHz mono
@@ -87,8 +87,8 @@ impl CaptureSink {
 }
 
 impl TextSink for CaptureSink {
-    fn deliver(&self, text: &str) -> Result<(), DeliverError> {
+    fn deliver(&self, text: &str) -> Result<DeliverOutcome, DeliverError> {
         *self.captured.lock().unwrap() = Some(text.to_string());
-        Ok(())
+        Ok(DeliverOutcome::Injected)
     }
 }

@@ -58,6 +58,55 @@ impl Default for ModelsConfig {
     }
 }
 
+/// How a session's final text is delivered (`ARCHITECTURE.md` §5, D-0012). `paste` requires the
+/// daemon to be built with the `platform` feature; without it, `paste` degrades to `none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeliveryMode {
+    /// Text is only returned via the API / WS events (the Phase-4 default).
+    #[default]
+    None,
+    /// Inject into the focused app via pasteboard + Cmd-V (D-0007).
+    Paste,
+}
+
+/// Hotkey trigger mode on the wire (`HotkeyMode` in `whisper-platform`, D-0007/D-0012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HotkeyModeDto {
+    /// Hold to talk; release stops.
+    #[default]
+    PushToTalk,
+    /// Press to start, press again to stop.
+    Toggle,
+}
+
+fn default_hotkey_combo() -> String {
+    "Ctrl+Alt+Space".to_string()
+}
+
+/// Global hotkey configuration (`ARCHITECTURE.md` §5, D-0012). Effective only with the `platform`
+/// feature; the listener starts at daemon startup, so changes are staged for the next restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotkeyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_hotkey_combo")]
+    pub combo: String,
+    #[serde(default)]
+    pub mode: HotkeyModeDto,
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            combo: default_hotkey_combo(),
+            mode: HotkeyModeDto::default(),
+        }
+    }
+}
+
 /// Opt-in transcript history (D-0010: strictly opt-in SQLite).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct HistoryConfig {
@@ -84,6 +133,10 @@ pub struct Config {
     pub cleanup_mode: CleanupModeDto,
     #[serde(default = "default_language")]
     pub language: String,
+    /// How final text is delivered (`ARCHITECTURE.md` §5, D-0012). Default `none` keeps the
+    /// headless contract unchanged; `paste` needs the `platform` feature.
+    #[serde(default)]
+    pub delivery: DeliveryMode,
     /// Optional JSON dictionary file to seed `/v1/dictionary` from at startup (D-0010).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dictionary_path: Option<PathBuf>,
@@ -91,6 +144,8 @@ pub struct Config {
     pub models: ModelsConfig,
     #[serde(default)]
     pub history: HistoryConfig,
+    #[serde(default)]
+    pub hotkey: HotkeyConfig,
 }
 
 impl Default for Config {
@@ -101,9 +156,11 @@ impl Default for Config {
             token: None,
             cleanup_mode: CleanupModeDto::Auto,
             language: default_language(),
+            delivery: DeliveryMode::default(),
             dictionary_path: None,
             models: ModelsConfig::default(),
             history: HistoryConfig::default(),
+            hotkey: HotkeyConfig::default(),
         }
     }
 }
@@ -157,5 +214,28 @@ mod tests {
     fn language_field_carries_czech_value() {
         let cfg = Config::from_toml_str("language = \"cs\"\n").unwrap();
         assert_eq!(cfg.language, "cs");
+    }
+
+    #[test]
+    fn delivery_defaults_to_none_and_parses_paste() {
+        assert_eq!(Config::default().delivery, DeliveryMode::None);
+        let cfg = Config::from_toml_str("delivery = \"paste\"\n").unwrap();
+        assert_eq!(cfg.delivery, DeliveryMode::Paste);
+    }
+
+    #[test]
+    fn hotkey_defaults_and_parses() {
+        let def = Config::default().hotkey;
+        assert!(!def.enabled);
+        assert_eq!(def.combo, "Ctrl+Alt+Space");
+        assert_eq!(def.mode, HotkeyModeDto::PushToTalk);
+
+        let cfg = Config::from_toml_str(
+            "[hotkey]\nenabled = true\ncombo = \"Cmd+Alt+D\"\nmode = \"toggle\"\n",
+        )
+        .unwrap();
+        assert!(cfg.hotkey.enabled);
+        assert_eq!(cfg.hotkey.combo, "Cmd+Alt+D");
+        assert_eq!(cfg.hotkey.mode, HotkeyModeDto::Toggle);
     }
 }

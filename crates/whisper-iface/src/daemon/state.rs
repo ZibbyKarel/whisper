@@ -9,13 +9,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use whisper_core::error::AudioError;
 use whisper_core::pipeline::CleanupMode;
+use whisper_core::ports::AudioSource;
 use whisper_core::session::CancellationToken;
 
 use super::api::{ApiEvent, SessionRecord};
@@ -30,15 +32,77 @@ pub fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-/// A unit of work sent to the engine worker thread. Carries owned PCM (already decoded from
-/// the request's `audio_b64`/`path`) so the worker never touches the network or filesystem.
+/// A live capture factory built on the worker thread (D-0012). It is `Send` (it crosses into the
+/// worker over the command channel) but the [`AudioSource`] it produces — and the cpal stream
+/// *that* produces — stay on the worker thread. Eager-opening inside the factory lets a
+/// permission/device error surface where the worker can finalize the session cleanly.
+pub type AudioSourceFactory = Box<dyn FnOnce() -> Result<Box<dyn AudioSource>, AudioError> + Send>;
+
+/// The audio a [`Job`] runs on: pre-decoded PCM (headless `audio_b64`/`path`, Phase 4) or a live
+/// mic source built on the worker thread (`{"source":"mic"}`, D-0012).
+pub enum JobAudio {
+    Pcm(Vec<f32>),
+    Live(AudioSourceFactory),
+}
+
+/// Which [`TextSink`](whisper_core::ports::TextSink) delivers a session's final text. `Paste`
+/// only differs from `Null` when the daemon was built with the `platform` feature and a
+/// pasteboard sink is available; otherwise it degrades to `Null` (`delivery = "none"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkKind {
+    Null,
+    Paste,
+}
+
+/// A unit of work sent to the engine worker thread. Carries owned audio (or a live source
+/// factory) so the worker never touches the network or filesystem for headless input.
 pub struct Job {
     pub session_id: String,
-    pub pcm: Vec<f32>,
+    pub audio: JobAudio,
     /// Per-request cleanup override; `None` means "use the configured mode".
     pub cleanup_mode: Option<CleanupMode>,
     pub token: CancellationToken,
+    /// Which delivery sink to build for this session (`ARCHITECTURE.md` §5, D-0012).
+    pub sink: SinkKind,
 }
+
+/// Graceful stop signal for a live capture session (D-0012). Cloned into the capture source so a
+/// `POST /v1/sessions/{id}/stop` ends recording *and lets the pipeline finish* (STT/cleanup/
+/// deliver) — as opposed to `cancel`, which discards via the [`CancellationToken`].
+#[derive(Clone, Default)]
+pub struct CaptureControl(Arc<AtomicBool>);
+
+impl CaptureControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Signal the capture to stop; the source drains buffered audio, then reports end-of-stream.
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+    /// The shared flag to hand to the capture source.
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        self.0.clone()
+    }
+}
+
+/// Context passed to a [`LiveSourceProvider`] to build a mic capture factory for one session.
+pub struct LiveSourceCtx {
+    pub session_id: String,
+    /// WS event sink, so the capture can emit `audio.device_lost` / `platform.permission`.
+    pub events: broadcast::Sender<super::api::ApiEvent>,
+    /// Shared graceful-stop flag (see [`CaptureControl`]).
+    pub stop: Arc<AtomicBool>,
+}
+
+/// Seam producing a live mic [`AudioSourceFactory`] (D-0012). `Some` only when the daemon was
+/// composed with a capture backend (the `platform` feature, or a test fake); `None` ⇒ mic
+/// sessions are rejected. Keeping it here (not in a handler `cfg`) lets contract tests inject a
+/// fake capture backend and drive the whole live path headlessly.
+pub type LiveSourceProvider = Box<dyn Fn(LiveSourceCtx) -> AudioSourceFactory + Send + Sync>;
 
 /// Engine phase for `GET /v1/status` (`ARCHITECTURE.md` §3.2 model lifecycle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +182,10 @@ pub struct AppState {
     pub waiters: Mutex<HashMap<String, oneshot::Sender<SessionRecord>>>,
     /// Per-session cancellation tokens for `stop`/`cancel`.
     pub cancels: Mutex<HashMap<String, CancellationToken>>,
+    /// Per-live-session graceful-stop controls (D-0012). Present only for mic sessions.
+    pub captures: Mutex<HashMap<String, CaptureControl>>,
+    /// Capture backend (`Some` with the `platform` feature or a test fake, else mic → 409/400).
+    pub live_source: Option<LiveSourceProvider>,
     pub config: RwLock<Config>,
     pub config_path: Option<PathBuf>,
     pub dictionary: RwLock<DictionaryState>,
@@ -140,6 +208,7 @@ impl AppState {
         dictionary: DictionaryState,
         lang: std::sync::Arc<RwLock<String>>,
         store: SessionStore,
+        live_source: Option<LiveSourceProvider>,
     ) -> Self {
         Self {
             started: Instant::now(),
@@ -149,6 +218,8 @@ impl AppState {
             active: Mutex::new(None),
             waiters: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
+            captures: Mutex::new(HashMap::new()),
+            live_source,
             config: RwLock::new(config),
             config_path,
             dictionary: RwLock::new(dictionary),
@@ -226,6 +297,28 @@ impl AppState {
         self.cancels
             .lock()
             .expect("cancels mutex")
+            .remove(session_id)
+    }
+
+    pub fn register_capture(&self, session_id: &str, control: CaptureControl) {
+        self.captures
+            .lock()
+            .expect("captures mutex")
+            .insert(session_id.to_string(), control);
+    }
+
+    pub fn get_capture(&self, session_id: &str) -> Option<CaptureControl> {
+        self.captures
+            .lock()
+            .expect("captures mutex")
+            .get(session_id)
+            .cloned()
+    }
+
+    pub fn take_capture(&self, session_id: &str) -> Option<CaptureControl> {
+        self.captures
+            .lock()
+            .expect("captures mutex")
             .remove(session_id)
     }
 }
