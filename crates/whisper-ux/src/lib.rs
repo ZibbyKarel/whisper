@@ -15,4 +15,7 @@ pub mod client;
 pub mod dict_editor;
 pub mod icons;
 pub mod onboarding;
+pub mod save_report;
+pub mod theme;
 pub mod tray_state;
+pub mod validation;

@@ -262,12 +262,14 @@ mod tests {
     fn get_config_parses_and_keeps_czech() {
         let (base, _rx) = mock_once(
             "200 OK",
-            r#"{"bind":"127.0.0.1","port":8737,"cleanup_mode":"auto","language":"cs","delivery":"none","models":{"stt":"m.bin","cleanup":null},"history":{"enabled":false},"hotkey":{"enabled":false,"combo":"Ctrl+Alt+Space","mode":"push_to_talk"}}"#,
+            r#"{"bind":"127.0.0.1","port":8737,"cleanup_mode":"auto","language":"cs","delivery":"none","models":{"stt":"m.bin","cleanup":null},"history":{"enabled":false},"hotkey":{"enabled":true,"combo":"Ctrl+Alt","mode":"push_to_talk"},"vad":{"threshold":0.35,"hangover_ms":300,"max_silence_ms":1000},"audio":{"agc_enabled":true,"agc_target_peak":0.7,"agc_max_gain":12.0}}"#,
         );
         let client = HttpClient::new(base, None);
         let cfg = client.get_config().unwrap();
         assert_eq!(cfg.language, "cs");
         assert_eq!(cfg.port, 8737);
+        assert_eq!(cfg.hotkey.combo, "Ctrl+Alt");
+        assert_eq!(cfg.vad.threshold, 0.35);
     }
 
     #[test]
@@ -296,7 +298,7 @@ mod tests {
     fn put_config_sends_bearer_token_and_body() {
         let (base, rx) = mock_once(
             "200 OK",
-            r#"{"applied":["language"],"staged":[],"config":{"bind":"127.0.0.1","port":8737,"cleanup_mode":"auto","language":"en","delivery":"none","models":{"stt":"m.bin","cleanup":null},"history":{"enabled":false},"hotkey":{"enabled":false,"combo":"Ctrl+Alt+Space","mode":"push_to_talk"}}}"#,
+            r#"{"applied":["language"],"staged":[],"config":{"bind":"127.0.0.1","port":8737,"cleanup_mode":"auto","language":"en","delivery":"none","models":{"stt":"m.bin","cleanup":null},"history":{"enabled":false},"hotkey":{"enabled":true,"combo":"Ctrl+Alt","mode":"push_to_talk"},"vad":{"threshold":0.35,"hangover_ms":300,"max_silence_ms":1000},"audio":{"agc_enabled":true,"agc_target_peak":0.7,"agc_max_gain":12.0}}}"#,
         );
         let client = HttpClient::new(base, Some("secret".to_string()));
         let cfg = Config {

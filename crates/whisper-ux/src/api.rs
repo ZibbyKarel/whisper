@@ -68,12 +68,49 @@ pub struct HistoryConfig {
     pub path: Option<String>,
 }
 
+/// VAD sensitivity tuning (mirror of `VadTuning`, `[vad]` in config.toml, D-0008).
+/// `Copy`/`f32` fields mean this (and therefore [`Config`]) cannot derive `Eq`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VadTuning {
+    pub threshold: f32,
+    pub hangover_ms: u32,
+    pub max_silence_ms: u32,
+}
+
+impl Default for VadTuning {
+    fn default() -> Self {
+        Self {
+            threshold: 0.35,
+            hangover_ms: 300,
+            max_silence_ms: 1_000,
+        }
+    }
+}
+
+/// Capture input-gain tuning (mirror of `AudioTuning`, `[audio]` in config.toml).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AudioTuning {
+    pub agc_enabled: bool,
+    pub agc_target_peak: f32,
+    pub agc_max_gain: f32,
+}
+
+impl Default for AudioTuning {
+    fn default() -> Self {
+        Self {
+            agc_enabled: true,
+            agc_target_peak: 0.7,
+            agc_max_gain: 12.0,
+        }
+    }
+}
+
 /// The full daemon configuration and the `/v1/config` body (mirror of `Config`).
 ///
 /// `#[serde(default)]` mirrors the daemon so a config returned by a newer daemon
 /// with extra fields still deserializes (unknown fields are ignored by serde by
 /// default), and a partial value we send is filled in by the daemon.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub bind: String,
@@ -88,6 +125,8 @@ pub struct Config {
     pub models: ModelsConfig,
     pub history: HistoryConfig,
     pub hotkey: HotkeyConfig,
+    pub vad: VadTuning,
+    pub audio: AudioTuning,
 }
 
 impl Default for Config {
@@ -106,10 +145,16 @@ impl Default for Config {
             },
             history: HistoryConfig::default(),
             hotkey: HotkeyConfig {
-                enabled: false,
-                combo: "Ctrl+Alt+Space".to_string(),
+                // Daemon default is moving to a modifier-only combo with the
+                // hotkey enabled out of the box (parallel change in
+                // whisper-iface); mirrored here so the shell's own defaults
+                // (used before the first `GET /v1/config`) stay in sync.
+                enabled: true,
+                combo: "Ctrl+Alt".to_string(),
                 mode: HotkeyMode::PushToTalk,
             },
+            vad: VadTuning::default(),
+            audio: AudioTuning::default(),
         }
     }
 }
@@ -508,5 +553,49 @@ mod tests {
         // Forward-compatible: a newer daemon field must not break the shell.
         let cfg: Config = serde_json::from_str(r#"{"port":8737,"some_new_field":true}"#).unwrap();
         assert_eq!(cfg.port, 8737);
+    }
+
+    #[test]
+    fn config_default_hotkey_matches_daemon_modifier_only_combo() {
+        // Kept in sync with the daemon's incoming default (see whisper-iface
+        // config.rs `default_hotkey_combo`): "Ctrl+Alt", enabled true.
+        let cfg = Config::default();
+        assert!(cfg.hotkey.enabled);
+        assert_eq!(cfg.hotkey.combo, "Ctrl+Alt");
+    }
+
+    #[test]
+    fn config_default_vad_and_audio_match_daemon() {
+        let cfg = Config::default();
+        assert_eq!(cfg.vad.threshold, 0.35);
+        assert_eq!(cfg.vad.hangover_ms, 300);
+        assert_eq!(cfg.vad.max_silence_ms, 1_000);
+        assert!(cfg.audio.agc_enabled);
+        assert_eq!(cfg.audio.agc_target_peak, 0.7);
+        assert_eq!(cfg.audio.agc_max_gain, 12.0);
+    }
+
+    #[test]
+    fn config_vad_audio_round_trip_and_partial_json_fills_defaults() {
+        let json = r#"{"vad":{"threshold":0.42,"hangover_ms":250,"max_silence_ms":800},"audio":{"agc_enabled":false,"agc_target_peak":0.5,"agc_max_gain":8.0}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.vad.threshold, 0.42);
+        assert_eq!(cfg.vad.hangover_ms, 250);
+        assert_eq!(cfg.vad.max_silence_ms, 800);
+        assert!(!cfg.audio.agc_enabled);
+        assert_eq!(cfg.audio.agc_target_peak, 0.5);
+        assert_eq!(cfg.audio.agc_max_gain, 8.0);
+
+        // Round-trip through serialize/deserialize.
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn config_missing_vad_audio_fields_fill_defaults() {
+        // A daemon predating this shell version still deserializes cleanly.
+        let cfg: Config = serde_json::from_str(r#"{"port":8737}"#).unwrap();
+        assert_eq!(cfg.vad, VadTuning::default());
+        assert_eq!(cfg.audio, AudioTuning::default());
     }
 }

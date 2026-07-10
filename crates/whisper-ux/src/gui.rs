@@ -9,8 +9,8 @@
 //!   latency is negligible for an MVP (see known limits in the manual doc).
 //!
 //! Everything here is GUI glue and is verified manually; the testable logic it
-//! calls (state machine, parsing, client, icons, onboarding, dictionary) lives in
-//! the library modules.
+//! calls (state machine, parsing, client, icons, onboarding, dictionary,
+//! theme, validation, save-report formatting) lives in the library modules.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
@@ -20,12 +20,15 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use tungstenite::Message;
 
-use whisper_ux::api::{ApiEvent, Config, DeliveryMode, HotkeyMode, Incoming};
+use whisper_ux::api::{ApiEvent, CleanupMode, Config, DeliveryMode, HotkeyMode, Incoming};
 use whisper_ux::client::{backoff_delay, events_ws_url, Api, ApiError, HttpClient};
 use whisper_ux::dict_editor::DictEditor;
 use whisper_ux::icons::{self, IconImage};
 use whisper_ux::onboarding::{self, OnboardingState};
+use whisper_ux::save_report::SaveReport;
+use whisper_ux::theme::{self, status_pill::PillState};
 use whisper_ux::tray_state::{TrayInput, TrayState};
+use whisper_ux::validation;
 
 /// Messages the WS listener thread sends to the UI thread.
 enum WsMsg {
@@ -38,7 +41,40 @@ enum WsMsg {
 #[derive(PartialEq, Eq)]
 enum Screen {
     Onboarding,
-    Settings,
+    App,
+}
+
+/// Sections of the main app screen (left sidebar / tab bar, D-0013 UX pass).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Status,
+    Dictation,
+    Audio,
+    Cleanup,
+    Dictionary,
+    Advanced,
+}
+
+const SECTIONS: [Section; 6] = [
+    Section::Status,
+    Section::Dictation,
+    Section::Audio,
+    Section::Cleanup,
+    Section::Dictionary,
+    Section::Advanced,
+];
+
+impl Section {
+    fn label(self) -> &'static str {
+        match self {
+            Section::Status => "Status",
+            Section::Dictation => "Dictation",
+            Section::Audio => "Audio",
+            Section::Cleanup => "Cleanup",
+            Section::Dictionary => "Dictionary",
+            Section::Advanced => "Advanced",
+        }
+    }
 }
 
 /// Handles to the dynamic tray menu items so their labels can be updated.
@@ -70,20 +106,30 @@ pub struct ShellApp {
 
     // --- window / screens ---
     screen: Screen,
+    section: Section,
     onboarding: OnboardingState,
     onboarding_path: Option<PathBuf>,
 
     // --- settings working copy ---
     cfg: Option<Config>,
-    port_str: String,
+    // `Option<String>` config fields need a free-typing text buffer that only
+    // round-trips to `Option` on save (an empty box means "unset"), mirroring
+    // how the daemon treats an absent field.
+    token_input: String,
+    dictionary_path_input: String,
+    history_path_input: String,
+    cleanup_model_input: String,
     dict: DictEditor,
     status_msg: Option<String>,
-    save_report: Option<String>,
+    save_report: SaveReport,
     test_dictation_text: String,
 }
 
 impl ShellApp {
     pub fn new(cc: &eframe::CreationContext<'_>, base_url: String, token: Option<String>) -> Self {
+        // D-0013 UX pass: a calm, rounded dark theme instead of raw egui defaults.
+        theme::apply(&cc.egui_ctx);
+
         let client = HttpClient::new(base_url.clone(), token.clone());
 
         // WS listener: reconnect forever with backoff, waking the UI on each frame.
@@ -108,7 +154,7 @@ impl ShellApp {
             .map(|p| OnboardingState::load(p))
             .unwrap_or_default();
         let screen = if onboarding.completed {
-            Screen::Settings
+            Screen::App
         } else {
             Screen::Onboarding
         };
@@ -127,13 +173,17 @@ impl ShellApp {
             tray,
             menu,
             screen,
+            section: Section::Status,
             onboarding,
             onboarding_path,
             cfg: None,
-            port_str: String::new(),
+            token_input: String::new(),
+            dictionary_path_input: String::new(),
+            history_path_input: String::new(),
+            cleanup_model_input: String::new(),
             dict: DictEditor::default(),
             status_msg: None,
-            save_report: None,
+            save_report: SaveReport::default(),
             test_dictation_text: String::new(),
         };
         // Best-effort initial sync so the UI reflects the daemon immediately.
@@ -163,7 +213,10 @@ impl ShellApp {
     fn load_settings(&mut self) {
         match self.client.get_config() {
             Ok(cfg) => {
-                self.port_str = cfg.port.to_string();
+                self.token_input = cfg.token.clone().unwrap_or_default();
+                self.dictionary_path_input = cfg.dictionary_path.clone().unwrap_or_default();
+                self.history_path_input = cfg.history.path.clone().unwrap_or_default();
+                self.cleanup_model_input = cfg.models.cleanup.clone().unwrap_or_default();
                 self.cfg = Some(cfg);
             }
             Err(e) => self.status_msg = Some(format!("load config: {e}")),
@@ -178,19 +231,42 @@ impl ShellApp {
         }
     }
 
+    /// Fold the `Option<String>` working buffers back into `cfg` (empty input
+    /// means "unset", matching the daemon's `Option::None`).
+    fn fold_optional_strings(&self, cfg: &mut Config) {
+        cfg.token = non_empty(&self.token_input);
+        cfg.dictionary_path = non_empty(&self.dictionary_path_input);
+        cfg.history.path = non_empty(&self.history_path_input);
+        cfg.models.cleanup = non_empty(&self.cleanup_model_input);
+    }
+
     fn save_settings(&mut self) {
         let Some(cfg) = self.cfg.clone() else {
             return;
         };
         let mut cfg = cfg;
-        if let Ok(p) = self.port_str.parse::<u16>() {
-            cfg.port = p;
+        self.fold_optional_strings(&mut cfg);
+
+        // Validate config ranges client-side (mirrors the daemon's `PUT
+        // /v1/config` `validate_config`) so a bad slider value is flagged
+        // inline instead of round-tripping to a 400.
+        let cfg_errs = validation::validate(&cfg);
+        if !cfg_errs.is_empty() {
+            self.status_msg = Some(format!(
+                "config invalid: {}",
+                cfg_errs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+            return;
         }
 
         // Validate the dictionary client-side before sending.
         let errs = self.dict.validate();
         if !errs.is_empty() {
-            self.save_report = Some(format!(
+            self.status_msg = Some(format!(
                 "dictionary invalid: {}",
                 errs.iter()
                     .map(ToString::to_string)
@@ -200,30 +276,26 @@ impl ShellApp {
             return;
         }
 
-        let mut report = String::new();
+        let mut messages = Vec::new();
         match self.client.put_config(&cfg) {
             Ok(resp) => {
                 self.cfg = Some(resp.config);
-                if !resp.applied.is_empty() {
-                    report.push_str(&format!("applied: {}. ", resp.applied.join(", ")));
-                }
-                if !resp.staged.is_empty() {
-                    report.push_str(&format!(
-                        "staged (needs daemon restart): {}. ",
-                        resp.staged.join(", ")
-                    ));
-                }
+                self.save_report = SaveReport::new(resp.applied, resp.staged);
             }
-            Err(e) => report.push_str(&format!("config error: {e}. ")),
+            Err(e) => messages.push(format!("config error: {e}")),
         }
         match self.client.put_dictionary(&self.dict.to_json_value()) {
-            Ok(_) => report.push_str("dictionary saved."),
+            Ok(_) => messages.push("dictionary saved.".to_string()),
             Err(ApiError::Http { message, .. }) => {
-                report.push_str(&format!("dictionary rejected: {message}"))
+                messages.push(format!("dictionary rejected: {message}"))
             }
-            Err(e) => report.push_str(&format!("dictionary error: {e}")),
+            Err(e) => messages.push(format!("dictionary error: {e}")),
         }
-        self.save_report = Some(report);
+        self.status_msg = if messages.is_empty() {
+            None
+        } else {
+            Some(messages.join(" "))
+        };
     }
 
     fn toggle_dictation(&mut self) {
@@ -321,7 +393,8 @@ impl ShellApp {
             if ev.id == start_stop {
                 self.toggle_dictation();
             } else if ev.id == settings {
-                self.screen = Screen::Settings;
+                self.screen = Screen::App;
+                self.section = Section::Status;
                 show_window(ctx);
             } else if ev.id == quit {
                 std::process::exit(0);
@@ -351,32 +424,424 @@ impl ShellApp {
         }
     }
 
-    // -- rendering --------------------------------------------------------
+    fn pill_state(&self) -> PillState {
+        theme::status_pill::from_tray(self.connected, self.tray_state)
+    }
+
+    // -- rendering: shared chrome ------------------------------------------
 
     fn ui_recording_banner(&self, ui: &mut egui::Ui) {
         if self.tray_state == TrayState::Recording || self.active_session.is_some() {
-            ui.group(|ui| {
+            theme::card_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("● Recording").color(egui::Color32::RED));
-                    // Live level meter from the audio.level event. Empty when the
-                    // daemon does not emit it (D-0013 §4).
-                    let meter = egui::ProgressBar::new(self.last_rms.clamp(0.0, 1.0))
-                        .desired_width(180.0)
-                        .text(format!(
-                            "rms {:.2} · peak {:.2}",
-                            self.last_rms, self.last_peak
-                        ));
-                    ui.add(meter);
+                    level_meter(ui, self.last_rms, self.last_peak, 180.0);
                 });
                 if !self.last_partial.is_empty() {
                     ui.label(format!("… {}", self.last_partial));
                 }
             });
+            ui.add_space(6.0);
         }
     }
 
-    fn ui_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
+    /// The persistent "restart to apply" notice (feedback item 2): stays
+    /// visible on every section, not just the one that triggered the save,
+    /// until the next save clears it.
+    fn ui_staged_notice(&self, ui: &mut egui::Ui) {
+        if let Some(notice) = self.save_report.staged_notice() {
+            ui.colored_label(egui::Color32::from_rgb(0xF2, 0x9D, 0x1C), notice);
+            ui.add_space(4.0);
+        }
+        if let Some(applied) = self.save_report.applied_summary() {
+            ui.label(egui::RichText::new(applied).weak().small());
+        }
+    }
+
+    fn ui_section_nav(&mut self, ui: &mut egui::Ui) {
+        for section in SECTIONS {
+            let selected = self.section == section;
+            if ui.selectable_label(selected, section.label()).clicked() {
+                self.section = section;
+            }
+        }
+    }
+
+    // -- rendering: sections -------------------------------------------------
+
+    fn ui_status_section(&mut self, ui: &mut egui::Ui) {
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Engine");
+            ui.horizontal(|ui| {
+                status_pill(ui, self.pill_state());
+                ui.label(format!("daemon: {}", self.daemon_phase));
+            });
+            ui.add_space(6.0);
+            ui.label("Input level");
+            level_meter(ui, self.last_rms, self.last_peak, 260.0);
+            ui.add_space(6.0);
+            let label = if self.active_session.is_some() {
+                "Stop dictation"
+            } else {
+                "Start dictation"
+            };
+            if ui.button(label).clicked() {
+                self.toggle_dictation();
+            }
+        });
+        ui.add_space(8.0);
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Last transcript");
+            if self.test_dictation_text.is_empty() && self.last_partial.is_empty() {
+                ui.label(egui::RichText::new("(nothing yet)").weak());
+            } else if !self.last_partial.is_empty() {
+                ui.label(format!("… {}", self.last_partial));
+            } else {
+                ui.label(&self.test_dictation_text);
+            }
+        });
+    }
+
+    fn ui_dictation_section(&mut self, cfg: &mut Config, ui: &mut egui::Ui) {
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Global hotkey");
+            labeled_toggle(ui, &mut cfg.hotkey.enabled, "Enabled");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Combo");
+                ui.text_edit_singleline(&mut cfg.hotkey.combo);
+            });
+            ui.add_space(4.0);
+            ui.label("Mode");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut cfg.hotkey.mode, HotkeyMode::PushToTalk, "Push to talk");
+                ui.selectable_value(&mut cfg.hotkey.mode, HotkeyMode::Toggle, "Toggle");
+            });
+            ui.label(
+                egui::RichText::new("Hotkey changes are staged until the daemon restarts.")
+                    .weak()
+                    .small(),
+            );
+        });
+        ui.add_space(8.0);
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Delivery");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut cfg.delivery, DeliveryMode::None, "None (API/WS only)");
+                ui.selectable_value(
+                    &mut cfg.delivery,
+                    DeliveryMode::Paste,
+                    "Paste into focused app",
+                );
+            });
+        });
+    }
+
+    fn ui_audio_section(&mut self, cfg: &mut Config, ui: &mut egui::Ui) {
+        let errs = validation::validate(cfg);
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Voice activity detection");
+            ui.add(
+                egui::Slider::new(&mut cfg.vad.threshold, 0.05..=0.95)
+                    .step_by(0.01)
+                    .text("Threshold"),
+            );
+            ui.label(
+                egui::RichText::new("Lower = more sensitive (picks up quieter speech).")
+                    .weak()
+                    .small(),
+            );
+            ui.add_space(6.0);
+            ui.add(
+                egui::DragValue::new(&mut cfg.vad.hangover_ms)
+                    .range(50..=2000)
+                    .suffix(" ms")
+                    .prefix("Hangover: "),
+            );
+            ui.add_space(4.0);
+            ui.add(
+                egui::DragValue::new(&mut cfg.vad.max_silence_ms)
+                    .range(50..=10_000)
+                    .suffix(" ms")
+                    .prefix("Max silence: "),
+            );
+            for e in &errs {
+                if matches!(
+                    e,
+                    validation::ConfigError::VadThresholdRange(_)
+                        | validation::ConfigError::VadMaxSilenceRange(_)
+                        | validation::ConfigError::VadHangoverExceedsMaxSilence { .. }
+                ) {
+                    ui.colored_label(egui::Color32::from_rgb(0xE0, 0x3B, 0x24), e.to_string());
+                }
+            }
+        });
+        ui.add_space(8.0);
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Automatic gain control");
+            labeled_toggle(ui, &mut cfg.audio.agc_enabled, "Enabled");
+            ui.add_space(6.0);
+            ui.add(
+                egui::Slider::new(&mut cfg.audio.agc_target_peak, 0.1..=1.0)
+                    .step_by(0.01)
+                    .text("Target peak"),
+            );
+            ui.add(
+                egui::Slider::new(&mut cfg.audio.agc_max_gain, 1.0..=24.0)
+                    .step_by(0.5)
+                    .text("Max gain"),
+            );
+            for e in &errs {
+                if matches!(
+                    e,
+                    validation::ConfigError::AudioTargetPeakRange(_)
+                        | validation::ConfigError::AudioMaxGainRange(_)
+                ) {
+                    ui.colored_label(egui::Color32::from_rgb(0xE0, 0x3B, 0x24), e.to_string());
+                }
+            }
+            ui.label(
+                egui::RichText::new("Audio changes are staged until the daemon restarts.")
+                    .weak()
+                    .small(),
+            );
+        });
+        ui.add_space(8.0);
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Live level (for tuning)");
+            level_meter(ui, self.last_rms, self.last_peak, 260.0);
+        });
+    }
+
+    fn ui_cleanup_section(&mut self, cfg: &mut Config, ui: &mut egui::Ui) {
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Cleanup");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut cfg.cleanup_mode, CleanupMode::Auto, "auto");
+                ui.selectable_value(&mut cfg.cleanup_mode, CleanupMode::Always, "always");
+                ui.selectable_value(&mut cfg.cleanup_mode, CleanupMode::Never, "never");
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Language");
+                ui.add(
+                    egui::TextEdit::singleline(&mut cfg.language)
+                        .hint_text("cs / en / auto")
+                        .desired_width(120.0),
+                );
+            });
+        });
+        ui.add_space(8.0);
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Models");
+            ui.horizontal(|ui| {
+                ui.label("STT");
+                ui.text_edit_singleline(&mut cfg.models.stt);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Cleanup LLM");
+                ui.text_edit_singleline(&mut self.cleanup_model_input);
+            });
+            ui.label(
+                egui::RichText::new("Empty cleanup path disables the LLM cleanup stage.")
+                    .weak()
+                    .small(),
+            );
+            ui.label(
+                egui::RichText::new("Model changes are staged until the daemon restarts.")
+                    .weak()
+                    .small(),
+            );
+        });
+    }
+
+    fn ui_dictionary_section(&mut self, ui: &mut egui::Ui) {
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Dictionary");
+            ui.label(
+                egui::RichText::new(
+                    "Deterministic substitutions applied before cleanup (Czech-safe, case-sensitive).",
+                )
+                .weak()
+                .small(),
+            );
+            ui.add_space(6.0);
+            let mut remove: Option<usize> = None;
+            egui::Grid::new("dict_grid")
+                .num_columns(3)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("from");
+                    ui.label("to");
+                    ui.label("");
+                    ui.end_row();
+                    for (i, pair) in self.dict.pairs.iter_mut().enumerate() {
+                        ui.text_edit_singleline(&mut pair.from);
+                        ui.text_edit_singleline(&mut pair.to);
+                        if ui.button("✕").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.end_row();
+                    }
+                });
+            if let Some(i) = remove {
+                self.dict.remove(i);
+            }
+            if ui.button("+ Add row").clicked() {
+                self.dict.add_blank();
+            }
+            for err in self.dict.validate() {
+                ui.colored_label(egui::Color32::from_rgb(0xE0, 0x3B, 0x24), err.to_string());
+            }
+        });
+    }
+
+    fn ui_advanced_section(&mut self, cfg: &mut Config, ui: &mut egui::Ui) {
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Server");
+            ui.horizontal(|ui| {
+                ui.label("Bind");
+                ui.text_edit_singleline(&mut cfg.bind);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Port");
+                ui.add(egui::DragValue::new(&mut cfg.port).range(1..=65_535));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Token");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.token_input)
+                        .password(true)
+                        .hint_text("(none)"),
+                );
+            });
+            ui.label(egui::RichText::new(&self.base_url).weak().small());
+            ui.label(
+                egui::RichText::new("Bind/port changes are staged until the daemon restarts.")
+                    .weak()
+                    .small(),
+            );
+        });
+        ui.add_space(8.0);
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("History");
+            labeled_toggle(
+                ui,
+                &mut cfg.history.enabled,
+                "Enabled (opt-in transcript log)",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Path");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.history_path_input)
+                        .hint_text("(default XDG data dir)"),
+                );
+            });
+        });
+        ui.add_space(8.0);
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Dictionary file");
+            ui.horizontal(|ui| {
+                ui.label("Path");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.dictionary_path_input)
+                        .hint_text("(none — dictionary lives only in daemon memory)"),
+                );
+            });
+        });
+    }
+
+    fn ui_onboarding(&mut self, ui: &mut egui::Ui) {
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Welcome to Whisper");
+            ui.label("Local-first Czech/English dictation. Let's get set up.");
+        });
+        ui.add_space(8.0);
+        theme::card_frame().show(ui, |ui| {
+            let daemon_ok = self.daemon_phase == "ready" || self.daemon_phase == "degraded";
+            checklist_row(ui, daemon_ok, "1. Daemon is running");
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                if ui.button("Check daemon").clicked() {
+                    self.refresh_status();
+                    if daemon_ok {
+                        self.onboarding.daemon_seen = true;
+                    }
+                    self.onboarding.daemon_seen |= self.daemon_phase != "unreachable";
+                    self.persist_onboarding();
+                }
+                ui.label(format!("status: {}", self.daemon_phase));
+            });
+
+            checklist_row(ui, self.onboarding.mic_ack, "2. Microphone permission");
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label(
+                    "Grant in System Settings → Privacy & Security → Microphone (for whisperd).",
+                );
+                if ui.button("I granted it").clicked() {
+                    self.onboarding.mic_ack = true;
+                    self.persist_onboarding();
+                }
+            });
+
+            checklist_row(
+                ui,
+                self.onboarding.accessibility_ack,
+                "3. Accessibility permission",
+            );
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label(
+                    "Grant in System Settings → Privacy & Security → Accessibility (for paste).",
+                );
+                if ui.button("I granted it").clicked() {
+                    self.onboarding.accessibility_ack = true;
+                    self.persist_onboarding();
+                }
+            });
+
+            checklist_row(ui, self.onboarding.test_dictation_done, "4. Test dictation");
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                let label = if self.active_session.is_some() {
+                    "Stop"
+                } else {
+                    "Start test"
+                };
+                if ui.button(label).clicked() {
+                    self.toggle_dictation();
+                }
+            });
+            if !self.test_dictation_text.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(20.0);
+                    ui.label(format!("Heard: {}", self.test_dictation_text));
+                });
+                if !self.onboarding.test_dictation_done {
+                    self.onboarding.test_dictation_done = true;
+                    self.persist_onboarding();
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Finish").clicked() {
+                self.onboarding.completed = true;
+                self.persist_onboarding();
+                self.screen = Screen::App;
+                self.load_settings();
+            }
+            if ui.button("Skip for now").clicked() {
+                self.onboarding.completed = true;
+                self.persist_onboarding();
+                self.screen = Screen::App;
+            }
+        });
+    }
+
+    fn ui_app(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("Reload from daemon").clicked() {
                 self.load_settings();
@@ -385,192 +850,29 @@ impl ShellApp {
                 self.save_settings();
             }
         });
-        ui.separator();
+        ui.add_space(4.0);
+        self.ui_staged_notice(ui);
 
         if self.cfg.is_none() {
             ui.label("No config loaded — is the daemon running?");
             return;
         }
 
+        ui.horizontal_wrapped(|ui| self.ui_section_nav(ui));
+        ui.add_space(8.0);
+
         // Work on a temporary so the borrow of self.cfg doesn't collide with
         // helper methods; write back at the end.
         let mut cfg = self.cfg.take().unwrap();
-
-        egui::Grid::new("cfg_grid").num_columns(2).show(ui, |ui| {
-            ui.label("Language");
-            ui.horizontal(|ui| {
-                lang_radio(ui, &mut cfg.language, "cs", "Czech");
-                lang_radio(ui, &mut cfg.language, "en", "English");
-                lang_radio(ui, &mut cfg.language, "auto", "Auto");
-            });
-            ui.end_row();
-
-            ui.label("Cleanup mode");
-            ui.horizontal(|ui| {
-                use whisper_ux::api::CleanupMode as CM;
-                ui.selectable_value(&mut cfg.cleanup_mode, CM::Always, "always");
-                ui.selectable_value(&mut cfg.cleanup_mode, CM::Never, "never");
-                ui.selectable_value(&mut cfg.cleanup_mode, CM::Auto, "auto");
-            });
-            ui.end_row();
-
-            ui.label("Delivery");
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut cfg.delivery, DeliveryMode::None, "none");
-                ui.selectable_value(&mut cfg.delivery, DeliveryMode::Paste, "paste");
-            });
-            ui.end_row();
-
-            ui.label("Hotkey");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut cfg.hotkey.enabled, "enabled");
-                ui.text_edit_singleline(&mut cfg.hotkey.combo);
-            });
-            ui.end_row();
-
-            ui.label("Hotkey mode");
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut cfg.hotkey.mode, HotkeyMode::PushToTalk, "push-to-talk");
-                ui.selectable_value(&mut cfg.hotkey.mode, HotkeyMode::Toggle, "toggle");
-            });
-            ui.end_row();
-
-            ui.label("Daemon URL");
-            ui.label(&self.base_url);
-            ui.end_row();
-
-            ui.label("Port");
-            ui.text_edit_singleline(&mut self.port_str);
-            ui.end_row();
-        });
-        ui.label(
-            egui::RichText::new("Hotkey and port changes are staged until the daemon restarts.")
-                .weak()
-                .small(),
-        );
-
-        ui.separator();
-        ui.collapsing("Dictionary", |ui| self.ui_dictionary(ui));
-
+        match self.section {
+            Section::Status => self.ui_status_section(ui),
+            Section::Dictation => self.ui_dictation_section(&mut cfg, ui),
+            Section::Audio => self.ui_audio_section(&mut cfg, ui),
+            Section::Cleanup => self.ui_cleanup_section(&mut cfg, ui),
+            Section::Dictionary => self.ui_dictionary_section(ui),
+            Section::Advanced => self.ui_advanced_section(&mut cfg, ui),
+        }
         self.cfg = Some(cfg);
-
-        if let Some(report) = &self.save_report {
-            ui.separator();
-            ui.label(report);
-        }
-    }
-
-    fn ui_dictionary(&mut self, ui: &mut egui::Ui) {
-        let mut remove: Option<usize> = None;
-        egui::Grid::new("dict_grid")
-            .num_columns(3)
-            .striped(true)
-            .show(ui, |ui| {
-                ui.label("from");
-                ui.label("to");
-                ui.label("");
-                ui.end_row();
-                for (i, pair) in self.dict.pairs.iter_mut().enumerate() {
-                    ui.text_edit_singleline(&mut pair.from);
-                    ui.text_edit_singleline(&mut pair.to);
-                    if ui.button("✕").clicked() {
-                        remove = Some(i);
-                    }
-                    ui.end_row();
-                }
-            });
-        if let Some(i) = remove {
-            self.dict.remove(i);
-        }
-        if ui.button("+ Add row").clicked() {
-            self.dict.add_blank();
-        }
-        for err in self.dict.validate() {
-            ui.colored_label(egui::Color32::from_rgb(0xE0, 0x3B, 0x24), err.to_string());
-        }
-    }
-
-    fn ui_onboarding(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Welcome to Whisper");
-        ui.label("Local-first Czech/English dictation. Let's get set up.");
-        ui.separator();
-
-        let daemon_ok = self.daemon_phase == "ready" || self.daemon_phase == "degraded";
-        checklist_row(ui, daemon_ok, "1. Daemon is running");
-        ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            if ui.button("Check daemon").clicked() {
-                self.refresh_status();
-                if daemon_ok {
-                    self.onboarding.daemon_seen = true;
-                }
-                self.onboarding.daemon_seen |= self.daemon_phase != "unreachable";
-                self.persist_onboarding();
-            }
-            ui.label(format!("status: {}", self.daemon_phase));
-        });
-
-        checklist_row(ui, self.onboarding.mic_ack, "2. Microphone permission");
-        ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            ui.label("Grant in System Settings → Privacy & Security → Microphone (for whisperd).");
-            if ui.button("I granted it").clicked() {
-                self.onboarding.mic_ack = true;
-                self.persist_onboarding();
-            }
-        });
-
-        checklist_row(
-            ui,
-            self.onboarding.accessibility_ack,
-            "3. Accessibility permission",
-        );
-        ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            ui.label("Grant in System Settings → Privacy & Security → Accessibility (for paste).");
-            if ui.button("I granted it").clicked() {
-                self.onboarding.accessibility_ack = true;
-                self.persist_onboarding();
-            }
-        });
-
-        checklist_row(ui, self.onboarding.test_dictation_done, "4. Test dictation");
-        ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            let label = if self.active_session.is_some() {
-                "Stop"
-            } else {
-                "Start test"
-            };
-            if ui.button(label).clicked() {
-                self.toggle_dictation();
-            }
-        });
-        if !self.test_dictation_text.is_empty() {
-            ui.horizontal(|ui| {
-                ui.add_space(20.0);
-                ui.label(format!("Heard: {}", self.test_dictation_text));
-            });
-            if !self.onboarding.test_dictation_done {
-                self.onboarding.test_dictation_done = true;
-                self.persist_onboarding();
-            }
-        }
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui.button("Finish").clicked() {
-                self.onboarding.completed = true;
-                self.persist_onboarding();
-                self.screen = Screen::Settings;
-                self.load_settings();
-            }
-            if ui.button("Skip for now").clicked() {
-                self.onboarding.completed = true;
-                self.persist_onboarding();
-                self.screen = Screen::Settings;
-            }
-        });
     }
 }
 
@@ -596,21 +898,18 @@ impl eframe::App for ShellApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.screen, Screen::Settings, "Settings");
-                ui.selectable_value(&mut self.screen, Screen::Onboarding, "Onboarding");
+                ui.heading("Whisper");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let dot = if self.connected { "🟢" } else { "🔴" };
-                    ui.label(format!("{dot} {}", self.tray_state.label()));
+                    status_pill(ui, self.pill_state());
                 });
             });
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
             self.ui_recording_banner(ui);
-            ui.add_space(6.0);
             egui::ScrollArea::vertical().show(ui, |ui| match self.screen {
                 Screen::Onboarding => self.ui_onboarding(ui),
-                Screen::Settings => self.ui_settings(ui),
+                Screen::App => self.ui_app(ui),
             });
             if let Some(msg) = &self.status_msg {
                 ui.separator();
@@ -624,9 +923,14 @@ impl eframe::App for ShellApp {
 // Free helpers
 // ---------------------------------------------------------------------------
 
-fn lang_radio(ui: &mut egui::Ui, current: &mut String, value: &str, label: &str) {
-    if ui.selectable_label(current == value, label).clicked() {
-        *current = value.to_string();
+/// Trim `s`; an empty result becomes `None` (the daemon's "unset" convention
+/// for `Option<String>` config fields).
+fn non_empty(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -638,6 +942,108 @@ fn checklist_row(ui: &mut egui::Ui, done: bool, label: &str) {
 fn show_window(ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
+
+/// Colored-dot + label status pill (D-0013 UX pass, feedback item 1).
+fn status_pill(ui: &mut egui::Ui, state: PillState) {
+    ui.horizontal(|ui| {
+        let (rect, _response) =
+            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        if ui.is_rect_visible(rect) {
+            ui.painter()
+                .circle_filled(rect.center(), 5.0, state.color());
+        }
+        ui.label(state.label());
+    });
+}
+
+/// Smooth horizontal level meter: an RMS fill banded quiet/good/hot, plus a
+/// peak tick mark (D-0013 UX pass, feedback item 1: "not a raw number").
+fn level_meter(ui: &mut egui::Ui, rms: f32, peak: f32, width: f32) {
+    let rms = rms.clamp(0.0, 1.0);
+    let peak = peak.clamp(0.0, 1.0);
+    let desired_size = egui::vec2(width.min(ui.available_width()), 14.0);
+    let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect(
+            rect,
+            7.0,
+            ui.visuals().extreme_bg_color,
+            egui::Stroke::NONE,
+            egui::StrokeKind::Inside,
+        );
+        if rms > 0.0 {
+            let fill =
+                egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * rms, rect.height()));
+            painter.rect(
+                fill,
+                7.0,
+                theme::level::color_for_rms(rms),
+                egui::Stroke::NONE,
+                egui::StrokeKind::Inside,
+            );
+        }
+        if peak > 0.0 {
+            let x = rect.left() + rect.width() * peak;
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+            );
+        }
+    }
+    ui.label(
+        egui::RichText::new(format!("rms {rms:.2} · peak {peak:.2}"))
+            .weak()
+            .small(),
+    );
+}
+
+/// Animated toggle switch (egui has no built-in one); the canonical ~15-line
+/// pattern from the egui demo library, themed with the shell's accent color
+/// via `interact_selectable`.
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let desired_size = ui.spacing().interact_size.y * egui::vec2(1.8, 1.0);
+    let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, "")
+    });
+
+    if ui.is_rect_visible(rect) {
+        let how_on = ui.ctx().animate_bool(response.id, *on);
+        let visuals = ui.style().interact_selectable(&response, *on);
+        let rect = rect.expand(visuals.expansion);
+        let radius = 0.5 * rect.height();
+        ui.painter().rect(
+            rect,
+            radius,
+            visuals.bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let circle_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
+        let center = egui::pos2(circle_x, rect.center().y);
+        ui.painter().circle(
+            center,
+            0.75 * radius,
+            egui::Color32::WHITE,
+            visuals.fg_stroke,
+        );
+    }
+
+    response
+}
+
+/// A toggle switch with a trailing label, laid out like a checkbox row.
+fn labeled_toggle(ui: &mut egui::Ui, on: &mut bool, label: &str) {
+    ui.horizontal(|ui| {
+        toggle_switch(ui, on);
+        ui.label(label);
+    });
 }
 
 /// Convert a rasterized [`IconImage`] into a tray-icon [`Icon`].
