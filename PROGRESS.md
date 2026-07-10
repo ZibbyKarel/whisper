@@ -39,6 +39,12 @@ Append-only. Newest at bottom. Absolute dates.
 - `scripts/bench_stt.py` now scores against the primary reference plus optional `accepted_references` (manifest) and reports the min-WER match (`scored_against: primary|itn`); cs-02 gained the digit-form alternative. Implemented by sonnet-implementer, reviewed by Fable.
 - Re-ran all 4 whisper models: ITN-aware cs WER — large-v3 0.11 (was 0.18), large-v3-turbo 0.17 (was 0.23), medium 0.28, small 0.32. cs-02 is now 0.00 for large/turbo/medium; ranking unchanged, large-v3-turbo stays the provisional default. Docs updated (`docs/stt-benchmark.{md,json}`).
 
+## 2026-07-10 — Phase 1: STT benchmark, round 2 (mikr Czech fine-tune + Parakeet v3)
+- opus-implementer converted mikr/whisper-large-v3-czech-cv13 (Apache-2.0) HF→GGML→q5_0 (1031 MB) and benchmarked Parakeet TDT 0.6B v3 int8 via sherpa-onnx (~640 MB). Runner `scripts/bench_stt_round2.py`, results `docs/stt-benchmark-round2.{md,json}`.
+- Fable review caught a scoring mismatch (round 2 ran concurrently with the ITN-aware change) — re-scored ITN-aware: **large-v3 cs 0.11 · mikr cs 0.14 · turbo cs 0.17 · Parakeet cs 0.11**.
+- Verdict: mikr beats turbo modestly but not stock large-v3, loses whisper's number ITN, no speed win → only a niche "best code-switching" profile (mix 0.22). **Parakeet ties best Czech at ~10× speed** (~0.15 s/clip) with correct ITN, but worst code-switching (mix 0.38) blocks it as default. **Default stays large-v3-turbo q5_0**; Parakeet = low-latency profile candidate.
+- RESEARCH.md §3 shortlist updated accordingly. Phase 1 automatable work done; real-mic Czech validation (user recordings) is the remaining gate before the model ADR.
+
 ## Debt register
 
 (empty)

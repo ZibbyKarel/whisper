@@ -94,11 +94,19 @@ references only.
   dictation). [VERIFIED — mac-whisper-speedtest]
 - mlx-whisper ~2× faster than whisper.cpp on large-v3-turbo (long-form). [PLAUSIBLE]
 
-**Phase-2 shortlist:** (a) whisper.cpp large-v3-turbo q5_0 — measured baseline, works
-today; (b) mikr large-v3 Czech fine-tune — potential quality jump, must benchmark;
-(c) Parakeet v3 via sherpa-onnx — latency/footprint winner, must benchmark on our Czech
-fixtures; (d) MLX/CoreML runtimes as perf optimization of (a). Vosk: zero data surfaced —
-deprioritize.
+**Round 2 [MEASURED — docs/stt-benchmark-round2.md]:** both candidates benchmarked on our
+fixtures (ITN-aware scoring). mikr fine-tune: cs 0.14 — beats turbo (0.17) but **not**
+stock large-v3 (0.11); best code-switching (mix 0.22) and fixes `ďábelské`, but **lost
+whisper's number ITN** (grows the cleanup-LLM's job) and is large-v3-sized (1031 MB,
+~1.4 s/clip). Parakeet v3 int8 via sherpa-onnx: **cs 0.11 ties stock large-v3 at ~10×
+speed** (~0.15 s/clip decode, 640 MB), correct ITN, but **worst code-switching (mix
+0.38)** — mangles Czech-embedded English tech terms.
+
+**Phase-2 shortlist (post round 2):** default remains **large-v3-turbo q5_0** (best
+speed/quality/memory balance with intact ITN); **Parakeet v3** as low-latency profile
+(or a future code-switch-router pairing); mikr fine-tune only if real-speech validation
+shows rare-word diacritics matter more than ITN; MLX/CoreML runtimes as perf optimization.
+Vosk: zero data surfaced — deprioritized.
 
 ---
 

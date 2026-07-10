@@ -1,0 +1,122 @@
+[
+  {
+    "model": "ggml-mikr-large-v3-czech-cv13-q5_0.bin",
+    "fixture": "cs-01.wav",
+    "lang": "cs",
+    "reference": "Příliš žluťoučký kůň úpěl ďábelské ódy.",
+    "hypothesis": "Příliš žluťoučký kuň upěl ďábelské ódy!",
+    "wer": 0.333,
+    "cer": 0.053,
+    "seconds": 1.41
+  },
+  {
+    "model": "ggml-mikr-large-v3-czech-cv13-q5_0.bin",
+    "fixture": "cs-02.wav",
+    "lang": "cs",
+    "reference": "Dobrý den, chtěl bych objednat dvě stě třicet sedm kusů zboží a doručit je do Ústí nad Labem příští středu.",
+    "hypothesis": "Dobrý den, chtěl bych objednat dvěstě třicet sedm kusů zboží a doručit je do ústí nad labem příští středu.",
+    "wer": 0.1,
+    "cer": 0.01,
+    "seconds": 1.8
+  },
+  {
+    "model": "ggml-mikr-large-v3-czech-cv13-q5_0.bin",
+    "fixture": "cs-03.wav",
+    "lang": "cs",
+    "reference": "Věda a výzkum jsou základem hospodářského růstu, říká zpráva ministerstva školství.",
+    "hypothesis": "Věda a výzkum jsou základem hospodářského růstu, říká zpráva Ministerstva školství.",
+    "wer": 0.0,
+    "cer": 0.0,
+    "seconds": 1.59
+  },
+  {
+    "model": "ggml-mikr-large-v3-czech-cv13-q5_0.bin",
+    "fixture": "mix-01.wav",
+    "lang": "cs+en",
+    "reference": "Pushni ten branch do repa a udělej pull request, ať to můžeme mergnout do mainu.",
+    "hypothesis": "Puzhni ten branch do repa a udělej pull request, ať to můžeme mrknout do mainu.",
+    "wer": 0.133,
+    "cer": 0.038,
+    "seconds": 1.41
+  },
+  {
+    "model": "ggml-mikr-large-v3-czech-cv13-q5_0.bin",
+    "fixture": "mix-02.wav",
+    "lang": "cs+en",
+    "reference": "Otevři si terminál a spusť npm install, pak zkontroluj package.json.",
+    "hypothesis": "Otevři si terminál a spust npm install, pak zkontroluj packa json.",
+    "wer": 0.3,
+    "cer": 0.046,
+    "seconds": 1.34
+  },
+  {
+    "model": "ggml-mikr-large-v3-czech-cv13-q5_0.bin",
+    "fixture": "en-01.wav",
+    "lang": "en",
+    "reference": "The quick brown fox jumps over the lazy dog near the riverbank.",
+    "hypothesis": "The quick brown fox jumps over the lazy dog near the river bank.",
+    "wer": 0.167,
+    "cer": 0.016,
+    "seconds": 1.11
+  },
+  {
+    "model": "parakeet-tdt-0.6b-v3-int8",
+    "fixture": "cs-01.wav",
+    "lang": "cs",
+    "reference": "Příliš žluťoučký kůň úpěl ďábelské ódy.",
+    "hypothesis": "Příliš žluťoučký kuň úpěl dábelské ódy.",
+    "wer": 0.333,
+    "cer": 0.053,
+    "seconds": 0.26
+  },
+  {
+    "model": "parakeet-tdt-0.6b-v3-int8",
+    "fixture": "cs-02.wav",
+    "lang": "cs",
+    "reference": "Dobrý den, chtěl bych objednat dvě stě třicet sedm kusů zboží a doručit je do Ústí nad Labem příští středu.",
+    "hypothesis": "Dobrý den, chtěl bych objednat 237 kusů zboží a doručit je do ústí nad labem příští středu.",
+    "wer": 0.2,
+    "cer": 0.181,
+    "seconds": 0.17
+  },
+  {
+    "model": "parakeet-tdt-0.6b-v3-int8",
+    "fixture": "cs-03.wav",
+    "lang": "cs",
+    "reference": "Věda a výzkum jsou základem hospodářského růstu, říká zpráva ministerstva školství.",
+    "hypothesis": "Věda a výzkum jsou základem hospodářského růstu, říká zpráva ministerstva školství.",
+    "wer": 0.0,
+    "cer": 0.0,
+    "seconds": 0.15
+  },
+  {
+    "model": "parakeet-tdt-0.6b-v3-int8",
+    "fixture": "mix-01.wav",
+    "lang": "cs+en",
+    "reference": "Pushni ten branch do repa a udělej pull request, ať to můžeme mergnout do mainu.",
+    "hypothesis": "Půzvni ten branch do repa a udělaj půrequest, ať to můžeme mrgnout domainu.",
+    "wer": 0.467,
+    "cer": 0.128,
+    "seconds": 0.12
+  },
+  {
+    "model": "parakeet-tdt-0.6b-v3-int8",
+    "fixture": "mix-02.wav",
+    "lang": "cs+en",
+    "reference": "Otevři si terminál a spusť npm install, pak zkontroluj package.json.",
+    "hypothesis": "Otevři si terminál a spust npm install, pak zkontroluj Packa JSON.",
+    "wer": 0.3,
+    "cer": 0.046,
+    "seconds": 0.13
+  },
+  {
+    "model": "parakeet-tdt-0.6b-v3-int8",
+    "fixture": "en-01.wav",
+    "lang": "en",
+    "reference": "The quick brown fox jumps over the lazy dog near the riverbank.",
+    "hypothesis": "The quick brown fox jumps over the lazy dog near the riverbank.",
+    "wer": 0.0,
+    "cer": 0.0,
+    "seconds": 0.09
+  }
+]

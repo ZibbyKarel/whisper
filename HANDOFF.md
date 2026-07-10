@@ -6,8 +6,12 @@ run (Wispr Flow teardown, OSS landscape, Czech STT/LLM evidence, macOS integrati
 per-claim confidence tags, plus our measured benchmarks. LLM cleanup benchmark round 1
 done (`docs/llm-cleanup-benchmark.md`): **qwen3:8b = provisional cleanup default** (0/4
 trap failures, avg WER 0.15, 1.6 s); mistral-nemo:12b disqualified (obeys prompt
-injections). Provisional model pair: whisper large-v3-turbo q5_0 (STT) + qwen3:8b
-(cleanup) ≈ 5.8 GB resident, inside the ~10 GB budget (D-0001).
+injections). STT round 2 done (`docs/stt-benchmark-round2.md`): mikr Czech fine-tune and
+Parakeet v3 benchmarked, ITN-aware — **default stays large-v3-turbo q5_0**; Parakeet
+(cs 0.11, ~10× faster) is the low-latency profile candidate but worst at code-switching.
+Provisional model pair: whisper large-v3-turbo q5_0 (STT) + qwen3:8b (cleanup) ≈ 5.8 GB
+resident, inside the ~10 GB budget (D-0001). All automatable Phase-1 work is done —
+only real-mic validation (needs the user) remains before Phase 2.
 
 ## Architecture overview
 See ARCHITECTURE.md (skeleton; binding layer contract only) — unchanged since Phase 0.
@@ -22,13 +26,11 @@ See PROGRESS.md 2026-07-10 entries. Key artifacts:
   trap cases (dictated questions/commands must be transcribed, never answered).
 
 ## Unfinished / next steps
-1. Benchmark mikr/whisper-large-v3-czech-cv13 (needs GGML conversion) and Parakeet v3
-   (sherpa-onnx) on our fixtures — extend `scripts/bench_stt.py`.
-2. Real-microphone Czech validation of the STT finalist (blocks the model ADR). Needs the
+1. Real-microphone Czech validation of the STT finalist (blocks the model ADR). Needs the
    user: a few sentences of real Czech dictation recorded on the target machine.
-3. Round 2 of the LLM cleanup eval belongs to Phase 2 (engineered prompt: few-shot
+2. Round 2 of the LLM cleanup eval belongs to Phase 2 (engineered prompt: few-shot
    self-correction + anti-paraphrase; try qwen3:4b; cleanup-skip gate).
-4. Then Phase 2 architecture: ARCHITECTURE.md full design + ADRs (STT model, LLM model,
+3. Then Phase 2 architecture: ARCHITECTURE.md full design + ADRs (STT model, LLM model,
    stack language, insertion method — RESEARCH.md has the evidence base).
 
 ## Known issues / assumptions
