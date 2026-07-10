@@ -1,27 +1,39 @@
 # HANDOFF
 
-> Placeholder — filled before any run ends prematurely (context/token/rate limits).
-
 ## Current state
-Phase 0 (environment bootstrap) complete. Phase 1 (research) in progress: STT benchmark round 1 done (whisper.cpp on synthetic Czech/English/mixed fixtures). Wispr Flow product/UX analysis, LLM cleanup comparison, VAD/capture/text-injection research, and `docs/RESEARCH.md` not started.
+Phase 1 (research) mostly done. `docs/RESEARCH.md` written — synthesizes the deep-research
+run (Wispr Flow teardown, OSS landscape, Czech STT/LLM evidence, macOS integration) with
+per-claim confidence tags, plus our measured STT benchmark. LLM cleanup benchmark harness
+built (`scripts/bench_llm_cleanup.py`, `fixtures/llm/cleanup-cases.json`) but not yet run —
+qwen3:8b / gemma3:12b / mistral-nemo:12b were still downloading via Ollama.
 
 ## Architecture overview
 See ARCHITECTURE.md (skeleton; binding layer contract only) — unchanged since Phase 0.
+RESEARCH.md §2 identifies the proven stack pattern (Rust core: cpal → Silero VAD →
+whisper.cpp/Parakeet → pasteboard+Cmd-V insertion; Handy MIT as reference) as Phase-2 input.
 
 ## Completed
-See PROGRESS.md 2026-07-10 entries (environment bootstrap; STT benchmark round 1).
-- `scripts/bench_stt.py` benchmark harness + `fixtures/audio/` (6 synthetic TTS clips, manifest with references).
-- `docs/stt-benchmark.md` / `docs/stt-benchmark.json`: large-v3-turbo q5_0 is the provisional default model (near-large-v3 Czech quality, ~2× speed, 547 MB); medium/small degrade Czech diacritics.
+See PROGRESS.md 2026-07-10 entries. Key artifacts:
+- `docs/stt-benchmark.{md,json}` — large-v3-turbo q5_0 provisional STT default.
+- `docs/RESEARCH.md` — Phase 1 research deliverable (claims tagged MEASURED/VERIFIED/PLAUSIBLE/SNIPPET).
+- `scripts/bench_llm_cleanup.py` + `fixtures/llm/cleanup-cases.json` — 13 cases incl. 4
+  trap cases (dictated questions/commands must be transcribed, never answered).
 
 ## Unfinished / next steps
-1. Make `scripts/bench_stt.py` scoring ITN-aware — current raw WER penalizes whisper's desirable number/format normalization, inflating error rates.
-2. Validate the large-v3-turbo finalist on real-microphone Czech recordings (synthetic TTS fixtures are a clean upper bound) before locking a model choice into an ADR.
-3. Local LLM cleanup comparison (Qwen/Gemma/Mistral tiers, 24 GB budget) — Ollama installed but no models pulled yet.
-4. Wispr Flow product/UX/pipeline analysis; VAD, audio capture, macOS text-injection method research.
-5. Write `docs/RESEARCH.md` deliverable, then move to Phase 2 architecture with ADRs.
+1. Run `python3 scripts/bench_llm_cleanup.py` once `ollama list` shows qwen3:8b,
+   gemma3:12b, mistral-nemo:12b; write results into `docs/llm-cleanup-benchmark.json` +
+   a short `docs/llm-cleanup-benchmark.md` analysis; update RESEARCH.md §4.
+2. Benchmark mikr/whisper-large-v3-czech-cv13 (needs GGML conversion) and Parakeet v3
+   (sherpa-onnx) on our fixtures — extend `scripts/bench_stt.py`.
+3. Real-microphone Czech validation of the STT finalist (blocks the model ADR).
+4. ITN-aware WER scoring mode in `bench_stt.py`.
+5. Then Phase 2 architecture: ARCHITECTURE.md full design + ADRs (STT model, LLM model,
+   stack language, insertion method — RESEARCH.md has the evidence base).
 
 ## Known issues / assumptions
-- rtk warns about untrusted `.rtk/filters.toml` (cosmetic; filters not applied).
-- Ollama installed via brew but its server isn't running and no LLM models are pulled yet (Phase 1 artifact, still pending).
-- Uncommitted local change: `.gitignore` gained a `graphify-out/` entry (graphify knowledge-graph output dir) — not yet committed.
-- `ROADMAP.md`'s "Current position" line still reads "starting Phase 1"; Phase 1 is now underway (STT benchmark round 1 done) but not yet marked as such there.
+- Ollama daemon started via `brew services start ollama`; model pulls ran in a background
+  task — verify with `ollama list` (~20 GB total for the three models).
+- Deep-research verification debt (RESEARCH.md §6): Secure Input, VocaMac, CzechBench
+  numbers, Mistral-Nemo Czech claims are PLAUSIBLE only — verify individually if an ADR
+  depends on them.
+- rtk warns about untrusted `.rtk/filters.toml` (cosmetic).

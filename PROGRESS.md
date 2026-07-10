@@ -24,6 +24,12 @@ Append-only. Newest at bottom. Absolute dates.
 - Ollama daemon started; qwen3:8b, gemma3:12b, mistral-nemo:12b downloading in background.
 - Next: run the benchmark once models finish pulling; record results + model pick input for Phase 2.
 
+## 2026-07-10 — Phase 1: research synthesis (`docs/RESEARCH.md`)
+- Recovered the deep-research workflow output (106 agents, 76 completed; 30 verification agents + synthesis lost to a session limit) via a subagent extraction of the workflow journal — no web research repeated.
+- Wrote `docs/RESEARCH.md`: Wispr Flow teardown (cloud-only pipeline audio→Baseten→OpenAI/Anthropic, pricing, complaints), OSS landscape (Handy MIT/Rust/Tauri stack = architecture donor; VoiceInk = UX template, GPL so design-reference only; OpenWhispr MIT/Electron; Parakeet-on-Mac proof via sherpa-onnx), Czech STT (mikr/whisper-large-v3-czech-cv13 WER 7.89 % Apache-2.0; Parakeet v3 FLEURS cs 11.0 % ≈ whisper large-v3 11.3 % at ~10× speed; Apple-Silicon runtime latency ladder), LLM cleanup candidates (BenCzechMark: Gemma-2-9B strong Czech; Mistral-Nemo 12B plausible leader ≤12B; published data one generation stale → hands-on eval decisive), macOS integration (pasteboard+Cmd-V as robust insertion path; Secure Input must be detected, never bypassed).
+- Every claim tagged MEASURED / VERIFIED / PLAUSIBLE / SNIPPET; verification debt and unresearched topics (Superwhisper, Vosk, code-switching mechanics) listed in §6.
+- Phase 1 remaining: run LLM cleanup benchmark, benchmark mikr fine-tune + Parakeet on our fixtures, real-mic Czech validation, ITN-aware scoring.
+
 ## Debt register
 
 (empty)
