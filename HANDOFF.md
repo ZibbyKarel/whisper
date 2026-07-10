@@ -1,13 +1,16 @@
 # HANDOFF
 
 ## Current state
-Phases 1–3 complete, 2026-07-10. The headless pipeline runs end to end with real models:
-Rust workspace (D-0006) with whisper.cpp STT adapter (parity vs whisper-cli proven),
-Silero VAD streaming segmenter with per-segment decoding (anti-hallucination regression
-test green), llama.cpp qwen3:8b cleanup adapter (KV-prefix cached: **1.1 s/call release**,
-guard avg WER 0.019, 0 traps, 0 diacritics loss — prompt frozen; llama.cpp logs silenced),
-and skip-gate `CleanupMode::Auto` (Czech marker heuristic, 22 unit tests). 53 fast +
-6 real-model test suites green; clippy -D warnings; fmt clean. Next: Phase 4 `whisperd`.
+Phases 1–4 complete, 2026-07-10. The engine is now reachable headless over the Interface
+Layer: `whisperd` (axum, 127.0.0.1, D-0009/D-0011) exposes `/v1/health|status|transcribe|
+sessions|config|dictionary` + `WS /v1/events`, with the `!Send` engines pinned to a
+dedicated worker thread (actor: bounded cmd channel + oneshot waiters + broadcast events),
+single-active-session 409 semantics, opt-in SQLite history, and `whisper-cli` as a thin
+HTTP client. Core pipeline underneath: whisper.cpp STT (parity-proven), Silero VAD
+per-segment decoding (anti-hallucination test), llama.cpp qwen3:8b cleanup (KV-prefix
+cached, 1.1 s/call release, guard WER 0.019, 0 traps — prompt frozen), skip-gate
+`CleanupMode::Auto`. 73 fast tests + 7 real-model suites green; clippy -D warnings; fmt
+clean. Next: Phase 5 macOS platform layer.
 
 ## Architecture overview
 See ARCHITECTURE.md (authoritative). Shape: Rust workspace — `whisper-core` (pure lib,
@@ -25,14 +28,19 @@ mistral-nemo disqualified), ARCHITECTURE.md + ADRs D-0004..D-0010 (cross-reviewe
 findings addressed).
 
 ## Unfinished / next steps
-1. Phase 4: `whisperd` — HTTP `/v1/*` + `WS /v1/events` per ARCHITECTURE §4 / D-0009,
-   bridging the existing PipelineEvent subscriber channel (CleanupSkipped now carries a
-   `reason`); CLI as thin client. NOTE: LlamaCleanupEngine is `!Send`/`!Sync` — pin to
-   one worker thread or front with an actor (see cleanup.rs struct doc).
-2. Verify Parakeet v3 weights license before adopting the low-latency profile (D-0004).
-3. Grow the real-speech Czech corpus (noise, speakers) for VAD tuning + WER regression;
+1. Phase 5: macOS platform layer in whisper-platform — cpal mic AudioSource, global
+   hotkey (push-to-talk/toggle; rdev with CGEventTap fallback, Fn/globe needs
+   flagsChanged/IOKit), pasteboard+Cmd-V TextSink (D-0007: restore-after-paste, NFC
+   read-back), Secure Input detect-never-bypass, menu-bar presence. Wire into whisperd
+   as the mic-port audio source for live sessions.
+2. Phase-4 follow-ups (tracked, not blocking): queued one-shot transcribe behind active
+   session (now immediate 409); config sentinel to disable cleanup via config.toml;
+   input sample-rate check/resample (16 kHz assumed); cap the in-memory session map;
+   silence whisper.cpp load banner.
+3. Verify Parakeet v3 weights license before adopting the low-latency profile (D-0004).
+4. Grow the real-speech Czech corpus (noise, speakers) for VAD tuning + WER regression;
    tune skip-gate marker lists on it (first-pass lists, §3.2 deliverable).
-4. Housekeeping: remove redundant PlaceholderVad in whisper-platform; a stale superseded
+5. Housekeeping: remove redundant PlaceholderVad in whisper-platform; a stale superseded
    `stash@{0}` sits in the repo — safe to `git stash drop` manually.
 
 ## Known issues / assumptions

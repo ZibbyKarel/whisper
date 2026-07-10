@@ -2,7 +2,7 @@
 
 Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-first, built as an embeddable platform component.
 
-**Current position: Phase 3 (Core Engine MVP) ✅ complete (2026-07-10) — headless pipeline end to end with real models: whisper.cpp STT (parity-proven), Silero VAD per-segment decoding (anti-hallucination test), llama.cpp qwen3:8b cleanup (KV-prefix cached, 1.1 s/call release, WER 0.019, 0 traps), skip-gate Auto mode. Next: Phase 4 Interface Layer (`whisperd` HTTP + WS per D-0009).**
+**Current position: Phase 4 (Interface Layer) ✅ complete (2026-07-10) — `whisperd` daemon (axum, 127.0.0.1): `/v1/health|status|transcribe|sessions|config|dictionary` + `WS /v1/events`, actor over the `!Send` engines, single-active-session 409, opt-in SQLite history, `whisper-cli` thin client; real-model contract test green. Next: Phase 5 macOS platform layer (mic capture, hotkey, text injection).**
 
 ## Phase 0 — Environment & tooling bootstrap ✅ (2026-07-10)
 - Capability audit (`docs/CAPABILITY_AUDIT.md`), local skills, subagents, runtimes, memory files, verification gate.
@@ -24,9 +24,9 @@ Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-fi
 - Text cleanup + formatting pipeline (rule-based first, LLM optional)
 - Headless, fully testable with fixture audio
 
-## Phase 4 — Interface Layer
+## Phase 4 — Interface Layer ✅ (2026-07-10)
 - Local HTTP + WebSocket API, CLI, event stream
-- External orchestrator can start/stop, subscribe, inject processing steps
+- External orchestrator can start/stop, subscribe, inject processing steps (transform hook deferred past MVP per §4)
 
 ## Phase 5 — macOS Platform Layer
 - Global hotkey (push-to-talk / toggle), mic permissions, text insertion into focused app, menu-bar presence
