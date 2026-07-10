@@ -125,12 +125,13 @@ session for the shared STT/LLM resources (bounded queue, structured busy error b
   handle Czech-inflected dev vocabulary. No per-language routing in v1 (Parakeet's
   code-switching collapse rules out engine-per-language until a router exists).
 
-### 3.4 Latency budget (release-to-text: ≤ 1.5 s when cleanup is skipped; ~2.5 s when the LLM runs)
+### 3.4 Latency budget (release-to-text: ≤ 1.5 s when cleanup is skipped; ~2 s when the LLM runs)
 
 Default profile: cleanup **on with skip-gate** — the gate exists precisely to keep the
-median case on the fast path; when the LLM does run, the extra ~1.6 s buys the measured
-cleanup quality. Per-segment decoding overlaps STT with recording, so for multi-segment
-(long/hands-free) sessions only the *final* segment's decode lands after release.
+median case on the fast path; when the LLM does run, the extra ~1.1 s (measured in-process,
+release) buys the measured cleanup quality. Per-segment decoding overlaps STT with recording,
+so for multi-segment (long/hands-free) sessions only the *final* segment's decode lands after
+release.
 
 | Stage | Budget | Evidence |
 |---|---|---|
@@ -139,7 +140,7 @@ cleanup quality. Per-segment decoding overlaps STT with recording, so for multi-
 | earlier segments | 0 ms at release (decoded during recording) | design (§3.2) |
 | dictionary pass | <1 ms | string ops |
 | cleanup gate: skipped | 0 ms (est. ~40 % of cases per FreeFlow) | |
-| cleanup LLM (when it runs) | ~1.6 s provisional — measured on Ollama; must be re-measured in-process (D-0005) | round-1 LLM bench |
+| cleanup LLM (when it runs) | ~1.1 s (in-process, release, KV-prefix cached; 0.5–2.7 s by input length) | D-0005 guard, round 2 |
 | injection (paste) | ~50 ms | |
 
 Mitigations: segment-granular partials over WS (UX shows text as segments close), models

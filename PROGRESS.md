@@ -88,6 +88,13 @@ Append-only. Newest at bottom. Absolute dates.
 - Noted: marker lists are a first pass — tune on the growing real-speech corpus (§3.2 deliverable); heuristic biases toward cleanup (false "needs cleanup" costs only latency, false "clean" costs quality).
 - Incident: a mid-task `git reset` in the shared tree wiped uncommitted work (redone + re-verified); concurrent-agent git hygiene tightened — commit reviewed work immediately.
 
+## 2026-07-10 — Phase 3: cleanup adapter round 2 — KV-prefix caching, latency under budget, self-correction fixed
+- `LlamaCleanupEngine` reworked: one persistent `LlamaContext`, static few-shot prefix decoded once, per-call self-healing KV trim back to `prefix_len` + suffix-only decode (split exactly at the `<|im_start|>` special-token boundary — separate tokenization provably identical; byte-identical outputs vs fresh-context path verified on the whole guard suite). Overflow fallback to full-prompt fresh context. Model now owned (`Box`, documented `unsafe` self-reference, load-bearing field drop order) — fixes a Metal residency-set abort the earlier leak-to-`'static` approach caused at exit. Implemented by opus-implementer, reviewed by Fable.
+- **Latency (release, D-0005 guard): 3.22 s → 1.12 s/call** (0.5–2.7 s by length) — under the 1.6 s budget; ARCHITECTURE §3.4 updated from measurements. llama.cpp stderr silenced via `send_logs_to_tracing(logs_enabled=false)` (0 ggml/metal lines).
+- **Self-correction round 2 fixed via few-shot only**: root cause — system prompt listed "vlastně" as pure filler; two new disjoint retraction examples (clause restart + "ne vlastně" value swap) and trap examples reordered last. **Guard: avg WER 0.069 → 0.019, both retraction cases now WER 0.00, traps 0/4, diacritics 0** — independently re-run by Fable (`SUMMARY cases=13 avg WER=0.019 trap failures=0 diacritics lost=0 avg latency=1.17s`). Cleanup prompt now frozen.
+- Noted: engine is `!Send`/`!Sync` (persistent context) — future daemon must pin it to one worker thread or front with an actor (flagged in struct doc); `dev-vocab-packajson` WER 0.00→0.09 (LLM no longer fixes "packa"→"package" — dictionary pass is the primary dev-vocab fixer per D-0005, low severity).
+- Incident closed: agent's early `git stash` in the shared tree caused the reverted-files episode; stale stash dropped, both agents' final work committed.
+
 ## Debt register
 
 (empty)
