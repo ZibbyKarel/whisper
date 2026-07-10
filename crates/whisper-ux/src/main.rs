@@ -19,10 +19,12 @@ fn main() -> eframe::Result<()> {
     let token = env::var("WHISPERD_TOKEN").ok().filter(|t| !t.is_empty());
 
     let mut native_options = eframe::NativeOptions {
+        // UX pass 2: wider default to fit the sidebar + content comfortably;
+        // min size keeps the sidebar (150px) and a usable content column.
         viewport: egui::ViewportBuilder::default()
             .with_title("Whisper")
-            .with_inner_size([560.0, 640.0])
-            .with_min_inner_size([420.0, 480.0]),
+            .with_inner_size([760.0, 520.0])
+            .with_min_inner_size([640.0, 440.0]),
         ..Default::default()
     };
 

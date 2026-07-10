@@ -15,6 +15,7 @@ pub mod client;
 pub mod daemon_ctl;
 pub mod dict_editor;
 pub mod icons;
+pub mod language;
 pub mod onboarding;
 pub mod overlay;
 pub mod save_report;

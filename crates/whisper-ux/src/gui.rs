@@ -25,6 +25,7 @@ use whisper_ux::client::{backoff_delay, events_ws_url, Api, ApiError, HttpClient
 use whisper_ux::daemon_ctl::DaemonController;
 use whisper_ux::dict_editor::DictEditor;
 use whisper_ux::icons::{self, IconImage};
+use whisper_ux::language::{self, LanguagePreset};
 use whisper_ux::onboarding::{self, OnboardingState};
 use whisper_ux::overlay::{self, Overlay, OverlayPhase};
 use whisper_ux::save_report::SaveReport;
@@ -47,7 +48,8 @@ enum Screen {
     App,
 }
 
-/// Sections of the main app screen (left sidebar / tab bar, D-0013 UX pass).
+/// Sections of the main app screen, navigated via the left sidebar (D-0013 UX
+/// pass; sidebar layout added in UX pass 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
     Status,
@@ -76,6 +78,19 @@ impl Section {
             Section::Cleanup => "Cleanup",
             Section::Dictionary => "Dictionary",
             Section::Advanced => "Advanced",
+        }
+    }
+
+    /// One-line muted description shown under the section heading (UX pass 2:
+    /// "a section heading + one-line muted description under it").
+    fn description(self) -> &'static str {
+        match self {
+            Section::Status => "Live engine state, input level and the last transcript.",
+            Section::Dictation => "Dictation language, global hotkey and delivery.",
+            Section::Audio => "Voice activity detection and automatic gain control.",
+            Section::Cleanup => "LLM disfluency cleanup and resident model paths.",
+            Section::Dictionary => "Deterministic substitutions applied before cleanup.",
+            Section::Advanced => "Server bind/port, history and dictionary file locations.",
         }
     }
 }
@@ -139,6 +154,11 @@ pub struct ShellApp {
     status_msg: Option<String>,
     save_report: SaveReport,
     test_dictation_text: String,
+    /// Whether the Dictation section's language picker shows the free-text
+    /// "Other…" ISO-code field. Tracked separately from `cfg.language` so
+    /// revealing the field never clobbers the current value (Task 1: "never
+    /// clobber it to a preset"); derived from `cfg.language` on load.
+    language_other_mode: bool,
 }
 
 impl ShellApp {
@@ -220,6 +240,7 @@ impl ShellApp {
             status_msg: None,
             save_report: SaveReport::default(),
             test_dictation_text: String::new(),
+            language_other_mode: false,
         };
         // Best-effort initial sync so the UI reflects the daemon immediately.
         app.refresh_status();
@@ -252,6 +273,8 @@ impl ShellApp {
                 self.dictionary_path_input = cfg.dictionary_path.clone().unwrap_or_default();
                 self.history_path_input = cfg.history.path.clone().unwrap_or_default();
                 self.cleanup_model_input = cfg.models.cleanup.clone().unwrap_or_default();
+                self.language_other_mode =
+                    language::preset_for(&cfg.language) == LanguagePreset::Other;
                 self.cfg = Some(cfg);
             }
             Err(e) => self.status_msg = Some(format!("load config: {e}")),
@@ -614,40 +637,87 @@ impl ShellApp {
         }
     }
 
-    fn ui_section_nav(&mut self, ui: &mut egui::Ui) {
+    /// The sidebar's nav list: app name + status pill (top), then one row per
+    /// [`Section`] with a selected-state accent bar/highlight and a hover
+    /// effect (UX pass 2: proper left sidebar instead of a tab bar).
+    fn ui_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Whisper").heading());
+        ui.add_space(6.0);
+        status_pill(ui, self.pill_state());
+        ui.add_space(18.0);
         for section in SECTIONS {
-            let selected = self.section == section;
-            if ui.selectable_label(selected, section.label()).clicked() {
-                self.section = section;
-            }
+            self.ui_nav_item(ui, section);
         }
+    }
+
+    fn ui_nav_item(&mut self, ui: &mut egui::Ui, section: Section) {
+        let selected = self.section == section;
+        let desired = egui::vec2(ui.available_width(), 32.0);
+        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+        if response.clicked() {
+            self.section = section;
+        }
+        if ui.is_rect_visible(rect) {
+            let radius = theme::CORNER_RADIUS as f32;
+            if selected {
+                ui.painter()
+                    .rect_filled(rect, radius, egui::Color32::from_gray(40));
+                let bar = egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
+                ui.painter().rect_filled(bar, 0.0, theme::ACCENT);
+            } else if response.hovered() {
+                ui.painter()
+                    .rect_filled(rect, radius, egui::Color32::from_gray(30));
+            }
+            let text_color = if selected {
+                egui::Color32::WHITE
+            } else {
+                ui.visuals().text_color()
+            };
+            ui.painter().text(
+                rect.left_center() + egui::vec2(16.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                section.label(),
+                egui::FontId::proportional(14.0),
+                text_color,
+            );
+        }
+        ui.add_space(2.0);
     }
 
     // -- rendering: sections -------------------------------------------------
 
+    /// Status dashboard (UX pass 2): a big level meter + status pill + primary
+    /// action up top, session/process info laid out on a two-column grid below.
     fn ui_status_section(&mut self, ui: &mut egui::Ui) {
         theme::card_frame().show(ui, |ui| {
-            ui.heading("Engine");
             ui.horizontal(|ui| {
                 status_pill(ui, self.pill_state());
-                ui.label(format!("daemon: {}", self.daemon_phase));
+                ui.label(
+                    egui::RichText::new(format!("daemon: {}", self.daemon_phase))
+                        .weak()
+                        .small(),
+                );
             });
-            ui.add_space(6.0);
-            ui.label("Input level");
-            level_meter(ui, self.last_rms, self.last_peak, 260.0);
-            ui.add_space(6.0);
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Input level").weak().small());
+            let width = ui.available_width();
+            level_meter_sized(ui, self.last_rms, self.last_peak, width, 28.0);
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
                 let label = if self.active_session.is_some() {
                     "Stop dictation"
                 } else {
                     "Start dictation"
                 };
-                if ui.button(label).clicked() {
+                if primary_button(ui, label).clicked() {
                     self.toggle_dictation();
                 }
                 self.ui_restart_button(ui);
             });
-            ui.add_space(6.0);
+        });
+        ui.add_space(theme::CARD_GAP);
+        theme::card_frame().show(ui, |ui| {
             let mode = if self.daemon.is_managed() {
                 "managed by this app"
             } else if self.daemon.is_external() {
@@ -655,18 +725,37 @@ impl ShellApp {
             } else {
                 "not running"
             };
-            ui.label(
-                egui::RichText::new(format!("Process: {mode}"))
-                    .weak()
-                    .small(),
-            );
-            ui.label(
-                egui::RichText::new(format!("Log: {}", self.daemon.log_path().display()))
-                    .weak()
-                    .small(),
-            );
+            egui::Grid::new("status_dashboard_grid")
+                .num_columns(2)
+                .spacing([32.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Session").strong());
+                    ui.label(egui::RichText::new("Process").strong());
+                    ui.end_row();
+
+                    ui.vertical(|ui| {
+                        let active = self.active_session.as_deref().unwrap_or("none");
+                        ui.label(format!("active: {active}"));
+                        if !self.last_partial.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("… {}", self.last_partial)).small(),
+                            );
+                        }
+                    });
+                    ui.vertical(|ui| {
+                        ui.label(format!("mode: {mode}"));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "log: {}",
+                                self.daemon.log_path().display()
+                            ))
+                            .small(),
+                        );
+                    });
+                    ui.end_row();
+                });
         });
-        ui.add_space(8.0);
+        ui.add_space(theme::CARD_GAP);
         theme::card_frame().show(ui, |ui| {
             ui.heading("Last transcript");
             if self.test_dictation_text.is_empty() && self.last_partial.is_empty() {
@@ -680,6 +769,11 @@ impl ShellApp {
     }
 
     fn ui_dictation_section(&mut self, cfg: &mut Config, ui: &mut egui::Ui) {
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Language");
+            self.ui_language_picker(cfg, ui);
+        });
+        ui.add_space(theme::CARD_GAP);
         theme::card_frame().show(ui, |ui| {
             ui.heading("Global hotkey");
             labeled_toggle(ui, &mut cfg.hotkey.enabled, "Enabled");
@@ -700,7 +794,7 @@ impl ShellApp {
                     .small(),
             );
         });
-        ui.add_space(8.0);
+        ui.add_space(theme::CARD_GAP);
         theme::card_frame().show(ui, |ui| {
             ui.heading("Delivery");
             ui.horizontal(|ui| {
@@ -712,8 +806,57 @@ impl ShellApp {
                 );
             });
         });
-        ui.add_space(8.0);
+        ui.add_space(theme::CARD_GAP);
         self.ui_overlay_card(ui);
+    }
+
+    /// Dictation-language picker (Task 1): preset buttons for cs/en/auto plus
+    /// an "Other…" affordance that reveals a free-text ISO-code field. The
+    /// preset shown is always derived from `cfg.language` so a value the
+    /// daemon returns that isn't one of the three known codes round-trips
+    /// byte-exact — clicking "Other…" only reveals the text field, it never
+    /// overwrites `cfg.language`.
+    fn ui_language_picker(&mut self, cfg: &mut Config, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let current = language::preset_for(&cfg.language);
+            for preset in language::PRESETS {
+                if ui
+                    .selectable_label(
+                        current == preset && !self.language_other_mode,
+                        preset.label(),
+                    )
+                    .clicked()
+                {
+                    if let Some(code) = preset.code() {
+                        cfg.language = code.to_string();
+                    }
+                    self.language_other_mode = false;
+                }
+            }
+            if ui
+                .selectable_label(self.language_other_mode, LanguagePreset::Other.label())
+                .clicked()
+            {
+                self.language_other_mode = true;
+            }
+        });
+        if self.language_other_mode {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("ISO code");
+                ui.add(
+                    egui::TextEdit::singleline(&mut cfg.language)
+                        .hint_text("e.g. de, sk, fr")
+                        .desired_width(100.0),
+                );
+            });
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Applied live by the daemon — no restart needed.")
+                .weak()
+                .small(),
+        );
     }
 
     /// "Floating overlay" card: enable toggle + Top/Bottom edge. Persisted to the
@@ -798,7 +941,7 @@ impl ShellApp {
                 }
             }
         });
-        ui.add_space(8.0);
+        ui.add_space(theme::CARD_GAP);
         theme::card_frame().show(ui, |ui| {
             ui.heading("Automatic gain control");
             labeled_toggle(ui, &mut cfg.audio.agc_enabled, "Enabled");
@@ -828,7 +971,7 @@ impl ShellApp {
                     .small(),
             );
         });
-        ui.add_space(8.0);
+        ui.add_space(theme::CARD_GAP);
         theme::card_frame().show(ui, |ui| {
             ui.heading("Live level (for tuning)");
             level_meter(ui, self.last_rms, self.last_peak, 260.0);
@@ -843,17 +986,8 @@ impl ShellApp {
                 ui.selectable_value(&mut cfg.cleanup_mode, CleanupMode::Always, "always");
                 ui.selectable_value(&mut cfg.cleanup_mode, CleanupMode::Never, "never");
             });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("Language");
-                ui.add(
-                    egui::TextEdit::singleline(&mut cfg.language)
-                        .hint_text("cs / en / auto")
-                        .desired_width(120.0),
-                );
-            });
         });
-        ui.add_space(8.0);
+        ui.add_space(theme::CARD_GAP);
         theme::card_frame().show(ui, |ui| {
             ui.heading("Models");
             ui.horizontal(|ui| {
@@ -944,7 +1078,7 @@ impl ShellApp {
                     .small(),
             );
         });
-        ui.add_space(8.0);
+        ui.add_space(theme::CARD_GAP);
         theme::card_frame().show(ui, |ui| {
             ui.heading("History");
             labeled_toggle(
@@ -960,7 +1094,7 @@ impl ShellApp {
                 );
             });
         });
-        ui.add_space(8.0);
+        ui.add_space(theme::CARD_GAP);
         theme::card_frame().show(ui, |ui| {
             ui.heading("Dictionary file");
             ui.horizontal(|ui| {
@@ -978,7 +1112,7 @@ impl ShellApp {
             ui.heading("Welcome to Whisper");
             ui.label("Local-first Czech/English dictation. Let's get set up.");
         });
-        ui.add_space(8.0);
+        ui.add_space(theme::CARD_GAP);
         theme::card_frame().show(ui, |ui| {
             let daemon_ok = self.daemon_phase == "ready" || self.daemon_phase == "degraded";
             checklist_row(ui, daemon_ok, "1. Daemon is running");
@@ -1047,7 +1181,7 @@ impl ShellApp {
             }
         });
 
-        ui.add_space(8.0);
+        ui.add_space(theme::CARD_GAP);
         ui.horizontal(|ui| {
             if ui.button("Finish").clicked() {
                 self.onboarding.completed = true;
@@ -1063,25 +1197,33 @@ impl ShellApp {
         });
     }
 
+    /// Content area for `Screen::App`: section heading + muted description
+    /// (UX pass 2), Reload/Save row (Save is the primary accent-filled
+    /// action), the staged-config notice, then the selected section.
     fn ui_app(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("Reload from daemon").clicked() {
-                self.load_settings();
-            }
-            if ui.button("Save").clicked() {
-                self.save_settings();
-            }
+            ui.label(egui::RichText::new(self.section.label()).heading());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if primary_button(ui, "Save").clicked() {
+                    self.save_settings();
+                }
+                if ui.button("Reload from daemon").clicked() {
+                    self.load_settings();
+                }
+            });
         });
-        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(self.section.description())
+                .weak()
+                .small(),
+        );
+        ui.add_space(10.0);
         self.ui_staged_notice(ui);
 
         if self.cfg.is_none() {
             ui.label("No config loaded — is the daemon running?");
             return;
         }
-
-        ui.horizontal_wrapped(|ui| self.ui_section_nav(ui));
-        ui.add_space(8.0);
 
         // Work on a temporary so the borrow of self.cfg doesn't collide with
         // helper methods; write back at the end.
@@ -1123,26 +1265,41 @@ impl eframe::App for ShellApp {
         let ctx = ui.ctx().clone();
         self.show_overlay(&ctx);
 
-        egui::Panel::top("top").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Whisper");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    status_pill(ui, self.pill_state());
+        // Onboarding has no section nav, so it keeps a slim top bar instead of
+        // the sidebar (UX pass 2 restyles it lightly; the flow is unchanged).
+        if self.screen == Screen::Onboarding {
+            egui::Panel::top("top_onboarding").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Whisper").heading());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        status_pill(ui, self.pill_state());
+                    });
                 });
             });
-        });
+        } else {
+            // Left sidebar: app name + status pill + section nav (UX pass 2:
+            // replaces the old top tab bar).
+            egui::Panel::left("sidebar")
+                .exact_size(150.0)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(theme::sidebar_frame())
+                .show(ui, |ui| self.ui_sidebar(ui));
+        }
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.ui_recording_banner(ui);
-            egui::ScrollArea::vertical().show(ui, |ui| match self.screen {
-                Screen::Onboarding => self.ui_onboarding(ui),
-                Screen::App => self.ui_app(ui),
+        egui::CentralPanel::default()
+            .frame(theme::content_frame())
+            .show(ui, |ui| {
+                self.ui_recording_banner(ui);
+                egui::ScrollArea::vertical().show(ui, |ui| match self.screen {
+                    Screen::Onboarding => self.ui_onboarding(ui),
+                    Screen::App => self.ui_app(ui),
+                });
+                if let Some(msg) = &self.status_msg {
+                    ui.separator();
+                    ui.label(egui::RichText::new(msg).weak().small());
+                }
             });
-            if let Some(msg) = &self.status_msg {
-                ui.separator();
-                ui.label(egui::RichText::new(msg).weak().small());
-            }
-        });
     }
 }
 
@@ -1186,16 +1343,25 @@ fn status_pill(ui: &mut egui::Ui, state: PillState) {
 
 /// Smooth horizontal level meter: an RMS fill banded quiet/good/hot, plus a
 /// peak tick mark (D-0013 UX pass, feedback item 1: "not a raw number").
+/// Standard 14px-tall bar; see [`level_meter_sized`] for the Status
+/// dashboard's larger meter (UX pass 2).
 fn level_meter(ui: &mut egui::Ui, rms: f32, peak: f32, width: f32) {
+    level_meter_sized(ui, rms, peak, width, 14.0);
+}
+
+/// [`level_meter`] with a configurable bar height (UX pass 2: "big level
+/// meter" on the Status dashboard).
+fn level_meter_sized(ui: &mut egui::Ui, rms: f32, peak: f32, width: f32, height: f32) {
     let rms = rms.clamp(0.0, 1.0);
     let peak = peak.clamp(0.0, 1.0);
-    let desired_size = egui::vec2(width.min(ui.available_width()), 14.0);
+    let desired_size = egui::vec2(width.min(ui.available_width()), height);
     let (rect, _response) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
     if ui.is_rect_visible(rect) {
+        let radius = height * 0.5;
         let painter = ui.painter();
         painter.rect(
             rect,
-            7.0,
+            radius,
             ui.visuals().extreme_bg_color,
             egui::Stroke::NONE,
             egui::StrokeKind::Inside,
@@ -1205,7 +1371,7 @@ fn level_meter(ui: &mut egui::Ui, rms: f32, peak: f32, width: f32) {
                 egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * rms, rect.height()));
             painter.rect(
                 fill,
-                7.0,
+                radius,
                 theme::level::color_for_rms(rms),
                 egui::Stroke::NONE,
                 egui::StrokeKind::Inside,
@@ -1224,6 +1390,18 @@ fn level_meter(ui: &mut egui::Ui, rms: f32, peak: f32, width: f32) {
             .weak()
             .small(),
     );
+}
+
+/// A primary, accent-filled action button (white text on [`theme::ACCENT`],
+/// rounded) for the shell's single most important action per screen (UX pass
+/// 2: "Save, Start dictation"). Secondary buttons stay the default subtle
+/// style.
+fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE))
+            .fill(theme::ACCENT)
+            .corner_radius(egui::CornerRadius::same(theme::CORNER_RADIUS)),
+    )
 }
 
 /// Animated toggle switch (egui has no built-in one); the canonical ~15-line

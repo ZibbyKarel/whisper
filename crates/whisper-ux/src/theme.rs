@@ -1,15 +1,23 @@
-//! Central dark theme for `whisper-tray` (feedback item 1: "make it modern").
-//! Builds a custom `egui::Style`/`Visuals` on top of `egui::Visuals::dark()`:
-//! rounded corners, comfortable spacing, and a single accent color for
-//! sliders/toggles/selected tabs. Pure data construction — no live
+//! Central dark theme for `whisper-tray` (feedback item 1: "make it modern",
+//! round 2: "redo the UI some more"). Builds a custom `egui::Style`/`Visuals`
+//! on top of `egui::Visuals::dark()`: rounded corners, comfortable spacing,
+//! vendored Inter typography, and a single accent color for sliders/toggles/
+//! selected nav items/primary buttons. Pure data construction — no live
 //! `egui::Context` is needed to build a [`Style`], so its shape is
-//! unit-tested directly; only [`apply`] touches a real context, and that is
-//! exercised manually (egui rendering is not unit-tested per project policy).
+//! unit-tested directly; only [`apply`]/[`install_fonts`] touch a real
+//! context, and those are exercised manually (egui rendering is not unit-
+//! tested per project policy).
 
-use egui::{Color32, CornerRadius, Stroke, Style, Vec2, Visuals};
+use std::sync::Arc;
 
-/// Single accent color used for sliders, toggles, selected tabs and active
-/// buttons: a calm teal that reads clearly on the dark panel background.
+use egui::{
+    Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, Style, TextStyle,
+    Vec2, Visuals,
+};
+
+/// Single accent color used for sliders, toggles, selected nav items and
+/// primary buttons: a calm teal that reads clearly on the dark panel
+/// background.
 pub const ACCENT: Color32 = Color32::from_rgb(0x4D, 0xB6, 0xAC);
 
 /// Corner radius (px) applied to windows, menus, cards and widgets.
@@ -21,6 +29,22 @@ pub const ITEM_SPACING: Vec2 = Vec2::new(10.0, 10.0);
 /// Button content padding.
 pub const BUTTON_PADDING: Vec2 = Vec2::new(12.0, 6.0);
 
+/// Vertical gap between stacked cards (UX pass 2: "consistent 12 px gaps").
+pub const CARD_GAP: f32 = 12.0;
+
+/// Vendored font family name for body/UI text (Inter Regular, SIL OFL 1.1).
+/// Registered into [`FontFamily::Proportional`] by [`install_fonts`].
+pub const FONT_REGULAR: &str = "Inter-Regular";
+/// Vendored font family name for headings (Inter SemiBold, SIL OFL 1.1),
+/// registered under its own [`FontFamily::Name`] since egui's `Proportional`
+/// slot only holds one weight.
+pub const FONT_SEMIBOLD: &str = "Inter-SemiBold";
+
+/// SIL OFL 1.1, offline, `include_bytes!`'d — see `assets/fonts/LICENSE-OFL.txt`.
+const INTER_REGULAR_TTF: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
+/// SIL OFL 1.1, offline, `include_bytes!`'d — see `assets/fonts/LICENSE-OFL.txt`.
+const INTER_SEMIBOLD_TTF: &[u8] = include_bytes!("../assets/fonts/Inter-SemiBold.ttf");
+
 /// Build the full [`Style`] for the shell.
 #[must_use]
 pub fn style() -> Style {
@@ -30,7 +54,61 @@ pub fn style() -> Style {
     };
     style.spacing.item_spacing = ITEM_SPACING;
     style.spacing.button_padding = BUTTON_PADDING;
+    style.text_styles = [
+        (
+            TextStyle::Heading,
+            FontId::new(20.0, FontFamily::Name(FONT_SEMIBOLD.into())),
+        ),
+        (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
+        (
+            TextStyle::Monospace,
+            FontId::new(13.0, FontFamily::Monospace),
+        ),
+        (
+            TextStyle::Button,
+            FontId::new(14.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Small,
+            FontId::new(11.5, FontFamily::Proportional),
+        ),
+    ]
+    .into();
     style
+}
+
+/// Register the vendored Inter faces into a live `egui::Context` (Inter 4.1,
+/// SIL Open Font License 1.1 — permissive, offline, `include_bytes!`'d, no
+/// network at runtime). Regular becomes the default proportional family (used
+/// by body/button/small text via [`style`]'s `TextStyle` map); SemiBold is
+/// registered under its own named family for [`TextStyle::Heading`]. Falls
+/// back to Regular, then egui's bundled defaults, if a glyph is missing from
+/// either face. Not unit-tested: needs a live `Context` (see module docs).
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        FONT_REGULAR.to_owned(),
+        Arc::new(FontData::from_static(INTER_REGULAR_TTF)),
+    );
+    fonts.font_data.insert(
+        FONT_SEMIBOLD.to_owned(),
+        Arc::new(FontData::from_static(INTER_SEMIBOLD_TTF)),
+    );
+
+    // Inter first in the proportional fallback chain; egui's bundled fonts
+    // (emoji, wide Unicode coverage) stay behind it for glyphs Inter lacks.
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, FONT_REGULAR.to_owned());
+
+    fonts.families.insert(
+        FontFamily::Name(FONT_SEMIBOLD.into()),
+        vec![FONT_SEMIBOLD.to_owned(), FONT_REGULAR.to_owned()],
+    );
+
+    ctx.set_fonts(fonts);
 }
 
 /// Build the [`Visuals`] half of the theme (separated so tests can inspect it
@@ -61,23 +139,49 @@ pub fn visuals() -> Visuals {
     v.widgets.active.bg_fill = ACCENT;
     v.widgets.active.weak_bg_fill = ACCENT;
 
+    // UX pass 2: sliders show the accent as a trailing fill behind the handle,
+    // and hovered widgets brighten with an accent-tinted edge (buttons/toggles
+    // read as clickable, not flat).
+    v.slider_trailing_fill = true;
+    v.widgets.hovered.weak_bg_fill = Color32::from_gray(78);
+    v.widgets.hovered.bg_fill = Color32::from_gray(78);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
+
     v
 }
 
-/// A card [`egui::Frame`] for section content: panel-toned fill, inner margin,
-/// rounded corners (D-0013 UX feedback: "not a raw form dump").
+/// A card [`egui::Frame`] for section content: panel-toned fill, generous
+/// inner margin, rounded corners (D-0013 UX feedback: "not a raw form dump";
+/// UX pass 2: "more air inside cards").
 pub fn card_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(Color32::from_gray(32))
         .corner_radius(CornerRadius::same(CORNER_RADIUS))
-        .inner_margin(egui::Margin::same(12))
+        .inner_margin(egui::Margin::same(16))
         .stroke(Stroke::new(1.0, Color32::from_gray(46)))
+}
+
+/// The left navigation sidebar's frame: a darker tone than the content area so
+/// it reads as its own depth layer (UX pass 2: proper sidebar layout).
+pub fn sidebar_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(Color32::from_gray(20))
+        .inner_margin(egui::Margin::symmetric(12, 20))
+}
+
+/// The main content area's frame: generous margins around the section heading
+/// and cards (UX pass 2: "~20 px margins").
+pub fn content_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(Color32::from_gray(24))
+        .inner_margin(egui::Margin::symmetric(20, 20))
 }
 
 /// Apply the theme to a live egui context (called once at startup). Not
 /// unit-tested (needs a real `Context`); [`style`]/[`visuals`] carry the
 /// tested logic.
 pub fn apply(ctx: &egui::Context) {
+    install_fonts(ctx);
     // Force dark (the design is dark-only) and overwrite both theme slots so
     // an OS light/dark switch never reverts the custom style.
     ctx.set_theme(egui::ThemePreference::Dark);
@@ -186,6 +290,18 @@ mod tests {
     }
 
     #[test]
+    fn visuals_enable_slider_trailing_fill() {
+        assert!(visuals().slider_trailing_fill);
+    }
+
+    #[test]
+    fn hovered_widgets_are_visibly_brighter_than_inactive() {
+        let v = visuals();
+        assert_ne!(v.widgets.hovered.bg_fill, v.widgets.inactive.bg_fill);
+        assert_eq!(v.widgets.hovered.bg_stroke.color, ACCENT);
+    }
+
+    #[test]
     fn style_carries_comfortable_spacing() {
         let s = style();
         assert_eq!(s.spacing.item_spacing, ITEM_SPACING);
@@ -193,10 +309,35 @@ mod tests {
     }
 
     #[test]
+    fn style_uses_inter_semibold_for_headings_and_inter_regular_for_body() {
+        let s = style();
+        let heading = s.text_styles.get(&TextStyle::Heading).unwrap();
+        assert_eq!(heading.family, FontFamily::Name(FONT_SEMIBOLD.into()));
+        assert_eq!(heading.size, 20.0);
+
+        let body = s.text_styles.get(&TextStyle::Body).unwrap();
+        assert_eq!(body.family, FontFamily::Proportional);
+        assert_eq!(body.size, 14.0);
+
+        let small = s.text_styles.get(&TextStyle::Small).unwrap();
+        assert_eq!(small.size, 11.5);
+
+        let button = s.text_styles.get(&TextStyle::Button).unwrap();
+        assert_eq!(button.size, 14.0);
+    }
+
+    #[test]
     fn card_frame_has_rounding_and_margin() {
         let f = card_frame();
         assert_eq!(f.corner_radius, CornerRadius::same(CORNER_RADIUS));
-        assert_eq!(f.inner_margin, egui::Margin::same(12));
+        assert_eq!(f.inner_margin, egui::Margin::same(16));
+    }
+
+    #[test]
+    fn sidebar_and_content_frames_have_distinct_fills() {
+        let sidebar = sidebar_frame();
+        let content = content_frame();
+        assert_ne!(sidebar.fill, content.fill);
     }
 
     #[test]
