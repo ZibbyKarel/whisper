@@ -1,0 +1,41 @@
+{
+  "note": "Synthetic TTS fixtures (macOS say: Zuzana cs_CZ, Samantha en_US) at 16 kHz mono WAV. TTS is cleaner than real dictation — results are an upper bound; validate finalists with real recordings before locking models (see docs/RESEARCH.md).",
+  "fixtures": [
+    {
+      "file": "cs-01.wav",
+      "lang": "cs",
+      "voice": "Zuzana",
+      "reference": "Příliš žluťoučký kůň úpěl ďábelské ódy."
+    },
+    {
+      "file": "cs-02.wav",
+      "lang": "cs",
+      "voice": "Zuzana",
+      "reference": "Dobrý den, chtěl bych objednat dvě stě třicet sedm kusů zboží a doručit je do Ústí nad Labem příští středu."
+    },
+    {
+      "file": "cs-03.wav",
+      "lang": "cs",
+      "voice": "Zuzana",
+      "reference": "Věda a výzkum jsou základem hospodářského růstu, říká zpráva ministerstva školství."
+    },
+    {
+      "file": "mix-01.wav",
+      "lang": "cs+en",
+      "voice": "Zuzana",
+      "reference": "Pushni ten branch do repa a udělej pull request, ať to můžeme mergnout do mainu."
+    },
+    {
+      "file": "mix-02.wav",
+      "lang": "cs+en",
+      "voice": "Zuzana",
+      "reference": "Otevři si terminál a spusť npm install, pak zkontroluj package.json."
+    },
+    {
+      "file": "en-01.wav",
+      "lang": "en",
+      "voice": "Samantha",
+      "reference": "The quick brown fox jumps over the lazy dog near the riverbank."
+    }
+  ]
+}
