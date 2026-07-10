@@ -115,12 +115,15 @@ deprioritize.
   entries) → **published benchmarks cannot decide our pick; hands-on eval required.**
 - Multilingual GEC (no Czech in study): Gemma-9B best ≤9 B across EN/DE/IT/SV. [PLAUSIBLE]
 
-**Consequence [MEASURED path]:** we built `scripts/bench_llm_cleanup.py` +
-`fixtures/llm/cleanup-cases.json` (13 cases incl. 4 trap cases: dictated
-questions/commands/prompt-injections must be transcribed, never answered) and evaluate
-**qwen3:8b, gemma3:12b, mistral-nemo:12b** hands-on via Ollama. Gemma-2→Gemma-3 and
-Qwen2→Qwen3 generation jumps mean published Czech data is one generation behind current
-models anyway. FreeFlow's "~40 % of dictations skip cleanup" gate is worth copying.
+**Hands-on round 1 [MEASURED — docs/llm-cleanup-benchmark.md]:** qwen3:8b, gemma3:12b and
+mistral-nemo:12b evaluated on 13 Czech/mixed cleanup cases incl. 4 trap cases (dictated
+questions/commands/prompt-injections must be transcribed, never answered).
+**qwen3:8b wins**: avg WER 0.15, 0/4 trap failures, 1.6 s avg, 5.2 GB. gemma3:12b leaked
+meta-commentary into the output on the prompt-injection trap; **mistral-nemo:12b is
+disqualified** (obeyed the injection, answered the arithmetic trap — the BenCzechMark NLU
+lead does not transfer to instruction-following cleanup). Cross-model: Czech
+self-correction needs few-shot prompting; paraphrasing is the dominant error class →
+adopt FreeFlow-style cleanup-skip gate + anti-paraphrase prompt in Phase 2.
 
 ---
 

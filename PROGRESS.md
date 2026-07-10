@@ -24,6 +24,11 @@ Append-only. Newest at bottom. Absolute dates.
 - Ollama daemon started; qwen3:8b, gemma3:12b, mistral-nemo:12b downloading in background.
 - Next: run the benchmark once models finish pulling; record results + model pick input for Phase 2.
 
+## 2026-07-10 — Phase 1: LLM cleanup benchmark, round 1 (results)
+- Ran `scripts/bench_llm_cleanup.py` on qwen3:8b / gemma3:12b / mistral-nemo:12b (Ollama, temp 0, zero-shot). Write-up `docs/llm-cleanup-benchmark.md`, raw outputs `docs/llm-cleanup-benchmark.json`.
+- **qwen3:8b = provisional cleanup default**: avg WER 0.15, 0/4 trap failures, 1.6 s avg, 5.2 GB. gemma3:12b failed 1 trap (leaked refusal commentary into output); **mistral-nemo:12b disqualified** (obeyed prompt-injection, answered arithmetic trap, 1× diacritics loss) despite BenCzechMark's Czech-NLU lead — NLU benchmarks don't predict cleanup instruction-following.
+- Cross-model gaps: Czech self-correction unreliable zero-shot (needs few-shot prompt); paraphrasing is the dominant error class → Phase 2: anti-paraphrase prompt + cleanup-skip gate (FreeFlow pattern), possibly qwen3:4b for latency.
+
 ## 2026-07-10 — Phase 1: research synthesis (`docs/RESEARCH.md`)
 - Recovered the deep-research workflow output (106 agents, 76 completed; 30 verification agents + synthesis lost to a session limit) via a subagent extraction of the workflow journal — no web research repeated.
 - Wrote `docs/RESEARCH.md`: Wispr Flow teardown (cloud-only pipeline audio→Baseten→OpenAI/Anthropic, pricing, complaints), OSS landscape (Handy MIT/Rust/Tauri stack = architecture donor; VoiceInk = UX template, GPL so design-reference only; OpenWhispr MIT/Electron; Parakeet-on-Mac proof via sherpa-onnx), Czech STT (mikr/whisper-large-v3-czech-cv13 WER 7.89 % Apache-2.0; Parakeet v3 FLEURS cs 11.0 % ≈ whisper large-v3 11.3 % at ~10× speed; Apple-Silicon runtime latency ladder), LLM cleanup candidates (BenCzechMark: Gemma-2-9B strong Czech; Mistral-Nemo 12B plausible leader ≤12B; published data one generation stale → hands-on eval decisive), macOS integration (pasteboard+Cmd-V as robust insertion path; Secure Input must be detected, never bypassed).

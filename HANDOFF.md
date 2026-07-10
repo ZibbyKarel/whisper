@@ -3,9 +3,11 @@
 ## Current state
 Phase 1 (research) mostly done. `docs/RESEARCH.md` written — synthesizes the deep-research
 run (Wispr Flow teardown, OSS landscape, Czech STT/LLM evidence, macOS integration) with
-per-claim confidence tags, plus our measured STT benchmark. LLM cleanup benchmark harness
-built (`scripts/bench_llm_cleanup.py`, `fixtures/llm/cleanup-cases.json`) but not yet run —
-qwen3:8b / gemma3:12b / mistral-nemo:12b were still downloading via Ollama.
+per-claim confidence tags, plus our measured benchmarks. LLM cleanup benchmark round 1
+done (`docs/llm-cleanup-benchmark.md`): **qwen3:8b = provisional cleanup default** (0/4
+trap failures, avg WER 0.15, 1.6 s); mistral-nemo:12b disqualified (obeys prompt
+injections). Provisional model pair: whisper large-v3-turbo q5_0 (STT) + qwen3:8b
+(cleanup) ≈ 5.8 GB resident, inside the ~10 GB budget (D-0001).
 
 ## Architecture overview
 See ARCHITECTURE.md (skeleton; binding layer contract only) — unchanged since Phase 0.
@@ -20,13 +22,12 @@ See PROGRESS.md 2026-07-10 entries. Key artifacts:
   trap cases (dictated questions/commands must be transcribed, never answered).
 
 ## Unfinished / next steps
-1. Run `python3 scripts/bench_llm_cleanup.py` once `ollama list` shows qwen3:8b,
-   gemma3:12b, mistral-nemo:12b; write results into `docs/llm-cleanup-benchmark.json` +
-   a short `docs/llm-cleanup-benchmark.md` analysis; update RESEARCH.md §4.
-2. Benchmark mikr/whisper-large-v3-czech-cv13 (needs GGML conversion) and Parakeet v3
+1. Benchmark mikr/whisper-large-v3-czech-cv13 (needs GGML conversion) and Parakeet v3
    (sherpa-onnx) on our fixtures — extend `scripts/bench_stt.py`.
-3. Real-microphone Czech validation of the STT finalist (blocks the model ADR).
-4. ITN-aware WER scoring mode in `bench_stt.py`.
+2. Real-microphone Czech validation of the STT finalist (blocks the model ADR).
+3. ITN-aware WER scoring mode in `bench_stt.py`.
+4. Round 2 of the LLM cleanup eval belongs to Phase 2 (engineered prompt: few-shot
+   self-correction + anti-paraphrase; try qwen3:4b; cleanup-skip gate).
 5. Then Phase 2 architecture: ARCHITECTURE.md full design + ADRs (STT model, LLM model,
    stack language, insertion method — RESEARCH.md has the evidence base).
 
