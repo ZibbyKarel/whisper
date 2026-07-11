@@ -78,8 +78,17 @@ impl ModelsPanel {
                 }
             }
             DownloadPhase::Error => {
-                self.download_errors
-                    .insert(id.clone(), error.clone().unwrap_or_default());
+                // A user-initiated cancel (`DELETE /v1/models/{id}/download`) reports as
+                // `phase=error, error="cancelled"` on the wire (D-0015's fixed phase set has
+                // no dedicated "cancelled" value) — but it isn't a *failure* the tray should
+                // flag in red; the daemon already deleted `.part`, so the row should just
+                // read "Missing" again, same as if the download had never started.
+                if error.as_deref() == Some("cancelled") {
+                    self.download_errors.remove(id);
+                } else {
+                    self.download_errors
+                        .insert(id.clone(), error.clone().unwrap_or_default());
+                }
                 if let Some(entry) = self.entry_mut(id) {
                     entry.downloading = false;
                     entry.progress = None;
@@ -329,6 +338,60 @@ mod tests {
             panel.download_error("stt-large-v3-turbo"),
             Some("integrity check failed")
         );
+    }
+
+    #[test]
+    fn apply_event_treats_a_user_cancel_as_missing_not_an_error() {
+        // A cancel reports on the wire as phase=error, error="cancelled" (the fixed phase set
+        // has no dedicated "cancelled" value) — the tray must not show a red error banner for
+        // a user-initiated action; the row should just read "Missing" again.
+        let mut panel = ModelsPanel {
+            entries: vec![entry("stt-large-v3-turbo", true, false)],
+            ..Default::default()
+        };
+        panel.apply_event(&ApiEvent::ModelDownload {
+            id: "stt-large-v3-turbo".to_string(),
+            downloaded: 12_345,
+            total: 574_041_195,
+            phase: DownloadPhase::Error,
+            error: Some("cancelled".to_string()),
+            ts_ms: 4,
+        });
+        let e = panel.entry("stt-large-v3-turbo").unwrap();
+        assert!(!e.downloading);
+        assert!(!e.present);
+        assert_eq!(
+            panel.download_error("stt-large-v3-turbo"),
+            None,
+            "a cancel must not surface as a download error"
+        );
+    }
+
+    #[test]
+    fn apply_event_cancel_after_a_real_error_clears_the_stale_error() {
+        let mut panel = ModelsPanel {
+            entries: vec![entry("stt-large-v3-turbo", true, false)],
+            ..Default::default()
+        };
+        panel.apply_event(&ApiEvent::ModelDownload {
+            id: "stt-large-v3-turbo".to_string(),
+            downloaded: 0,
+            total: 574_041_195,
+            phase: DownloadPhase::Error,
+            error: Some("integrity check failed".to_string()),
+            ts_ms: 1,
+        });
+        assert!(panel.download_error("stt-large-v3-turbo").is_some());
+
+        panel.apply_event(&ApiEvent::ModelDownload {
+            id: "stt-large-v3-turbo".to_string(),
+            downloaded: 0,
+            total: 574_041_195,
+            phase: DownloadPhase::Error,
+            error: Some("cancelled".to_string()),
+            ts_ms: 2,
+        });
+        assert_eq!(panel.download_error("stt-large-v3-turbo"), None);
     }
 
     #[test]

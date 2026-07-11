@@ -265,8 +265,16 @@ fn attempt_download(
             .map_err(|e| format!("create model dir {}: {e}", parent.display()))?;
     }
 
+    // Bound only the connect + response-headers phases so a dead/unreachable host fails fast;
+    // deliberately leave `timeout_recv_body`/`timeout_global` unset so a multi-GB stream is
+    // never aborted mid-download (both cap the WHOLE body read, per ureq's own docs — a hard
+    // 30s global timeout would require >153 Mbps for the 574 MB STT model and >1.3 Gbps for
+    // the 5 GB cleanup model, failing on most real links). A truly stalled mid-stream transfer
+    // relies on the user's Cancel (`DELETE /v1/models/{id}/download`) — acceptable for this
+    // iteration (D-0015: resumable/bounded-stall handling is deferred).
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(30)))
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(Duration::from_secs(30)))
         .build()
         .into();
     let mut resp = agent
