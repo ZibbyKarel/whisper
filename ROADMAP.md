@@ -36,8 +36,12 @@ Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-fi
 - Settings, onboarding, visualization; replaceable UI shell — `whisper-tray` (D-0013), API-only, needs no TCC
 - Sign-off gate: `docs/phase6-manual-verification.md`; polish items tracked in HANDOFF
 
-## Phase 7 — Hardening & release 🔶 packaging landed (2026-07-10)
+## Phase 7 — Hardening & release 🔶 packaging + model provisioning landed (2026-07-11)
 - ✅ Packaging: Whisper.app bundle + DMG, tray-managed daemon lifecycle, install docs (D-0014)
-- Remaining: deploy checklist, app icon + UI polish round 2, performance/latency tuning, plugin system maturity, signing/notarization decision
+- ✅ In-app model provisioning (D-0015): daemon-side catalog/download/verify over `/v1`
+  (`GET /v1/models`, `POST`/`DELETE /v1/models/{id}/download`, `model.download` WS event);
+  tray startup gate + reworked Settings → Models + onboarding checklist step, all backed by
+  one shared `ModelsPanel`/`ui_model_row` component
+- Remaining: deploy checklist, app icon + UI polish round 2, performance/latency tuning, plugin system maturity, signing/notarization decision, resumable downloads (deferred by D-0015)
 
 Milestone rule: after every milestone — update this file + CHANGELOG, commit.
