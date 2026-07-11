@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use whisper_core::pipeline::{CleanupMode, CleanupSkipReason};
 
+use super::models::DownloadPhase;
+
 /// Cleanup gating mode on the wire (`CleanupMode` in the core, D-0005). Defaults to `Auto`, the
 /// skip-gate default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -188,6 +190,42 @@ pub struct ConfigUpdateResponse {
     pub config: super::config::Config,
 }
 
+// ---------------------------------------------------------------------------
+// Model provisioning (D-0015): GET /v1/models, POST/DELETE /v1/models/{id}/download
+// ---------------------------------------------------------------------------
+
+/// In-flight download progress, embedded in [`ModelEntryDto`] and the `model.download` WS
+/// event.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelProgressDto {
+    pub downloaded: u64,
+    pub total: u64,
+}
+
+/// One catalog model's provisioning status (`GET /v1/models` D-0015 design doc). Deliberately
+/// does not expose `url`/`sha256`/`license` on the wire — those are provisioning internals, not
+/// part of the operator-facing contract.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelEntryDto {
+    pub id: String,
+    /// `"stt"` | `"cleanup"`.
+    pub kind: String,
+    pub filename: String,
+    pub required: bool,
+    pub size_bytes: u64,
+    pub present: bool,
+    /// The resolved on-disk target path (`<data_dir>/models/<filename>`), present or not.
+    pub path: String,
+    pub downloading: bool,
+    pub progress: Option<ModelProgressDto>,
+}
+
+/// `GET /v1/models` body (D-0015 design doc).
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelsListResponse {
+    pub models: Vec<ModelEntryDto>,
+}
+
 /// One event on `WS /v1/events` (`ARCHITECTURE.md` §4). Best-effort: a lagging client may miss
 /// events; the authoritative result is `GET /v1/sessions/{id}`. Tagged by `type`.
 #[derive(Debug, Clone, Serialize)]
@@ -297,6 +335,20 @@ pub enum ApiEvent {
         detail: Option<String>,
         ts_ms: u64,
     },
+    /// Model provisioning progress (D-0015 design doc): one catalog model's download, from the
+    /// first `downloading` tick through `verifying` to a terminal `done`/`error`. `error` is
+    /// only present when `phase == "error"` (network failure, checksum mismatch, or a user
+    /// cancel, all surfaced as `error` with a distinguishing message).
+    #[serde(rename = "model.download")]
+    ModelDownload {
+        id: String,
+        downloaded: u64,
+        total: u64,
+        phase: DownloadPhase,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        ts_ms: u64,
+    },
 }
 
 /// Structured error envelope returned for every non-2xx response (`ARCHITECTURE.md` §3:
@@ -332,5 +384,39 @@ mod tests {
         assert_eq!(v["ts_ms"], 42);
         // Exactly the five documented keys, no more.
         assert_eq!(v.as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn model_download_event_wire_shape() {
+        let ev = ApiEvent::ModelDownload {
+            id: "stt-large-v3-turbo".to_string(),
+            downloaded: 100,
+            total: 574_041_195,
+            phase: DownloadPhase::Downloading,
+            error: None,
+            ts_ms: 42,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "model.download");
+        assert_eq!(v["id"], "stt-large-v3-turbo");
+        assert_eq!(v["downloaded"], 100);
+        assert_eq!(v["total"], 574_041_195_u64);
+        assert_eq!(v["phase"], "downloading");
+        // `error` is omitted (not null) when absent.
+        assert!(v.get("error").is_none());
+        // type, id, downloaded, total, phase, ts_ms — exactly six keys, no more.
+        assert_eq!(v.as_object().unwrap().len(), 6);
+
+        let err_ev = ApiEvent::ModelDownload {
+            id: "stt-large-v3-turbo".to_string(),
+            downloaded: 0,
+            total: 574_041_195,
+            phase: DownloadPhase::Error,
+            error: Some("integrity check failed".to_string()),
+            ts_ms: 43,
+        };
+        let ev_v = serde_json::to_value(&err_ev).unwrap();
+        assert_eq!(ev_v["phase"], "error");
+        assert_eq!(ev_v["error"], "integrity check failed");
     }
 }

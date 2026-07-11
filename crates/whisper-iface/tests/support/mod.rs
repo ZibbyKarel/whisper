@@ -25,7 +25,7 @@ use whisper_iface::daemon::state::{
     AppState, AudioSourceFactory, EnginePhase, LiveSourceCtx, LiveSourceProvider,
 };
 use whisper_iface::daemon::worker::{null_sink_builder, BuildCtx, EngineBuilder, ResidentEngines};
-use whisper_iface::{build_router, build_state};
+use whisper_iface::{build_router, build_state, build_state_with_data_dir};
 
 /// The canonical Czech pangram — every diacritic in one sentence. Fake STT returns it so tests
 /// can assert byte-exact UTF-8 round-trips through the whole API (`ARCHITECTURE.md` §3.3).
@@ -320,7 +320,27 @@ pub fn harness_with_config_path(
     live_source: Option<LiveSourceProvider>,
 ) -> (Arc<AppState>, Router) {
     let state = build_state(config, config_path, builder, live_source).expect("build state");
-    // Wait for the worker thread to finish its (instant) model-load phase.
+    wait_ready(&state);
+    let router = build_router(state.clone());
+    (state, router)
+}
+
+/// Like [`harness`] but with an explicit model-provisioning `data_dir` (D-0015) — used by the
+/// model-download contract/API tests so they never touch the real app-support directory.
+pub fn harness_with_data_dir(
+    config: Config,
+    builder: EngineBuilder,
+    data_dir: std::path::PathBuf,
+) -> (Arc<AppState>, Router) {
+    let state = build_state_with_data_dir(config, None, builder, None, data_dir)
+        .expect("build state with data dir");
+    wait_ready(&state);
+    let router = build_router(state.clone());
+    (state, router)
+}
+
+/// Wait for the worker thread to finish its (instant, fake-engine) model-load phase.
+fn wait_ready(state: &Arc<AppState>) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let phase = state.status.read().unwrap().phase;
@@ -333,8 +353,32 @@ pub fn harness_with_config_path(
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let router = build_router(state.clone());
-    (state, router)
+}
+
+/// A process-unique temp dir under the OS temp root, auto-cleaned on drop — the `data_dir` for
+/// model-provisioning tests (D-0015). Not a `tempfile` dependency: this workspace already
+/// hand-rolls the same pattern in a couple of places.
+pub struct TempDataDir(pub std::path::PathBuf);
+
+impl TempDataDir {
+    pub fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!(
+            "whisper-iface-data-dir-test-{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        Self(p)
+    }
+}
+
+impl Drop for TempDataDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// A tiny valid 16 kHz mono WAV (base64) of near-silence. Content is irrelevant — the fake STT

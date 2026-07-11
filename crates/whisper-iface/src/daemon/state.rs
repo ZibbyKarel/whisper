@@ -23,6 +23,7 @@ use whisper_core::vad::VadConfig;
 
 use super::api::{ApiEvent, SessionRecord};
 use super::config::Config;
+use super::models::DownloadRegistry;
 use super::store::SessionStore;
 
 /// Unix-epoch milliseconds, the timestamp unit used across the `/v1` contract.
@@ -198,6 +199,12 @@ pub struct AppState {
     pub vad: std::sync::Arc<RwLock<VadConfig>>,
     pub store: SessionStore,
     pub status: RwLock<EngineStatus>,
+    /// App-support data dir (`ARCHITECTURE.md` §6, D-0014) — the root that model provisioning
+    /// (D-0015) downloads into (`data_dir/models/<filename>`), mirroring `resolve_model_paths`'s
+    /// rebase target.
+    pub data_dir: PathBuf,
+    /// In-flight model downloads (D-0015): one active download per catalog model id.
+    pub model_downloads: Arc<DownloadRegistry>,
     id_counter: AtomicU64,
 }
 
@@ -214,6 +221,7 @@ impl AppState {
         vad: std::sync::Arc<RwLock<VadConfig>>,
         store: SessionStore,
         live_source: Option<LiveSourceProvider>,
+        data_dir: PathBuf,
     ) -> Self {
         Self {
             started: Instant::now(),
@@ -232,6 +240,8 @@ impl AppState {
             vad,
             store,
             status: RwLock::new(EngineStatus::default()),
+            data_dir,
+            model_downloads: Arc::new(DownloadRegistry::default()),
             id_counter: AtomicU64::new(0),
         }
     }

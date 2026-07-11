@@ -41,6 +41,13 @@ toml = "1.1.2"
 base64 = "0.22.1"
 dirs = "6.0.0"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+# In-app model provisioning (D-0015): blocking HTTPS download of catalog models, run on
+# `tokio::task::spawn_blocking`. rustls-based (no OpenSSL); already a workspace dep pattern
+# (whisper-ux uses it for the whole /v1 client).
+ureq = { version = "3.3.0", features = ["json"] }
+# SHA-256 verification of downloaded model bytes against the pinned catalog (D-0015). The
+# only new third-party dependency this feature adds (MIT/Apache-2.0, RustCrypto, offline).
+sha2 = "0.10"
 
 # whisper.cpp on Apple Silicon runs on Metal (D-0004).
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -58,4 +65,3 @@ tower = { version = "0.5.3", features = ["util"] }
 tokio-tungstenite = "0.29.0"
 futures-util = "0.3.32"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
-ureq = { version = "3.3.0", features = ["json"] }

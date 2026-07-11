@@ -16,10 +16,12 @@ use whisper_core::dictionary::Dictionary;
 use whisper_core::session::CancellationToken;
 
 use super::api::{
-    AudioRequest, ConfigUpdateResponse, ErrorBody, ErrorEnvelope, HealthResponse, ModelStatus,
-    SessionAccepted, SessionRecord, SessionStatusDto, SourceKind, StatusResponse,
+    ApiEvent, AudioRequest, ConfigUpdateResponse, ErrorBody, ErrorEnvelope, HealthResponse,
+    ModelEntryDto, ModelProgressDto, ModelStatus, ModelsListResponse, SessionAccepted,
+    SessionRecord, SessionStatusDto, SourceKind, StatusResponse,
 };
 use super::config::{Config, DeliveryMode};
+use super::models::{self, DownloadProgress};
 use super::state::{
     now_ms, AppState, CaptureControl, EnginePhase, Job, JobAudio, LiveSourceCtx, SinkKind,
 };
@@ -49,6 +51,15 @@ impl ApiErr {
     }
     pub fn not_found(what: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", what)
+    }
+    /// `409` — a download for this model id is already in flight (D-0015: one active download
+    /// per id).
+    pub fn download_busy(id: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "download_busy",
+            format!("model {id} is already downloading"),
+        )
     }
     pub fn bad_request(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", msg)
@@ -412,6 +423,104 @@ pub async fn put_dictionary(
             .map_err(|e| ApiErr::internal(format!("write dictionary {}: {e}", path.display())))?;
     }
     Ok(Json(body))
+}
+
+// ---------------------------------------------------------------------------
+// Model provisioning (D-0015): GET /v1/models, POST/DELETE /v1/models/{id}/download
+// ---------------------------------------------------------------------------
+
+/// `GET /v1/models`: the compiled-in catalog plus each entry's live presence/download state.
+pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsListResponse> {
+    let models = models::catalog()
+        .iter()
+        .map(|m| {
+            let target = models::target_path(m, &state.data_dir);
+            let present = models::is_present(m, &state.data_dir);
+            let (downloading, progress) = match state.model_downloads.get(m.id) {
+                Some(handle) => {
+                    let p = handle.snapshot();
+                    (
+                        true,
+                        Some(ModelProgressDto {
+                            downloaded: p.downloaded,
+                            total: p.total,
+                        }),
+                    )
+                }
+                None => (false, None),
+            };
+            ModelEntryDto {
+                id: m.id.to_string(),
+                kind: m.kind.as_str().to_string(),
+                filename: m.filename.to_string(),
+                required: m.required,
+                size_bytes: m.size_bytes,
+                present,
+                path: target.display().to_string(),
+                downloading,
+                progress,
+            }
+        })
+        .collect();
+    Json(ModelsListResponse { models })
+}
+
+/// `POST /v1/models/{id}/download`: start a download in the background (`202 Accepted`); `409`
+/// if this model is already downloading, `404` for an unknown id.
+pub async fn start_model_download(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiErr> {
+    let model =
+        models::find(&id).ok_or_else(|| ApiErr::not_found(format!("unknown model {id}")))?;
+    let handle = state
+        .model_downloads
+        .begin(model.id)
+        .ok_or_else(|| ApiErr::download_busy(&id))?;
+
+    let data_dir = state.data_dir.clone();
+    let events = state.events.clone();
+    let registry = state.model_downloads.clone();
+    let model_id = model.id.to_string();
+
+    tokio::spawn(async move {
+        let progress_events = events.clone();
+        let progress_id = model_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            models::run_download(model, &data_dir, &handle, move |p: DownloadProgress| {
+                let _ = progress_events.send(model_download_event(&progress_id, &p));
+            });
+        })
+        .await;
+        // Terminal (done/error/cancel) — free the slot so a retry can begin fresh.
+        registry.end(&model_id);
+    });
+
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// `DELETE /v1/models/{id}/download`: cancel an in-flight download (aborts the task, deletes
+/// `.part`); `404` for an unknown model id, no-op (`204`) if nothing is in flight.
+pub async fn cancel_model_download(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiErr> {
+    if models::find(&id).is_none() {
+        return Err(ApiErr::not_found(format!("unknown model {id}")));
+    }
+    state.model_downloads.cancel(&id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn model_download_event(id: &str, p: &DownloadProgress) -> ApiEvent {
+    ApiEvent::ModelDownload {
+        id: id.to_string(),
+        downloaded: p.downloaded,
+        total: p.total,
+        phase: p.phase,
+        error: p.error.clone(),
+        ts_ms: now_ms(),
+    }
 }
 
 // ---------------------------------------------------------------------------

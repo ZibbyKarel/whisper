@@ -10,6 +10,7 @@
 pub mod api;
 pub mod config;
 pub mod handlers;
+pub mod models;
 #[cfg(feature = "platform")]
 pub mod platform;
 pub mod state;
@@ -44,12 +45,34 @@ use crate::{LlamaCleanupEngine, SileroVad, WhisperCppEngine};
 const EVENT_CHANNEL_CAP: usize = 512;
 
 /// Build the shared state and spawn the engine worker thread. Public so integration tests can
-/// inject fake engines through `builder` and drive the router without real models.
+/// inject fake engines through `builder` and drive the router without real models. Uses the
+/// default model-provisioning data dir (`dirs::config_dir()/whisper-engine`, D-0014/D-0015);
+/// see [`build_state_with_data_dir`] to override it (tests only — production always uses the
+/// real app-support directory).
 pub fn build_state(
     config: Config,
     config_path: Option<PathBuf>,
     builder: EngineBuilder,
     live_source: Option<LiveSourceProvider>,
+) -> Result<Arc<AppState>, String> {
+    build_state_with_data_dir(
+        config,
+        config_path,
+        builder,
+        live_source,
+        default_data_dir(),
+    )
+}
+
+/// Like [`build_state`] but with an explicit model-provisioning data dir (D-0015) — the seam
+/// tests use so the model-download contract/unit tests never touch the real app-support
+/// directory.
+pub fn build_state_with_data_dir(
+    config: Config,
+    config_path: Option<PathBuf>,
+    builder: EngineBuilder,
+    live_source: Option<LiveSourceProvider>,
+    data_dir: PathBuf,
 ) -> Result<Arc<AppState>, String> {
     let (events, _rx) = broadcast::channel(EVENT_CHANNEL_CAP);
     let (cmd_tx, cmd_rx) = mpsc::channel(4);
@@ -75,12 +98,21 @@ pub fn build_state(
         vad,
         store,
         live_source,
+        data_dir,
     ));
 
     // The worker holds only a Weak ref, so dropping the daemon (all strong Arcs) closes the
     // command channel and lets the worker thread exit cleanly.
     worker::spawn_weak(Arc::downgrade(&state), cmd_rx, builder);
     Ok(state)
+}
+
+/// Default model-provisioning data dir: the app-support directory (`ARCHITECTURE.md` §6,
+/// D-0014). Mirrors [`resolve_history_path`]'s fallback convention.
+fn default_data_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("whisper-engine")
 }
 
 /// Assemble the `/v1` router, with token auth (when configured) layered over every route except
@@ -101,6 +133,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/v1/dictionary",
             get(handlers::get_dictionary).put(handlers::put_dictionary),
+        )
+        .route("/v1/models", get(handlers::list_models))
+        .route(
+            "/v1/models/{id}/download",
+            post(handlers::start_model_download).delete(handlers::cancel_model_download),
         )
         .route("/v1/events", get(ws_events))
         .layer(axum::middleware::from_fn_with_state(
