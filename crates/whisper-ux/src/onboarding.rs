@@ -22,13 +22,21 @@ pub struct OnboardingState {
     pub accessibility_ack: bool,
     /// A test dictation produced text at least once.
     pub test_dictation_done: bool,
+    /// The required model(s) (D-0015) were present at least once — set once
+    /// `ModelsPanel::required_satisfied()` is true, so a later deletion does not un-complete
+    /// onboarding retroactively (the startup gate, not onboarding, is what re-blocks that).
+    pub models_ready: bool,
 }
 
 impl OnboardingState {
     /// All checklist steps cleared.
     #[must_use]
     pub fn all_steps_done(&self) -> bool {
-        self.daemon_seen && self.mic_ack && self.accessibility_ack && self.test_dictation_done
+        self.daemon_seen
+            && self.mic_ack
+            && self.accessibility_ack
+            && self.test_dictation_done
+            && self.models_ready
     }
 
     /// Load from `path`; a missing file yields the default (fresh) state. A
@@ -89,6 +97,7 @@ mod tests {
             mic_ack: true,
             accessibility_ack: true,
             test_dictation_done: true,
+            models_ready: true,
         };
         s.save(&p).unwrap();
         let back = OnboardingState::load(&p);
@@ -114,9 +123,25 @@ mod tests {
             accessibility_ack: true,
             test_dictation_done: false,
             completed: false,
+            models_ready: true,
         };
         assert!(!s.all_steps_done());
         s.test_dictation_done = true;
+        assert!(s.all_steps_done());
+    }
+
+    #[test]
+    fn all_steps_done_requires_models_ready() {
+        let mut s = OnboardingState {
+            daemon_seen: true,
+            mic_ack: true,
+            accessibility_ack: true,
+            test_dictation_done: true,
+            completed: false,
+            models_ready: false,
+        };
+        assert!(!s.all_steps_done());
+        s.models_ready = true;
         assert!(s.all_steps_done());
     }
 }

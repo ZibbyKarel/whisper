@@ -212,6 +212,71 @@ pub struct StatusResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Model provisioning (GET /v1/models, POST/DELETE /v1/models/{id}/download) — D-0015
+// mirror of daemon/models.rs + daemon/api.rs
+// ---------------------------------------------------------------------------
+
+/// In-flight download progress (mirror of `ModelProgressDto`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct ModelProgress {
+    pub downloaded: u64,
+    pub total: u64,
+}
+
+/// One catalog model's provisioning status (mirror of `ModelEntryDto`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ModelEntry {
+    pub id: String,
+    /// `"stt"` | `"cleanup"`.
+    pub kind: String,
+    pub filename: String,
+    pub required: bool,
+    pub size_bytes: u64,
+    pub present: bool,
+    pub path: String,
+    pub downloading: bool,
+    #[serde(default)]
+    pub progress: Option<ModelProgress>,
+}
+
+impl ModelEntry {
+    /// Human-readable size, e.g. `"547 MB"` / `"4.7 GB"` — used by every model-download
+    /// surface (startup gate, Settings → Models, onboarding) so formatting stays consistent.
+    #[must_use]
+    pub fn size_label(&self) -> String {
+        format_bytes(self.size_bytes)
+    }
+
+    /// Progress as a rounded percentage in `0..=100`, or `None` when not downloading or the
+    /// daemon has not reported a total yet.
+    #[must_use]
+    pub fn progress_percent(&self) -> Option<u8> {
+        let p = self.progress?;
+        if p.total == 0 {
+            return None;
+        }
+        Some(((p.downloaded as f64 / p.total as f64) * 100.0).round() as u8)
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GB: f64 = 1_000_000_000.0;
+    const MB: f64 = 1_000_000.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else {
+        format!("{:.0} MB", b / MB)
+    }
+}
+
+/// `GET /v1/models` body (mirror of `ModelsListResponse`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ModelsListResponse {
+    pub models: Vec<ModelEntry>,
+}
+
+// ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
 
@@ -301,6 +366,16 @@ pub struct ErrorEnvelope {
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+}
+
+/// Phase of a model download (mirror of `DownloadPhase`, D-0015).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadPhase {
+    Downloading,
+    Verifying,
+    Done,
+    Error,
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +484,18 @@ pub enum ApiEvent {
         peak: f32,
         ts_ms: u64,
     },
+    /// Model provisioning progress (mirror of the daemon's `model.download`, D-0015). `error`
+    /// is only present when `phase == Error`.
+    #[serde(rename = "model.download")]
+    ModelDownload {
+        id: String,
+        downloaded: u64,
+        total: u64,
+        phase: DownloadPhase,
+        #[serde(default)]
+        error: Option<String>,
+        ts_ms: u64,
+    },
 }
 
 /// Result of decoding one WS text frame. Tolerant by design: an unknown `type`
@@ -465,6 +552,8 @@ mod tests {
         r#"{"type":"platform.permission","permission":"microphone","granted":false,"ts_ms":14}"#;
     const AUDIO_LEVEL: &str =
         r#"{"type":"audio.level","session_id":"s1","rms":0.12,"peak":0.4,"ts_ms":15}"#;
+    const MODEL_DOWNLOAD: &str = r#"{"type":"model.download","id":"stt-large-v3-turbo","downloaded":100,"total":574041195,"phase":"downloading","ts_ms":16}"#;
+    const MODEL_DOWNLOAD_ERROR: &str = r#"{"type":"model.download","id":"stt-large-v3-turbo","downloaded":0,"total":574041195,"phase":"error","error":"integrity check failed","ts_ms":17}"#;
 
     #[test]
     fn every_event_variant_parses() {
@@ -485,6 +574,8 @@ mod tests {
             DEVICE_LOST,
             PERMISSION,
             AUDIO_LEVEL,
+            MODEL_DOWNLOAD,
+            MODEL_DOWNLOAD_ERROR,
         ];
         for fixture in all {
             assert!(
@@ -528,6 +619,86 @@ mod tests {
     fn non_event_frame_is_unparseable() {
         assert_eq!(parse_event("not json"), Incoming::Unparseable);
         assert_eq!(parse_event(r#"{"no":"type"}"#), Incoming::Unparseable);
+    }
+
+    #[test]
+    fn model_download_event_fields_decoded() {
+        match parse_event(MODEL_DOWNLOAD) {
+            Incoming::Known(ApiEvent::ModelDownload {
+                id,
+                downloaded,
+                total,
+                phase,
+                error,
+                ..
+            }) => {
+                assert_eq!(id, "stt-large-v3-turbo");
+                assert_eq!(downloaded, 100);
+                assert_eq!(total, 574_041_195);
+                assert_eq!(phase, DownloadPhase::Downloading);
+                assert!(error.is_none());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_download_error_event_carries_the_message() {
+        match parse_event(MODEL_DOWNLOAD_ERROR) {
+            Incoming::Known(ApiEvent::ModelDownload { phase, error, .. }) => {
+                assert_eq!(phase, DownloadPhase::Error);
+                assert_eq!(error.as_deref(), Some("integrity check failed"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn models_list_response_parses_the_daemon_shape() {
+        // Fixture copied from the real `GET /v1/models` shape in daemon/api.rs.
+        let json = r#"{"models":[
+            {"id":"stt-large-v3-turbo","kind":"stt","filename":"ggml-large-v3-turbo-q5_0.bin","required":true,"size_bytes":574041195,"present":false,"path":"/data/models/ggml-large-v3-turbo-q5_0.bin","downloading":true,"progress":{"downloaded":1000,"total":574041195}},
+            {"id":"cleanup-qwen3-8b","kind":"cleanup","filename":"Qwen3-8B-Q4_K_M.gguf","required":false,"size_bytes":5027783488,"present":true,"path":"/data/models/Qwen3-8B-Q4_K_M.gguf","downloading":false,"progress":null}
+        ]}"#;
+        let resp: ModelsListResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.models.len(), 2);
+        let stt = &resp.models[0];
+        assert!(stt.required);
+        assert!(!stt.present);
+        assert!(stt.downloading);
+        assert_eq!(
+            stt.progress,
+            Some(ModelProgress {
+                downloaded: 1000,
+                total: 574_041_195
+            })
+        );
+        assert_eq!(stt.progress_percent(), Some(0));
+        assert_eq!(stt.size_label(), "574 MB");
+
+        let cleanup = &resp.models[1];
+        assert!(cleanup.present);
+        assert!(!cleanup.downloading);
+        assert_eq!(cleanup.progress, None);
+        assert_eq!(cleanup.progress_percent(), None);
+    }
+
+    #[test]
+    fn size_label_formats_mb_and_gb() {
+        let mut m = ModelEntry {
+            id: "x".to_string(),
+            kind: "stt".to_string(),
+            filename: "x.bin".to_string(),
+            required: true,
+            size_bytes: 547_000_000,
+            present: false,
+            path: String::new(),
+            downloading: false,
+            progress: None,
+        };
+        assert_eq!(m.size_label(), "547 MB");
+        m.size_bytes = 5_027_783_488;
+        assert_eq!(m.size_label(), "5.0 GB");
     }
 
     #[test]

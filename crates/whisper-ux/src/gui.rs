@@ -20,12 +20,15 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use tungstenite::Message;
 
-use whisper_ux::api::{ApiEvent, CleanupMode, Config, DeliveryMode, HotkeyMode, Incoming};
+use whisper_ux::api::{
+    ApiEvent, CleanupMode, Config, DeliveryMode, DownloadPhase, HotkeyMode, Incoming,
+};
 use whisper_ux::client::{backoff_delay, events_ws_url, Api, ApiError, HttpClient};
 use whisper_ux::daemon_ctl::DaemonController;
 use whisper_ux::dict_editor::DictEditor;
 use whisper_ux::icons::{self, IconImage};
 use whisper_ux::language::{self, LanguagePreset};
+use whisper_ux::models_ui::ModelsPanel;
 use whisper_ux::onboarding::{self, OnboardingState};
 use whisper_ux::overlay::{self, Overlay, OverlayPhase};
 use whisper_ux::save_report::SaveReport;
@@ -131,6 +134,12 @@ pub struct ShellApp {
     onboarding: OnboardingState,
     onboarding_path: Option<PathBuf>,
 
+    // --- model provisioning (D-0015): startup gate + Settings→Models + onboarding all read
+    // this one shared snapshot, kept current by periodic `GET /v1/models` polls and live
+    // `model.download` WS events. ---
+    models: ModelsPanel,
+    last_models_poll: std::time::Instant,
+
     // --- floating overlay (shell-local, D-0013) ---
     shell_settings: ShellSettings,
     shell_settings_path: Option<PathBuf>,
@@ -226,6 +235,8 @@ impl ShellApp {
             section: Section::Status,
             onboarding,
             onboarding_path,
+            models: ModelsPanel::default(),
+            last_models_poll: std::time::Instant::now(),
             shell_settings,
             shell_settings_path,
             overlay: Overlay::new(),
@@ -245,6 +256,7 @@ impl ShellApp {
         // Best-effort initial sync so the UI reflects the daemon immediately.
         app.refresh_status();
         app.load_settings();
+        app.models.refresh(&app.client);
         app
     }
 
@@ -370,6 +382,146 @@ impl ShellApp {
         }
     }
 
+    // -- model provisioning (D-0015) --------------------------------------
+
+    fn refresh_models(&mut self) {
+        self.models.refresh(&self.client);
+        self.last_models_poll = std::time::Instant::now();
+        if self.models.required_satisfied() {
+            self.mark_models_ready();
+        }
+    }
+
+    /// Poll `GET /v1/models` every few seconds so the startup gate reappears if a required
+    /// model is deleted out from under a running tray (D-0015: "the gate reappears whenever a
+    /// required model goes missing"), without hammering the daemon every frame.
+    fn poll_models_if_due(&mut self) {
+        if self.last_models_poll.elapsed() >= std::time::Duration::from_secs(5) {
+            self.refresh_models();
+        }
+    }
+
+    fn mark_models_ready(&mut self) {
+        if !self.onboarding.models_ready {
+            self.onboarding.models_ready = true;
+            self.persist_onboarding();
+        }
+    }
+
+    /// `POST /v1/models/{id}/download`, with an optimistic local flip to "downloading" so the
+    /// button reacts immediately (the first WS tick can lag behind a slow connection setup).
+    fn start_model_download(&mut self, id: &str) {
+        match self.client.start_model_download(id) {
+            Ok(()) => self.models.mark_download_started(id),
+            Err(e) => self.status_msg = Some(format!("download {id}: {e}")),
+        }
+    }
+
+    fn cancel_model_download(&mut self, id: &str) {
+        if let Err(e) = self.client.cancel_model_download(id) {
+            self.status_msg = Some(format!("cancel download {id}: {e}"));
+        }
+    }
+
+    /// The one shared "model download" row (D-0015): name, size, status (Present ✓ / Missing /
+    /// Downloading NN% / Verifying / Error) and a Download/Retry/Cancel button. Rendered from
+    /// three places — the startup gate, Settings → Models, and the onboarding checklist.
+    fn ui_model_row(&mut self, ui: &mut egui::Ui, id: &str) {
+        let Some(entry) = self.models.entry(id).cloned() else {
+            ui.horizontal(|ui| {
+                ui.label(id);
+                ui.label(
+                    egui::RichText::new("(not reported by daemon)")
+                        .weak()
+                        .small(),
+                );
+            });
+            return;
+        };
+        let error = self.models.download_error(&entry.id).map(str::to_string);
+        let phase = self.models.phase(&entry.id);
+
+        theme::card_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    let label = model_display_name(&entry.id);
+                    ui.label(egui::RichText::new(label).strong());
+                    let mut caption = entry.size_label();
+                    if entry.required {
+                        caption.push_str(" · required");
+                    }
+                    ui.label(egui::RichText::new(caption).weak().small());
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if entry.downloading {
+                        let verb = if phase == Some(DownloadPhase::Verifying) {
+                            "Verifying…".to_string()
+                        } else {
+                            format!("Downloading {}%", entry.progress_percent().unwrap_or(0))
+                        };
+                        if ui.button("Cancel").clicked() {
+                            self.cancel_model_download(&entry.id);
+                        }
+                        ui.label(verb);
+                    } else if entry.present {
+                        ui.colored_label(theme::ACCENT, "Present ✓");
+                    } else if let Some(err) = &error {
+                        if ui.button("Retry").clicked() {
+                            self.start_model_download(&entry.id);
+                        }
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xE0, 0x3B, 0x24),
+                            format!("Error: {err}"),
+                        );
+                    } else {
+                        if ui.button("Download").clicked() {
+                            self.start_model_download(&entry.id);
+                        }
+                        ui.label("Missing");
+                    }
+                });
+            });
+        });
+        ui.add_space(6.0);
+    }
+
+    /// `true` once at least one `GET /v1/models` has succeeded and a required model is
+    /// missing — the startup-gate condition (D-0015). Gated on a successful fetch so a
+    /// transient "daemon unreachable" moment never flashes the gate instead of the normal
+    /// "is the daemon running?" messaging.
+    fn models_gate_active(&self) -> bool {
+        !self.models.entries.is_empty() && !self.models.required_satisfied()
+    }
+
+    /// Blocking "Download models" screen (D-0015 surface 1): shown instead of the sidebar/app
+    /// whenever [`Self::models_gate_active`] is true, including reappearing after an
+    /// accidental deletion. STT (required) and the optional cleanup LLM both get their own
+    /// row via the shared [`Self::ui_model_row`] component; it disappears on its own the
+    /// frame after the required model's `model.download` `done` event lands.
+    fn ui_model_gate(&mut self, ui: &mut egui::Ui) {
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Download models");
+            ui.label(
+                egui::RichText::new(
+                    "Whisper needs its speech-recognition model before it can dictate. \
+                     Downloads are one-time, stored locally, and never uploaded anywhere.",
+                )
+                .weak(),
+            );
+        });
+        ui.add_space(theme::CARD_GAP);
+        let ids: Vec<String> = self.models.entries.iter().map(|m| m.id.clone()).collect();
+        for id in ids {
+            self.ui_model_row(ui, &id);
+        }
+        if let Some(err) = self.models.fetch_error.clone() {
+            ui.colored_label(egui::Color32::from_rgb(0xE0, 0x3B, 0x24), err);
+        }
+        if ui.button("Refresh").clicked() {
+            self.refresh_models();
+        }
+    }
+
     /// Restart the tray-managed daemon (SIGINT → wait → respawn). Only reachable
     /// from the UI when [`DaemonController::is_managed`]; refuses otherwise.
     fn restart_daemon(&mut self) {
@@ -432,6 +584,12 @@ impl ShellApp {
 
     /// Pull display-only payloads (levels, partials, session id) out of events.
     fn absorb_event(&mut self, ev: &ApiEvent) {
+        // Model-download progress (D-0015) updates the shared snapshot live, independent of
+        // the dictation-session events matched below.
+        self.models.apply_event(ev);
+        if matches!(ev, ApiEvent::ModelDownload { .. }) && self.models.required_satisfied() {
+            self.mark_models_ready();
+        }
         match ev {
             ApiEvent::SessionStarted { session_id, .. } => {
                 self.active_session = Some(session_id.clone());
@@ -990,24 +1148,61 @@ impl ShellApp {
         ui.add_space(theme::CARD_GAP);
         theme::card_frame().show(ui, |ui| {
             ui.heading("Models");
-            ui.horizontal(|ui| {
-                ui.label("STT");
-                ui.text_edit_singleline(&mut cfg.models.stt);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Cleanup LLM");
-                ui.text_edit_singleline(&mut self.cleanup_model_input);
-            });
             ui.label(
-                egui::RichText::new("Empty cleanup path disables the LLM cleanup stage.")
-                    .weak()
-                    .small(),
+                egui::RichText::new(
+                    "In-app download, verified against a pinned checksum before use. This is \
+                     the primary way to (re-)provision a model — e.g. after an accidental \
+                     deletion.",
+                )
+                .weak()
+                .small(),
             );
-            ui.label(
-                egui::RichText::new("Model changes are staged until the daemon restarts.")
-                    .weak()
-                    .small(),
-            );
+            if ui.button("Refresh").clicked() {
+                self.refresh_models();
+            }
+        });
+        ui.add_space(theme::CARD_GAP);
+        let ids: Vec<String> = self.models.entries.iter().map(|m| m.id.clone()).collect();
+        for id in ids {
+            self.ui_model_row(ui, &id);
+        }
+        if let Some(err) = self.models.fetch_error.clone() {
+            ui.colored_label(egui::Color32::from_rgb(0xE0, 0x3B, 0x24), err);
+        }
+        ui.add_space(theme::CARD_GAP);
+        theme::card_frame().show(ui, |ui| {
+            egui::CollapsingHeader::new("Advanced: raw model paths")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Power users only — point the daemon at a custom model file \
+                             instead of the managed download.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("STT");
+                        ui.text_edit_singleline(&mut cfg.models.stt);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Cleanup LLM");
+                        ui.text_edit_singleline(&mut self.cleanup_model_input);
+                    });
+                    ui.label(
+                        egui::RichText::new("Empty cleanup path disables the LLM cleanup stage.")
+                            .weak()
+                            .small(),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Model path changes are staged until the daemon restarts.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                });
         });
     }
 
@@ -1129,7 +1324,27 @@ impl ShellApp {
                 ui.label(format!("status: {}", self.daemon_phase));
             });
 
-            checklist_row(ui, self.onboarding.mic_ack, "2. Microphone permission");
+            // D-0015: the required speech-recognition model, downloaded in-app (the same
+            // widget the Settings → Models card and the startup gate use). Test dictation
+            // (step 5) needs this satisfied first.
+            checklist_row(ui, self.onboarding.models_ready, "2. Required models");
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                if ui.button("Check models").clicked() {
+                    self.refresh_models();
+                }
+            });
+            {
+                let ids: Vec<String> = self.models.entries.iter().map(|m| m.id.clone()).collect();
+                for id in ids {
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        ui.vertical(|ui| self.ui_model_row(ui, &id));
+                    });
+                }
+            }
+
+            checklist_row(ui, self.onboarding.mic_ack, "3. Microphone permission");
             ui.horizontal(|ui| {
                 ui.add_space(20.0);
                 ui.label(
@@ -1144,7 +1359,7 @@ impl ShellApp {
             checklist_row(
                 ui,
                 self.onboarding.accessibility_ack,
-                "3. Accessibility permission",
+                "4. Accessibility permission",
             );
             ui.horizontal(|ui| {
                 ui.add_space(20.0);
@@ -1157,7 +1372,7 @@ impl ShellApp {
                 }
             });
 
-            checklist_row(ui, self.onboarding.test_dictation_done, "4. Test dictation");
+            checklist_row(ui, self.onboarding.test_dictation_done, "5. Test dictation");
             ui.horizontal(|ui| {
                 ui.add_space(20.0);
                 let label = if self.active_session.is_some() {
@@ -1247,6 +1462,7 @@ impl eframe::App for ShellApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_ws();
         self.drain_menu_events(ctx);
+        self.poll_models_if_due();
 
         // Close-to-tray: hide the window instead of quitting (D-0013 §6).
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -1265,9 +1481,15 @@ impl eframe::App for ShellApp {
         let ctx = ui.ctx().clone();
         self.show_overlay(&ctx);
 
-        // Onboarding has no section nav, so it keeps a slim top bar instead of
-        // the sidebar (UX pass 2 restyles it lightly; the flow is unchanged).
-        if self.screen == Screen::Onboarding {
+        // Startup gate (D-0015): once past onboarding, a missing *required* model blocks
+        // normal use — reappears any time `GET /v1/models` (polled every few seconds, plus
+        // live `model.download` events) shows it missing again, e.g. after an accidental
+        // deletion.
+        let gate_active = self.screen == Screen::App && self.models_gate_active();
+
+        // Onboarding/the gate have no section nav, so they keep a slim top bar instead of the
+        // sidebar (UX pass 2 restyles it lightly; the flow is unchanged).
+        if self.screen == Screen::Onboarding || gate_active {
             egui::Panel::top("top_onboarding").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Whisper").heading());
@@ -1293,6 +1515,7 @@ impl eframe::App for ShellApp {
                 self.ui_recording_banner(ui);
                 egui::ScrollArea::vertical().show(ui, |ui| match self.screen {
                     Screen::Onboarding => self.ui_onboarding(ui),
+                    Screen::App if gate_active => self.ui_model_gate(ui),
                     Screen::App => self.ui_app(ui),
                 });
                 if let Some(msg) = &self.status_msg {
@@ -1315,6 +1538,16 @@ fn non_empty(s: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+/// A short human label for a catalog model id (D-0015), so the three model-download surfaces
+/// don't show the raw `stt-large-v3-turbo` id verbatim.
+fn model_display_name(id: &str) -> &str {
+    match id {
+        "stt-large-v3-turbo" => "Speech recognition (Whisper large-v3-turbo)",
+        "cleanup-qwen3-8b" => "Cleanup LLM (Qwen3-8B, optional)",
+        other => other,
     }
 }
 

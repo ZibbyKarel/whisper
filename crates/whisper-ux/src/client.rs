@@ -8,8 +8,8 @@ use std::time::Duration;
 use ureq::Agent;
 
 use crate::api::{
-    Config, ConfigUpdateResponse, ErrorEnvelope, HealthResponse, SessionAccepted, SessionRecord,
-    StatusResponse,
+    Config, ConfigUpdateResponse, ErrorEnvelope, HealthResponse, ModelsListResponse,
+    SessionAccepted, SessionRecord, StatusResponse,
 };
 
 /// A failed `/v1` call.
@@ -56,6 +56,12 @@ pub trait Api {
     fn start_mic_session(&self) -> Result<SessionAccepted, ApiError>;
     /// `POST /v1/sessions/{id}/stop` — graceful stop (D-0012).
     fn stop_session(&self, id: &str) -> Result<SessionRecord, ApiError>;
+    /// `GET /v1/models` — the model catalog plus each entry's presence/download state (D-0015).
+    fn list_models(&self) -> Result<ModelsListResponse, ApiError>;
+    /// `POST /v1/models/{id}/download` — start (or resume-from-scratch) a model download.
+    fn start_model_download(&self, id: &str) -> Result<(), ApiError>;
+    /// `DELETE /v1/models/{id}/download` — cancel an in-flight download.
+    fn cancel_model_download(&self, id: &str) -> Result<(), ApiError>;
 }
 
 /// ureq-backed [`Api`] implementation.
@@ -123,6 +129,46 @@ enum Method {
     Put,
 }
 
+impl HttpClient {
+    /// POST/DELETE `path` with no body and only care about the status (`202`/`204` responses
+    /// carry no JSON body — model-download start/cancel, D-0015). A non-2xx status is decoded
+    /// as the structured error envelope when present, mirroring [`read_checked`].
+    fn call_status_only(&self, delete: bool, path: &str) -> Result<(), ApiError> {
+        let mut res = if delete {
+            let mut req = self.agent.delete(self.url(path));
+            if let Some(t) = &self.token {
+                req = req.header("Authorization", format!("Bearer {t}"));
+            }
+            req.call()
+        } else {
+            let mut req = self.agent.post(self.url(path));
+            if let Some(t) = &self.token {
+                req = req.header("Authorization", format!("Bearer {t}"));
+            }
+            req.send_empty()
+        }
+        .map_err(|e| ApiError::Transport(e.to_string()))?;
+
+        let status = res.status().as_u16();
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        let value: serde_json::Value = res
+            .body_mut()
+            .read_json()
+            .unwrap_or(serde_json::Value::Null);
+        let (code, message) = match serde_json::from_value::<ErrorEnvelope>(value) {
+            Ok(env) => (env.error.code, env.error.message),
+            Err(_) => ("unknown".to_string(), "request failed".to_string()),
+        };
+        Err(ApiError::Http {
+            status,
+            code,
+            message,
+        })
+    }
+}
+
 /// Read the body as JSON and convert a non-2xx status into [`ApiError::Http`]
 /// carrying the daemon's structured `error.code`/`error.message` when present.
 fn read_checked(mut res: ureq::http::Response<ureq::Body>) -> Result<serde_json::Value, ApiError> {
@@ -184,6 +230,18 @@ impl Api for HttpClient {
     fn stop_session(&self, id: &str) -> Result<SessionRecord, ApiError> {
         let path = format!("/v1/sessions/{id}/stop");
         decode(self.send_value(Method::Post, &path, &serde_json::Value::Null)?)
+    }
+
+    fn list_models(&self) -> Result<ModelsListResponse, ApiError> {
+        decode(self.get_value("/v1/models")?)
+    }
+
+    fn start_model_download(&self, id: &str) -> Result<(), ApiError> {
+        self.call_status_only(false, &format!("/v1/models/{id}/download"))
+    }
+
+    fn cancel_model_download(&self, id: &str) -> Result<(), ApiError> {
+        self.call_status_only(true, &format!("/v1/models/{id}/download"))
     }
 }
 
@@ -315,6 +373,63 @@ mod tests {
             head.to_lowercase().contains("authorization: bearer secret"),
             "head was: {head}"
         );
+    }
+
+    #[test]
+    fn list_models_parses_body() {
+        let (base, _rx) = mock_once(
+            "200 OK",
+            r#"{"models":[{"id":"stt-large-v3-turbo","kind":"stt","filename":"ggml-large-v3-turbo-q5_0.bin","required":true,"size_bytes":574041195,"present":false,"path":"/x/ggml-large-v3-turbo-q5_0.bin","downloading":false,"progress":null}]}"#,
+        );
+        let client = HttpClient::new(base, None);
+        let resp = client.list_models().unwrap();
+        assert_eq!(resp.models.len(), 1);
+        assert_eq!(resp.models[0].id, "stt-large-v3-turbo");
+        assert!(resp.models[0].required);
+        assert!(!resp.models[0].present);
+    }
+
+    #[test]
+    fn start_model_download_posts_with_no_body_and_no_decode_error_on_202() {
+        let (base, rx) = mock_once("202 Accepted", "");
+        let client = HttpClient::new(base, None);
+        client.start_model_download("stt-large-v3-turbo").unwrap();
+        let head = rx.recv().unwrap();
+        assert!(
+            head.starts_with("POST /v1/models/stt-large-v3-turbo/download"),
+            "head was: {head}"
+        );
+    }
+
+    #[test]
+    fn cancel_model_download_sends_delete_and_tolerates_204_empty_body() {
+        let (base, rx) = mock_once("204 No Content", "");
+        let client = HttpClient::new(base, None);
+        client.cancel_model_download("stt-large-v3-turbo").unwrap();
+        let head = rx.recv().unwrap();
+        assert!(
+            head.starts_with("DELETE /v1/models/stt-large-v3-turbo/download"),
+            "head was: {head}"
+        );
+    }
+
+    #[test]
+    fn start_model_download_surfaces_structured_409() {
+        let (base, _rx) = mock_once(
+            "409 Conflict",
+            r#"{"error":{"code":"download_busy","message":"model stt-large-v3-turbo is already downloading"}}"#,
+        );
+        let client = HttpClient::new(base, None);
+        let err = client
+            .start_model_download("stt-large-v3-turbo")
+            .unwrap_err();
+        match err {
+            ApiError::Http { status, code, .. } => {
+                assert_eq!(status, 409);
+                assert_eq!(code, "download_busy");
+            }
+            other => panic!("expected Http error, got {other:?}"),
+        }
     }
 
     #[test]

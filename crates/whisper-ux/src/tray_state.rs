@@ -75,12 +75,15 @@ impl TrayState {
             ApiEvent::ModelLoadFailed { .. } => TrayState::Error,
 
             // Live-metering / partials / platform notices don't change the icon;
-            // they feed the settings window instead.
+            // they feed the settings window instead. Model downloads (D-0015) are
+            // background provisioning, not a dictation-session phase — the startup gate /
+            // Settings → Models card show their progress, not the tray icon.
             ApiEvent::PartialTranscript { .. }
             | ApiEvent::AudioLevel { .. }
             | ApiEvent::SecureInputBlocked { .. }
             | ApiEvent::AudioDeviceLost { .. }
-            | ApiEvent::PlatformPermission { .. } => self,
+            | ApiEvent::PlatformPermission { .. }
+            | ApiEvent::ModelDownload { .. } => self,
         }
     }
 
@@ -183,6 +186,24 @@ mod tests {
         assert_eq!(
             TrayState::Error.next(TrayInput::ConnectionRestored),
             TrayState::Idle
+        );
+    }
+
+    #[test]
+    fn model_download_does_not_change_tray_state() {
+        let idle = TrayState::Idle;
+        assert_eq!(
+            idle.next(TrayInput::Event(&ev(
+                r#"{"type":"model.download","id":"stt-large-v3-turbo","downloaded":1,"total":2,"phase":"downloading","ts_ms":1}"#
+            ))),
+            TrayState::Idle
+        );
+        let rec = TrayState::Recording;
+        assert_eq!(
+            rec.next(TrayInput::Event(&ev(
+                r#"{"type":"model.download","id":"stt-large-v3-turbo","downloaded":1,"total":2,"phase":"error","error":"boom","ts_ms":1}"#
+            ))),
+            TrayState::Recording
         );
     }
 
