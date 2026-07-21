@@ -74,20 +74,38 @@ fn secure_input_query_runs() {
     eprintln!("IsSecureEventInputEnabled = {enabled}");
 }
 
-/// Grant: Input Monitoring. Press the configured combo (default Ctrl+Alt+Space) and watch the
+/// Grant: Input Monitoring. Press the configured combo (default Ctrl+Alt) and watch the
 /// printed events. Ctrl-C to end. This blocks (the rdev listener never returns on its own).
 #[test]
 #[ignore = "needs Input Monitoring permission; blocks on the rdev listener; run manually"]
 fn hotkey_listener_reports_events() {
     let (tx, rx) = std::sync::mpsc::channel();
-    let combo = whisper_platform::HotkeyCombo::parse("Ctrl+Alt+Space").unwrap();
+    let combo = whisper_platform::HotkeyCombo::parse("Ctrl+Alt").unwrap();
     let on_error = Box::new(|msg: String| panic!("rdev::listen failed to start: {msg}"));
     let _listener = whisper_platform::spawn_listener(combo, tx, on_error);
-    eprintln!("press Ctrl+Alt+Space a few times (grant Input Monitoring)…");
+    eprintln!("press Ctrl+Alt a few times (grant Input Monitoring)…");
     for _ in 0..4 {
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok(ev) => eprintln!("hotkey event: {ev:?}"),
             Err(_) => panic!("no hotkey events within 30s — is Input Monitoring granted?"),
         }
     }
+}
+
+/// D-0016 preflight: prints the live Input Monitoring / Accessibility grant status via
+/// `whisper_platform::{input_monitoring_access, accessibility_access}` — no prompt, no
+/// hardware event stream, just the two `IOHIDCheckAccess`/`AXIsProcessTrusted` queries the
+/// daemon's `/v1/platform/permissions` endpoint and hotkey preflight use. Run once with each
+/// grant toggled off/on in System Settings to confirm the mapping.
+#[test]
+#[ignore = "reads real TCC grant state; run manually while toggling System Settings"]
+fn permission_preflight_reports_live_grant_state() {
+    eprintln!(
+        "input_monitoring_access() = {:?}",
+        whisper_platform::input_monitoring_access()
+    );
+    eprintln!(
+        "accessibility_access()    = {:?}",
+        whisper_platform::accessibility_access()
+    );
 }

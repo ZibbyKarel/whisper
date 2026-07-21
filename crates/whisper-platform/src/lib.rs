@@ -18,6 +18,7 @@
 pub mod audio;
 pub mod hotkey;
 pub mod paste;
+pub mod permission;
 
 pub use audio::{
     downmix_to_mono, AudioLevel, AutoGain, AutoGainConfig, CaptureError, LevelMeter,
@@ -27,6 +28,14 @@ pub use hotkey::{
     ComboTracker, HotkeyCombo, HotkeyEvent, HotkeyMode, HotkeySession, SessionIntent,
 };
 pub use paste::{Clipboard, KeySynth, PasteboardSink, SecureInput, DEFAULT_RESTORE_DELAY};
+// Permission preflight (D-0016): unlike the hardware adapters above, these are exported
+// unconditionally — a non-macOS build gets the `Access::Unknown`/`false` stub (see
+// `permission.rs`), so a caller (e.g. `whisper-iface`'s `/v1/platform/permissions`) can call
+// them the same way regardless of host OS.
+pub use permission::{
+    accessibility_access, input_monitoring_access, request_accessibility, request_input_monitoring,
+    Access,
+};
 
 #[cfg(target_os = "macos")]
 pub use audio::CpalAudioSource;

@@ -139,6 +139,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/models/{id}/download",
             post(handlers::start_model_download).delete(handlers::cancel_model_download),
         )
+        .route(
+            "/v1/platform/permissions",
+            get(handlers::platform_permissions),
+        )
         .route("/v1/events", get(ws_events))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

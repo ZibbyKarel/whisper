@@ -29,13 +29,18 @@ pub enum OverlayPosition {
 /// fills any missing field from [`Default`], so an older/partial file (or a
 /// newer daemon adding fields) still loads with sensible values — and, crucially,
 /// a missing `overlay_enabled` deserializes to `true`, not `false`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellSettings {
     /// Show the floating waveform overlay while dictating.
     pub overlay_enabled: bool,
     /// Which screen edge the overlay hugs.
     pub overlay_position: OverlayPosition,
+    /// Opacity of the floating overlay's glass surface (0.0 = fully transparent
+    /// tint, 1.0 = fully opaque tint). The UI slider constrains this to a usable
+    /// range; `Overlay::paint` also clamps defensively in case a hand-edited
+    /// settings file has an out-of-range value.
+    pub overlay_opacity: f32,
 }
 
 impl Default for ShellSettings {
@@ -43,6 +48,7 @@ impl Default for ShellSettings {
         Self {
             overlay_enabled: true,
             overlay_position: OverlayPosition::Bottom,
+            overlay_opacity: 0.85,
         }
     }
 }
@@ -111,6 +117,7 @@ mod tests {
         let s = ShellSettings {
             overlay_enabled: false,
             overlay_position: OverlayPosition::Top,
+            overlay_opacity: 0.6,
         };
         s.save(&p).unwrap();
         assert_eq!(ShellSettings::load(&p), s);
@@ -140,10 +147,23 @@ mod tests {
     }
 
     #[test]
+    fn partial_file_keeps_default_opacity_for_missing_field() {
+        // Container-level `#[serde(default)]` must source the missing field from
+        // `ShellSettings::default()` (0.85), not `f32::default()` (0.0).
+        let p = temp_path("partial-opacity");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, r#"{"overlay_position":"top"}"#).unwrap();
+        let loaded = ShellSettings::load(&p);
+        assert!((loaded.overlay_opacity - ShellSettings::default().overlay_opacity).abs() < 1e-6);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
     fn position_serializes_lowercase() {
         let s = ShellSettings {
             overlay_enabled: true,
             overlay_position: OverlayPosition::Top,
+            overlay_opacity: 0.6,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""overlay_position":"top""#), "got {json}");

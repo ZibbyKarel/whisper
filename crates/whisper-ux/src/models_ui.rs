@@ -221,6 +221,9 @@ mod tests {
         fn cancel_model_download(&self, _id: &str) -> Result<(), ApiError> {
             unimplemented!()
         }
+        fn platform_permissions(&self) -> Result<crate::api::PlatformPermissions, ApiError> {
+            unimplemented!()
+        }
     }
 
     #[test]

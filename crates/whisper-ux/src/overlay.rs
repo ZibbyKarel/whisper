@@ -1,30 +1,30 @@
 //! Floating waveform overlay (D-0013, Wispr Flow-style). A small borderless,
 //! transparent, always-on-top capsule that appears while a dictation session is
-//! live and shows a voice-reactive waveform, a recording dot, and an elapsed
-//! timer; during post-capture processing it freezes/dims with a "…" affordance
-//! so the pipeline finishing is visible.
+//! live and shows a voice-reactive waveform; during post-capture processing it
+//! freezes/dims the bars so the pipeline finishing is visible. The capsule
+//! surface itself is a faux "Liquid Glass" look (tint + sheen + rim, built from
+//! egui primitives — no real backdrop blur) whose opacity is user-adjustable.
 //!
 //! The window lifecycle (a second egui viewport) lives in `gui.rs`; this module
 //! owns the *pure* pieces so they are unit-tested without a display:
 //! - [`overlay_rect`]: where the capsule goes on the monitor (centered + edge);
 //! - [`LevelRing`] + [`bar_heights`]/[`fill_bar_heights`]: the 10 Hz RMS ring and
 //!   its mapping to N eased bar heights with an idle "breathing" baseline;
-//! - [`approach`]: the per-frame lerp that smooths 10 Hz steps to 60 fps;
-//! - [`format_elapsed`]: the mm:ss timer.
+//! - [`approach`]: the per-frame lerp that smooths 10 Hz steps to 60 fps.
 //!
 //! The paint code ([`Overlay::paint`]) stays thin and calls into these.
 
 use std::collections::VecDeque;
 
-use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, StrokeKind, Vec2};
+use egui::{Color32, Pos2, Rect, Stroke, StrokeKind, Vec2};
 
 use crate::shell_settings::OverlayPosition;
 
 /// Number of waveform bars in the capsule.
-pub const BAR_COUNT: usize = 24;
+pub const BAR_COUNT: usize = 14;
 
-/// Logical size of the overlay window (>= the 280x64 floor in the brief).
-pub const OVERLAY_SIZE: Vec2 = Vec2::new(320.0, 72.0);
+/// Logical size of the overlay window (a small waveform-only capsule).
+pub const OVERLAY_SIZE: Vec2 = Vec2::new(160.0, 40.0);
 
 /// Fallback monitor size used when the platform reports no monitor dimensions
 /// (e.g. headless, or before the first frame): a conservative laptop default.
@@ -50,25 +50,28 @@ const BREATH_WAVE: f32 = 0.55;
 const LERP_ALPHA: f32 = 0.35;
 
 // Palette (kept local; the capsule is its own translucent surface, not a card).
-const CAPSULE_FILL: Color32 = Color32::from_rgba_premultiplied(16, 18, 22, 232);
-const CAPSULE_STROKE: Color32 = Color32::from_rgb(58, 62, 70);
-const TEXT_COLOR: Color32 = Color32::from_rgb(220, 224, 230);
-const TEXT_DIM: Color32 = Color32::from_rgb(140, 146, 154);
-const REC_RED: Color32 = Color32::from_rgb(0xE0, 0x3B, 0x24);
+/// Base tint of the glass surface (before opacity/alpha is applied).
+const GLASS_TINT: Color32 = Color32::from_rgb(16, 18, 22);
+/// Fill alpha at `opacity == 1.0`.
+const GLASS_BASE_ALPHA: u8 = 210;
+/// Sheen highlight alpha at `opacity == 1.0`.
+const GLASS_SHEEN_ALPHA: u8 = 46;
+/// Rim stroke alpha range across `opacity == 0.0..=1.0` (the rim stays
+/// faintly visible even at low opacity — a glass edge still catches light).
+const GLASS_RIM_ALPHA_MIN: u8 = 40;
+const GLASS_RIM_ALPHA_MAX: u8 = 90;
 /// Dimmed bar tone used while processing (waveform frozen).
 const BAR_DIM: Color32 = Color32::from_rgb(88, 96, 100);
 
-/// Left reserve for the recording dot + timer / processing "…".
-const LEFT_CLUSTER_W: f32 = 64.0;
-/// Right/edge padding for the bar field.
+/// Edge padding for the bar field on both sides of the capsule.
 const EDGE_PAD: f32 = 12.0;
 
 /// Visual mode of the overlay, derived from the tray state by `gui.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayPhase {
-    /// Live capture: waveform animates, red dot + timer shown.
+    /// Live capture: waveform animates.
     Recording,
-    /// Post-capture pipeline: waveform frozen/dimmed, "…" shown.
+    /// Post-capture pipeline: waveform frozen/dimmed.
     Processing,
 }
 
@@ -171,15 +174,9 @@ pub fn approach(current: f32, target: f32, alpha: f32) -> f32 {
     current + (target - current) * alpha.clamp(0.0, 1.0)
 }
 
-/// Format an elapsed duration as `mm:ss` (minutes uncapped for long sessions).
-#[must_use]
-pub fn format_elapsed(total_secs: u64) -> String {
-    format!("{:02}:{:02}", total_secs / 60, total_secs % 60)
-}
-
 /// Live, per-frame overlay state (ring + eased bar buffers + last peak).
-/// Held by `gui.rs`; visibility and the elapsed timer are supplied by the caller
-/// since they depend on the tray state machine and wall-clock.
+/// Held by `gui.rs`; visibility is supplied by the caller since it depends on
+/// the tray state machine.
 pub struct Overlay {
     ring: LevelRing,
     target: Vec<f32>,
@@ -223,21 +220,59 @@ impl Overlay {
     }
 
     /// Paint the capsule for the current frame. `t` is a monotonic time in
-    /// seconds (for the breathing wave), `elapsed_secs` drives the timer.
-    pub fn paint(&mut self, ui: &mut egui::Ui, phase: OverlayPhase, t: f32, elapsed_secs: u64) {
+    /// seconds, driving the idle "breathing" wave; `opacity` (`0.0..=1.0`)
+    /// controls how see-through the glass surface is.
+    pub fn paint(&mut self, ui: &mut egui::Ui, phase: OverlayPhase, t: f32, opacity: f32) {
         let rect = ui.max_rect();
         let painter = ui.painter().clone();
         let radius = rect.height() * 0.5;
 
-        // Capsule surface (its own translucent rounded rect; the viewport itself
-        // is transparent so the corners read as fully clear).
+        // Capsule surface: a faux "Liquid Glass" look built from egui primitives
+        // (no real backdrop blur is available — egui/winit can't sample the desktop
+        // behind the window — so this fakes it with a translucent tint, a soft top
+        // sheen band, and a bright rim stroke). The viewport itself is transparent
+        // so the corners read as fully clear.
+        let opacity = opacity.clamp(0.15, 1.0);
+
+        let fill_alpha = (GLASS_BASE_ALPHA as f32 * opacity).round() as u8;
+        let fill = Color32::from_rgba_unmultiplied(
+            GLASS_TINT.r(),
+            GLASS_TINT.g(),
+            GLASS_TINT.b(),
+            fill_alpha,
+        );
+
+        let rim_alpha = (GLASS_RIM_ALPHA_MIN as f32
+            + (GLASS_RIM_ALPHA_MAX - GLASS_RIM_ALPHA_MIN) as f32 * opacity)
+            .round() as u8;
+        let rim = Color32::from_rgba_unmultiplied(255, 255, 255, rim_alpha);
+
         painter.rect(
             rect,
             radius,
-            CAPSULE_FILL,
-            Stroke::new(1.0, CAPSULE_STROKE),
+            fill,
+            Stroke::new(1.0, rim),
             StrokeKind::Inside,
         );
+
+        // Sheen: a soft rounded highlight band across the upper portion, faking a
+        // specular glass reflection.
+        let sheen_alpha = (GLASS_SHEEN_ALPHA as f32 * opacity).round() as u8;
+        if sheen_alpha > 0 {
+            let inset = radius * 0.35;
+            let sheen_rect = Rect::from_min_size(
+                Pos2::new(rect.left() + inset, rect.top() + 2.0),
+                Vec2::new(
+                    (rect.width() - inset * 2.0).max(1.0),
+                    (rect.height() * 0.45).max(2.0),
+                ),
+            );
+            painter.rect_filled(
+                sheen_rect,
+                (radius - inset).max(2.0),
+                Color32::from_rgba_unmultiplied(255, 255, 255, sheen_alpha),
+            );
+        }
 
         // Advance the waveform. While recording, targets track the live ring;
         // while processing, targets freeze so the last shape lingers, dimmed.
@@ -249,31 +284,10 @@ impl Overlay {
         }
 
         let cy = rect.center().y;
-        let cluster_x = rect.left() + 14.0;
-        match phase {
-            OverlayPhase::Recording => {
-                painter.circle_filled(Pos2::new(cluster_x, cy), 4.0, REC_RED);
-                painter.text(
-                    Pos2::new(cluster_x + 12.0, cy),
-                    Align2::LEFT_CENTER,
-                    format_elapsed(elapsed_secs),
-                    FontId::monospace(13.0),
-                    TEXT_COLOR,
-                );
-            }
-            OverlayPhase::Processing => {
-                painter.text(
-                    Pos2::new(cluster_x, cy),
-                    Align2::LEFT_CENTER,
-                    "…",
-                    FontId::proportional(20.0),
-                    TEXT_DIM,
-                );
-            }
-        }
 
-        // Bar field to the right of the left cluster.
-        let bars_left = rect.left() + LEFT_CLUSTER_W;
+        // Bar field fills the full capsule width (respecting edge padding on
+        // both sides) — the capsule shows only the animated waveform.
+        let bars_left = rect.left() + EDGE_PAD;
         let bars_right = rect.right() - EDGE_PAD;
         let n = self.displayed.len();
         let area_w = (bars_right - bars_left).max(1.0);
@@ -409,14 +423,6 @@ mod tests {
         // alpha > 1 is clamped to a full step, never overshoots.
         assert!((approach(0.0, 1.0, 2.0) - 1.0).abs() < 1e-6);
         assert!((approach(0.4, 0.4, 0.3) - 0.4).abs() < 1e-6);
-    }
-
-    #[test]
-    fn elapsed_formats_mm_ss() {
-        assert_eq!(format_elapsed(0), "00:00");
-        assert_eq!(format_elapsed(9), "00:09");
-        assert_eq!(format_elapsed(75), "01:15");
-        assert_eq!(format_elapsed(3661), "61:01");
     }
 
     #[test]

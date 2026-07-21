@@ -62,7 +62,33 @@ Input Monitoring you may need to add manually with the **+** button (choose
 `/Applications/Whisper.app`). Toggle Whisper off and on again if a grant does not
 take effect immediately.
 
-The tray's onboarding screen walks you through these on first run.
+The tray's onboarding screen walks you through these on first run, and shows a
+live status (Granted/Denied/Unknown) for Input Monitoring and Accessibility with
+a **Re-check** button and a one-click **Open System Settings** link straight to
+the right pane.
+
+> **After updating the app**, macOS may silently drop the Input Monitoring and
+> Accessibility grants. Whisper is **ad-hoc signed** (no paid Apple Developer
+> ID, D-0014) — every reinstalled build has a slightly different code identity,
+> and macOS's TCC privacy database keys grants to that identity. The result:
+> the hotkey (and paste) can stop working after an update with **no error
+> message**, because the underlying listener starts successfully — it just
+> silently receives no key events. Whisper now detects this proactively (the
+> tray shows a persistent banner naming the exact permission the moment it is
+> missing, instead of leaving you to guess why the hotkey "does nothing"), but
+> you still have to re-grant it by hand:
+>
+> 1. Open **System Settings → Privacy & Security → Input Monitoring** (and
+>    **Accessibility**).
+> 2. If `Whisper` is listed but its toggle is off, turn it back on. If it looks
+>    "stuck" (toggle on but still not working), remove it with the **−**
+>    button and re-add it with **+** (`/Applications/Whisper.app`).
+> 3. Quit and relaunch Whisper (the listener only starts once, at daemon
+>    startup — a grant made while it's running needs a restart to take
+>    effect).
+>
+> This is a known limitation of ad-hoc signing (deferred pending a paid
+> Developer ID / notarization, D-0014); see D-0016 for the detection mechanism.
 
 ## 5. Set up the models
 
@@ -129,7 +155,10 @@ the engine it started — an already-running engine is left alone.
 - **"Whisper is damaged / cannot be opened"** — Gatekeeper on the ad-hoc build.
   Use right-click → Open (step 3). If it persists, clear the quarantine flag:
   `xattr -dr com.apple.quarantine /Applications/Whisper.app`.
-- **Nothing happens on the hotkey** — check Input Monitoring + Accessibility are
-  granted, and that `delivery = "paste"` in the config.
+- **Nothing happens on the hotkey** — check the tray's permission banner (top of
+  the main window) or Settings; it names the exact missing grant. Otherwise
+  check Input Monitoring + Accessibility are granted (see "After updating the
+  app" above — a reinstall can silently drop them) and that `delivery = "paste"`
+  in the config.
 - **Engine won't start / "unreachable"** — read `~/Library/Logs/whisper-engine/whisperd.log`;
   a missing model file is the usual cause (see step 5).

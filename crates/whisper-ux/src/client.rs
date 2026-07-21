@@ -9,7 +9,7 @@ use ureq::Agent;
 
 use crate::api::{
     Config, ConfigUpdateResponse, ErrorEnvelope, HealthResponse, ModelsListResponse,
-    SessionAccepted, SessionRecord, StatusResponse,
+    PlatformPermissions, SessionAccepted, SessionRecord, StatusResponse,
 };
 
 /// A failed `/v1` call.
@@ -62,6 +62,9 @@ pub trait Api {
     fn start_model_download(&self, id: &str) -> Result<(), ApiError>;
     /// `DELETE /v1/models/{id}/download` — cancel an in-flight download.
     fn cancel_model_download(&self, id: &str) -> Result<(), ApiError>;
+    /// `GET /v1/platform/permissions` — current macOS TCC grant status for the hotkey/paste
+    /// path (D-0016).
+    fn platform_permissions(&self) -> Result<PlatformPermissions, ApiError>;
 }
 
 /// ureq-backed [`Api`] implementation.
@@ -242,6 +245,10 @@ impl Api for HttpClient {
 
     fn cancel_model_download(&self, id: &str) -> Result<(), ApiError> {
         self.call_status_only(true, &format!("/v1/models/{id}/download"))
+    }
+
+    fn platform_permissions(&self) -> Result<PlatformPermissions, ApiError> {
+        decode(self.get_value("/v1/platform/permissions")?)
     }
 }
 
@@ -430,6 +437,18 @@ mod tests {
             }
             other => panic!("expected Http error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn platform_permissions_parses_body() {
+        let (base, _rx) = mock_once(
+            "200 OK",
+            r#"{"input_monitoring":"denied","accessibility":"granted"}"#,
+        );
+        let client = HttpClient::new(base, None);
+        let p = client.platform_permissions().unwrap();
+        assert_eq!(p.input_monitoring, "denied");
+        assert_eq!(p.accessibility, "granted");
     }
 
     #[test]

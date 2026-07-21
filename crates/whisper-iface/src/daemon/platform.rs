@@ -18,8 +18,9 @@ use whisper_core::ports::{AudioSource, TextSink};
 use whisper_core::session::CancellationToken;
 
 use whisper_platform::{
-    macos_pasteboard_sink, spawn_listener, AudioLevel, AutoGainConfig, CpalAudioSource,
-    HotkeyCombo, HotkeyEvent, HotkeyMode, HotkeySession, SessionIntent,
+    input_monitoring_access, macos_pasteboard_sink, spawn_listener, Access, AudioLevel,
+    AutoGainConfig, CpalAudioSource, HotkeyCombo, HotkeyEvent, HotkeyMode, HotkeySession,
+    SessionIntent,
 };
 
 use super::api::{ApiEvent, SessionRecord};
@@ -168,6 +169,12 @@ pub fn stop_live_session(state: &Arc<AppState>, session_id: &str) {
 /// feeds [`HotkeyEvent`]s to a driver that applies the mode and starts/stops mic sessions through
 /// the same machinery as the HTTP API. Returns the driver thread handle (the rdev listener thread
 /// is detached inside `spawn_listener`).
+///
+/// Runs an Input Monitoring **preflight** before starting the listener (D-0016): after an
+/// ad-hoc-signed reinstall, macOS can drop the grant for the new bundle identity while
+/// `rdev::listen` still returns `Ok` (its `CGEventTapCreate` succeeds; it just then delivers
+/// zero key events) — the existing `on_error` path below never fires in that case, so the
+/// preflight is what actually catches the dominant failure mode.
 pub fn spawn_hotkey(
     state: Arc<AppState>,
     cfg: &HotkeyConfig,
@@ -187,11 +194,33 @@ pub fn spawn_hotkey(
         HotkeyModeDto::Toggle => HotkeyMode::Toggle,
     };
 
+    // Preflight (D-0016): check the grant *before* spawning the listener, since `rdev::listen`
+    // returning `Ok` says nothing about whether the grant is actually present (see the doc
+    // comment above). Still spawn the listener either way — a grant made after this check (or a
+    // false `Unknown` reading) recovers on the next daemon restart without a rebuild.
+    if input_monitoring_access() != Access::Granted {
+        eprintln!(
+            "whisperd: Input Monitoring permission is not granted for this build. The hotkey \
+             listener will start but will not receive key events. Grant it in System Settings \
+             › Privacy & Security › Input Monitoring, then restart whisperd. (Reinstalling an \
+             ad-hoc-signed build can drop this grant — see docs/install.md.)"
+        );
+        let _ = state.events.send(ApiEvent::PlatformPermission {
+            session_id: None,
+            permission: "input_monitoring".to_string(),
+            granted: false,
+            detail: Some("preflight: IOHIDCheckAccess reported the grant is missing".to_string()),
+            ts_ms: now_ms(),
+        });
+    }
+
     let (tx, rx) = std::sync::mpsc::channel::<HotkeyEvent>();
     // If the rdev listen loop cannot start (most commonly a missing Input Monitoring TCC grant),
     // whisper-platform would otherwise die silently and the hotkey would just appear broken to
     // the user (observed in real user testing) — surface it on stderr and as a WS event so a UI
-    // shell can show it.
+    // shell can show it. This is now the secondary path (D-0016): the preflight above catches
+    // the dominant "listener starts but is silently deaf" case; this still catches a genuine
+    // `rdev::listen` `Err`.
     let err_state = state.clone();
     let on_error: Box<dyn FnOnce(String) + Send> = Box::new(move |msg: String| {
         eprintln!(

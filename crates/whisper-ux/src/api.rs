@@ -277,6 +277,18 @@ pub struct ModelsListResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Platform permissions (GET /v1/platform/permissions) — mirror of daemon/api.rs, D-0016
+// ---------------------------------------------------------------------------
+
+/// Current macOS TCC grant status (mirror of `PlatformPermissionsDto`). `"granted" | "denied" |
+/// "unknown"` — `"unknown"` on a headless daemon build, or before the first successful poll.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PlatformPermissions {
+    pub input_monitoring: String,
+    pub accessibility: String,
+}
+
+// ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
 
@@ -768,5 +780,15 @@ mod tests {
         let cfg: Config = serde_json::from_str(r#"{"port":8737}"#).unwrap();
         assert_eq!(cfg.vad, VadTuning::default());
         assert_eq!(cfg.audio, AudioTuning::default());
+    }
+
+    #[test]
+    fn platform_permissions_parses_the_daemon_shape() {
+        // Fixture copied from the real `GET /v1/platform/permissions` shape in daemon/api.rs
+        // (contract-mirror discipline, HANDOFF item 8).
+        let json = r#"{"input_monitoring":"denied","accessibility":"granted"}"#;
+        let p: PlatformPermissions = serde_json::from_str(json).unwrap();
+        assert_eq!(p.input_monitoring, "denied");
+        assert_eq!(p.accessibility, "granted");
     }
 }

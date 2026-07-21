@@ -28,3 +28,7 @@ rdev = "0.5"
 arboard = "3"
 # Synthesized Cmd-V via CGEvent (D-0007). Dual MIT/Apache-2.0.
 core-graphics = "0.24"
+# CFDictionary/CFString/CFBoolean for the explicit-prompt Accessibility check
+# (`AXIsProcessTrustedWithOptions`, D-0016). Dual MIT/Apache-2.0; already pulled in transitively
+# by core-graphics, pinned here as a direct dep since permission.rs uses its types directly.
+core-foundation = "0.10"

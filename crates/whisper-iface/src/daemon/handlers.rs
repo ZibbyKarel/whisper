@@ -17,8 +17,8 @@ use whisper_core::session::CancellationToken;
 
 use super::api::{
     ApiEvent, AudioRequest, ConfigUpdateResponse, ErrorBody, ErrorEnvelope, HealthResponse,
-    ModelEntryDto, ModelProgressDto, ModelStatus, ModelsListResponse, SessionAccepted,
-    SessionRecord, SessionStatusDto, SourceKind, StatusResponse,
+    ModelEntryDto, ModelProgressDto, ModelStatus, ModelsListResponse, PlatformPermissionsDto,
+    SessionAccepted, SessionRecord, SessionStatusDto, SourceKind, StatusResponse,
 };
 use super::config::{Config, DeliveryMode};
 use super::models::{self, DownloadProgress};
@@ -124,6 +124,43 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
         language: cfg.language,
         history_enabled: state.store.history_enabled(),
     })
+}
+
+/// `GET /v1/platform/permissions` (`ARCHITECTURE.md` §5, D-0016): the current macOS TCC grant
+/// status for Input Monitoring (hotkey) and Accessibility (paste), queried fresh on every call
+/// (both are cheap parameterless OS queries — no caching needed). Lets a UI detect a missing
+/// grant proactively instead of waiting for a downstream failure that, for Input Monitoring,
+/// may never surface as an error at all (see D-0016).
+pub async fn platform_permissions() -> Json<PlatformPermissionsDto> {
+    Json(current_platform_permissions())
+}
+
+#[cfg(feature = "platform")]
+fn current_platform_permissions() -> PlatformPermissionsDto {
+    PlatformPermissionsDto {
+        input_monitoring: access_str(whisper_platform::input_monitoring_access()),
+        accessibility: access_str(whisper_platform::accessibility_access()),
+    }
+}
+
+#[cfg(feature = "platform")]
+fn access_str(a: whisper_platform::Access) -> String {
+    match a {
+        whisper_platform::Access::Granted => "granted",
+        whisper_platform::Access::Denied => "denied",
+        whisper_platform::Access::Unknown => "unknown",
+    }
+    .to_string()
+}
+
+/// Headless build: no macOS adapter to query, so both fields are `"unknown"` rather than a
+/// hard error — the endpoint still answers, it just cannot say more (`ARCHITECTURE.md` §5).
+#[cfg(not(feature = "platform"))]
+fn current_platform_permissions() -> PlatformPermissionsDto {
+    PlatformPermissionsDto {
+        input_monitoring: "unknown".to_string(),
+        accessibility: "unknown".to_string(),
+    }
 }
 
 /// One-shot transcription: blocks until the pipeline finishes and returns the final record

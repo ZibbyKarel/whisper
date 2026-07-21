@@ -43,6 +43,42 @@ async fn status_reports_ready_engines() {
     assert_eq!(body["language"], "cs");
 }
 
+/// D-0016: on the default (headless, no `platform` feature) build there is no macOS adapter to
+/// query, so the endpoint still answers `200` with both fields `"unknown"` rather than erroring.
+/// Gated to the headless build only: with `--features platform` this same query hits the real
+/// `whisper_platform::{input_monitoring_access,accessibility_access}` FFI, whose answer depends
+/// on the host machine's actual TCC grants (see `platform_permissions_reports_a_200_with_the_
+/// platform_feature` below for the feature-enabled shape assertion).
+#[cfg(not(feature = "platform"))]
+#[tokio::test]
+async fn platform_permissions_reports_unknown_without_the_platform_feature() {
+    let (_state, router) = harness(cfg(CleanupModeDto::Never), fake_builder());
+    let (status, body) = call(&router, "GET", "/v1/platform/permissions", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["input_monitoring"], "unknown");
+    assert_eq!(body["accessibility"], "unknown");
+}
+
+/// D-0016: with the `platform` feature, the endpoint queries the real macOS FFI. The grant state
+/// itself is host-dependent (not assertable in CI, D-0012), but the shape is: `200`, both fields
+/// present, and each one of the three documented strings.
+#[cfg(feature = "platform")]
+#[tokio::test]
+async fn platform_permissions_reports_a_200_with_the_platform_feature() {
+    let (_state, router) = harness(cfg(CleanupModeDto::Never), fake_builder());
+    let (status, body) = call(&router, "GET", "/v1/platform/permissions", None).await;
+    assert_eq!(status, StatusCode::OK);
+    for field in ["input_monitoring", "accessibility"] {
+        let v = body[field].as_str().unwrap_or_else(|| {
+            panic!("{field} should be a string, got {:?}", body[field]);
+        });
+        assert!(
+            ["granted", "denied", "unknown"].contains(&v),
+            "{field} = {v:?} is not one of the documented values"
+        );
+    }
+}
+
 #[tokio::test]
 async fn transcribe_returns_czech_byte_exact_with_skip_reason() {
     let (_state, router) = harness(cfg(CleanupModeDto::Never), fake_builder());

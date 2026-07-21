@@ -31,6 +31,7 @@ use whisper_ux::language::{self, LanguagePreset};
 use whisper_ux::models_ui::ModelsPanel;
 use whisper_ux::onboarding::{self, OnboardingState};
 use whisper_ux::overlay::{self, Overlay, OverlayPhase};
+use whisper_ux::permissions_ui::{self, PermissionsPanel};
 use whisper_ux::save_report::SaveReport;
 use whisper_ux::shell_settings::{self, OverlayPosition, ShellSettings};
 use whisper_ux::theme::{self, status_pill::PillState};
@@ -51,6 +52,14 @@ enum Screen {
     App,
 }
 
+/// Which of the two D-0016 platform permissions an onboarding step / banner row is about —
+/// selects the live status field, the onboarding ack flag, and the deep-link URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Permission {
+    InputMonitoring,
+    Accessibility,
+}
+
 /// Sections of the main app screen, navigated via the left sidebar (D-0013 UX
 /// pass; sidebar layout added in UX pass 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,15 +68,17 @@ enum Section {
     Dictation,
     Audio,
     Cleanup,
+    Models,
     Dictionary,
     Advanced,
 }
 
-const SECTIONS: [Section; 6] = [
+const SECTIONS: [Section; 7] = [
     Section::Status,
     Section::Dictation,
     Section::Audio,
     Section::Cleanup,
+    Section::Models,
     Section::Dictionary,
     Section::Advanced,
 ];
@@ -79,6 +90,7 @@ impl Section {
             Section::Dictation => "Dictation",
             Section::Audio => "Audio",
             Section::Cleanup => "Cleanup",
+            Section::Models => "Models",
             Section::Dictionary => "Dictionary",
             Section::Advanced => "Advanced",
         }
@@ -91,7 +103,8 @@ impl Section {
             Section::Status => "Live engine state, input level and the last transcript.",
             Section::Dictation => "Dictation language, global hotkey and delivery.",
             Section::Audio => "Voice activity detection and automatic gain control.",
-            Section::Cleanup => "LLM disfluency cleanup and resident model paths.",
+            Section::Cleanup => "LLM disfluency cleanup mode.",
+            Section::Models => "Local STT + LLM model downloads and raw model paths.",
             Section::Dictionary => "Deterministic substitutions applied before cleanup.",
             Section::Advanced => "Server bind/port, history and dictionary file locations.",
         }
@@ -140,6 +153,12 @@ pub struct ShellApp {
     models: ModelsPanel,
     last_models_poll: std::time::Instant,
 
+    // --- platform permissions (D-0016): Input Monitoring (hotkey) / Accessibility (paste)
+    // grant status, polled the same way as `models` — feeds the persistent main-window banner
+    // and the onboarding checklist steps. ---
+    permissions: PermissionsPanel,
+    last_permissions_poll: std::time::Instant,
+
     // --- floating overlay (shell-local, D-0013) ---
     shell_settings: ShellSettings,
     shell_settings_path: Option<PathBuf>,
@@ -147,8 +166,6 @@ pub struct ShellApp {
     /// Latch so a post-capture `Processing` state keeps the overlay up only if a
     /// `Recording` session actually preceded it (not on startup model-loading).
     overlay_active: bool,
-    /// Session start, for the overlay's mm:ss timer.
-    session_start: Option<std::time::Instant>,
 
     // --- settings working copy ---
     cfg: Option<Config>,
@@ -237,11 +254,12 @@ impl ShellApp {
             onboarding_path,
             models: ModelsPanel::default(),
             last_models_poll: std::time::Instant::now(),
+            permissions: PermissionsPanel::default(),
+            last_permissions_poll: std::time::Instant::now(),
             shell_settings,
             shell_settings_path,
             overlay: Overlay::new(),
             overlay_active: false,
-            session_start: None,
             cfg: None,
             token_input: String::new(),
             dictionary_path_input: String::new(),
@@ -257,6 +275,7 @@ impl ShellApp {
         app.refresh_status();
         app.load_settings();
         app.models.refresh(&app.client);
+        app.refresh_permissions();
         app
     }
 
@@ -420,6 +439,41 @@ impl ShellApp {
     fn cancel_model_download(&mut self, id: &str) {
         if let Err(e) = self.client.cancel_model_download(id) {
             self.status_msg = Some(format!("cancel download {id}: {e}"));
+        }
+    }
+
+    // -- platform permissions (D-0016) ------------------------------------
+
+    /// `GET /v1/platform/permissions`, then auto-latch the onboarding acks a live `"granted"`
+    /// covers so the checklist doesn't ask the user to also click "I granted it" once the real
+    /// grant has already landed.
+    fn refresh_permissions(&mut self) {
+        self.permissions.refresh(&self.client);
+        self.last_permissions_poll = std::time::Instant::now();
+        self.mark_permission_acks();
+    }
+
+    /// Poll `GET /v1/platform/permissions` every few seconds so the banner reacts to a grant
+    /// (or a lost grant, e.g. after a reinstall) without requiring the user to hit "Re-check"
+    /// (mirrors [`Self::poll_models_if_due`], D-0015's polling cadence).
+    fn poll_permissions_if_due(&mut self) {
+        if self.last_permissions_poll.elapsed() >= std::time::Duration::from_secs(5) {
+            self.refresh_permissions();
+        }
+    }
+
+    fn mark_permission_acks(&mut self) {
+        let mut changed = false;
+        if self.permissions.input_monitoring == "granted" && !self.onboarding.input_monitoring_ack {
+            self.onboarding.input_monitoring_ack = true;
+            changed = true;
+        }
+        if self.permissions.accessibility == "granted" && !self.onboarding.accessibility_ack {
+            self.onboarding.accessibility_ack = true;
+            changed = true;
+        }
+        if changed {
+            self.persist_onboarding();
         }
     }
 
@@ -595,7 +649,6 @@ impl ShellApp {
                 self.active_session = Some(session_id.clone());
                 self.last_partial.clear();
                 self.overlay.reset();
-                self.session_start = Some(std::time::Instant::now());
             }
             ApiEvent::AudioLevel { rms, peak, .. } => {
                 self.last_rms = *rms;
@@ -609,14 +662,12 @@ impl ShellApp {
                 self.active_session = None;
                 self.last_rms = 0.0;
                 self.last_peak = 0.0;
-                self.session_start = None;
                 self.test_dictation_text = text.clone();
             }
             ApiEvent::Cancelled { .. } | ApiEvent::Failed { .. } => {
                 self.active_session = None;
                 self.last_rms = 0.0;
                 self.last_peak = 0.0;
-                self.session_start = None;
             }
             _ => {}
         }
@@ -721,7 +772,7 @@ impl ShellApp {
         let builder = egui::ViewportBuilder::default()
             .with_title("Whisper overlay")
             .with_inner_size(overlay::OVERLAY_SIZE)
-            .with_min_inner_size(egui::vec2(280.0, 64.0))
+            .with_min_inner_size(egui::vec2(100.0, 28.0))
             .with_position(pos)
             .with_decorations(false)
             .with_transparent(true)
@@ -734,7 +785,7 @@ impl ShellApp {
             .with_mouse_passthrough(true);
 
         let t = ctx.input(|i| i.time) as f32;
-        let elapsed = self.session_start.map_or(0, |s| s.elapsed().as_secs());
+        let opacity = self.shell_settings.overlay_opacity;
         let overlay_state = &mut self.overlay;
 
         ctx.show_viewport_immediate(
@@ -750,7 +801,7 @@ impl ShellApp {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(vctx, |ui| {
-                        overlay_state.paint(ui, phase, t, elapsed);
+                        overlay_state.paint(ui, phase, t, opacity);
                     });
                 // Animate at ~60 fps, but only while the overlay is on screen.
                 vctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -777,6 +828,63 @@ impl ShellApp {
             });
             ui.add_space(6.0);
         }
+    }
+
+    /// Persistent, actionable permission banner (D-0016): shown whenever Input Monitoring
+    /// and/or Accessibility is not confirmed `"granted"`, naming the exact permission and
+    /// deep-linking straight to its System Settings pane. This is the tray-side half of closing
+    /// the silent-hotkey-failure gap — the daemon can detect the missing grant, but only the
+    /// tray can put it in front of the user.
+    fn ui_permissions_banner(&mut self, ui: &mut egui::Ui) {
+        if !self.permissions.needs_attention() {
+            return;
+        }
+        theme::card_frame().show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("⚠ Permission needed")
+                    .color(egui::Color32::from_rgb(0xF2, 0x9D, 0x1C))
+                    .strong(),
+            );
+            if self.permissions.input_monitoring_needs_attention() {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Input Monitoring: {} — the global hotkey will not work.",
+                        self.permissions.input_monitoring
+                    ));
+                    if ui.button("Open System Settings").clicked() {
+                        permissions_ui::open_system_settings(
+                            permissions_ui::INPUT_MONITORING_SETTINGS_URL,
+                        );
+                    }
+                });
+            }
+            if self.permissions.accessibility_needs_attention() {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Accessibility: {} — paste into other apps will not work.",
+                        self.permissions.accessibility
+                    ));
+                    if ui.button("Open System Settings").clicked() {
+                        permissions_ui::open_system_settings(
+                            permissions_ui::ACCESSIBILITY_SETTINGS_URL,
+                        );
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "After granting, restart Whisper — the listener starts once at daemon startup.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                if ui.button("Re-check").clicked() {
+                    self.refresh_permissions();
+                }
+            });
+        });
+        ui.add_space(6.0);
     }
 
     /// The persistent "restart to apply" notice (feedback item 2): stays
@@ -1048,6 +1156,20 @@ impl ShellApp {
                     .clicked();
                 self.shell_settings.overlay_position = pos;
             });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Opacity");
+                let mut opacity = self.shell_settings.overlay_opacity;
+                if ui
+                    .add(egui::Slider::new(&mut opacity, 0.2..=1.0).show_value(false))
+                    .changed()
+                {
+                    self.shell_settings.overlay_opacity = opacity;
+                    changed = true;
+                }
+            });
+
             ui.label(
                 egui::RichText::new("Always centered horizontally. Applies to the next session.")
                     .weak()
@@ -1145,7 +1267,9 @@ impl ShellApp {
                 ui.selectable_value(&mut cfg.cleanup_mode, CleanupMode::Never, "never");
             });
         });
-        ui.add_space(theme::CARD_GAP);
+    }
+
+    fn ui_models_section(&mut self, cfg: &mut Config, ui: &mut egui::Ui) {
         theme::card_frame().show(ui, |ui| {
             ui.heading("Models");
             ui.label(
@@ -1356,23 +1480,25 @@ impl ShellApp {
                 }
             });
 
-            checklist_row(
+            // D-0016: unlike the ack-only steps above, this reads the *real* grant from
+            // `GET /v1/platform/permissions` (closing the "user ticked the box but the grant
+            // never actually took" gap) — "Re-check" re-polls, and the manual "I granted it"
+            // fallback only appears when the daemon can't say (`"unknown"`, e.g. an older
+            // daemon build without this endpoint).
+            self.ui_permission_onboarding_step(
                 ui,
-                self.onboarding.accessibility_ack,
-                "4. Accessibility permission",
+                "4. Input Monitoring permission (global hotkey)",
+                permissions_ui::INPUT_MONITORING_SETTINGS_URL,
+                Permission::InputMonitoring,
             );
-            ui.horizontal(|ui| {
-                ui.add_space(20.0);
-                ui.label(
-                    "Grant in System Settings → Privacy & Security → Accessibility (for paste).",
-                );
-                if ui.button("I granted it").clicked() {
-                    self.onboarding.accessibility_ack = true;
-                    self.persist_onboarding();
-                }
-            });
+            self.ui_permission_onboarding_step(
+                ui,
+                "5. Accessibility permission (paste into other apps)",
+                permissions_ui::ACCESSIBILITY_SETTINGS_URL,
+                Permission::Accessibility,
+            );
 
-            checklist_row(ui, self.onboarding.test_dictation_done, "5. Test dictation");
+            checklist_row(ui, self.onboarding.test_dictation_done, "6. Test dictation");
             ui.horizontal(|ui| {
                 ui.add_space(20.0);
                 let label = if self.active_session.is_some() {
@@ -1412,6 +1538,55 @@ impl ShellApp {
         });
     }
 
+    /// One onboarding checklist row for a D-0016 platform permission: live status from the last
+    /// `GET /v1/platform/permissions` poll, a "Re-check" button, a "Open System Settings"
+    /// deep-link button, and — only while the status is `"unknown"` (the daemon can't say, e.g.
+    /// an older build without this endpoint) — a manual "I granted it" fallback ack. A live
+    /// `"granted"` reading auto-latches the ack (see [`Self::mark_permission_acks`]), so the
+    /// fallback button never appears once the daemon can confirm the grant itself.
+    fn ui_permission_onboarding_step(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        settings_url: &'static str,
+        which: Permission,
+    ) {
+        let (status, done) = match which {
+            Permission::InputMonitoring => (
+                self.permissions.input_monitoring.clone(),
+                self.onboarding.input_monitoring_ack,
+            ),
+            Permission::Accessibility => (
+                self.permissions.accessibility.clone(),
+                self.onboarding.accessibility_ack,
+            ),
+        };
+        checklist_row(ui, done, label);
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            ui.label(format!("status: {status}"));
+            if ui.button("Re-check").clicked() {
+                self.refresh_permissions();
+            }
+            if ui.button("Open System Settings").clicked() {
+                permissions_ui::open_system_settings(settings_url);
+            }
+        });
+        if status != "granted" {
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label("Grant it, then Re-check.");
+                if status == "unknown" && ui.button("I granted it").clicked() {
+                    match which {
+                        Permission::InputMonitoring => self.onboarding.input_monitoring_ack = true,
+                        Permission::Accessibility => self.onboarding.accessibility_ack = true,
+                    }
+                    self.persist_onboarding();
+                }
+            });
+        }
+    }
+
     /// Content area for `Screen::App`: section heading + muted description
     /// (UX pass 2), Reload/Save row (Save is the primary accent-filled
     /// action), the staged-config notice, then the selected section.
@@ -1448,6 +1623,7 @@ impl ShellApp {
             Section::Dictation => self.ui_dictation_section(&mut cfg, ui),
             Section::Audio => self.ui_audio_section(&mut cfg, ui),
             Section::Cleanup => self.ui_cleanup_section(&mut cfg, ui),
+            Section::Models => self.ui_models_section(&mut cfg, ui),
             Section::Dictionary => self.ui_dictionary_section(ui),
             Section::Advanced => self.ui_advanced_section(&mut cfg, ui),
         }
@@ -1456,6 +1632,19 @@ impl ShellApp {
 }
 
 impl eframe::App for ShellApp {
+    // eframe's default clear color is opaque (`visuals.panel_fill`) and is used
+    // to clear every viewport's swapchain surface each frame, including the
+    // overlay viewport — even though its `ViewportBuilder` sets
+    // `.with_transparent(true)`. An opaque clear paints a solid square behind
+    // the overlay before the rounded capsule is drawn on top of it, so make the
+    // clear itself transparent. This is safe for the main settings window too:
+    // its content is drawn inside eframe's default `CentralPanel`, which paints
+    // its own opaque `panel_fill` rect covering the whole window regardless of
+    // the clear color, so this only actually matters for the overlay viewport.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
+    }
+
     // Non-painting work (eframe 0.35 splits `logic` from `ui`): drain background
     // channels and handle the window-close request here, where the `Context` is
     // available.
@@ -1463,6 +1652,13 @@ impl eframe::App for ShellApp {
         self.drain_ws();
         self.drain_menu_events(ctx);
         self.poll_models_if_due();
+        self.poll_permissions_if_due();
+
+        // Drive the floating overlay viewport here (not in `ui()`): `logic` runs
+        // every frame regardless of the main window's visibility, while `ui` is
+        // skipped whenever the window is hidden (close-to-tray steady state) —
+        // and the overlay must still appear while dictating with no window open.
+        self.show_overlay(ctx);
 
         // Close-to-tray: hide the window instead of quitting (D-0013 §6).
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -1476,11 +1672,6 @@ impl eframe::App for ShellApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Drive the floating overlay viewport before the main window UI (it is a
-        // sibling viewport, not nested in these panels).
-        let ctx = ui.ctx().clone();
-        self.show_overlay(&ctx);
-
         // Startup gate (D-0015): once past onboarding, a missing *required* model blocks
         // normal use — reappears any time `GET /v1/models` (polled every few seconds, plus
         // live `model.download` events) shows it missing again, e.g. after an accidental
@@ -1513,6 +1704,11 @@ impl eframe::App for ShellApp {
             .frame(theme::content_frame())
             .show(ui, |ui| {
                 self.ui_recording_banner(ui);
+                // Onboarding has its own inline live-status + deep-link flow per step (below);
+                // showing the summary banner there too would just duplicate it.
+                if self.screen != Screen::Onboarding {
+                    self.ui_permissions_banner(ui);
+                }
                 egui::ScrollArea::vertical().show(ui, |ui| match self.screen {
                     Screen::Onboarding => self.ui_onboarding(ui),
                     Screen::App if gate_active => self.ui_model_gate(ui),

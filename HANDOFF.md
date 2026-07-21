@@ -79,12 +79,26 @@ D-0004..D-0015 in DECISIONS.md.
     download host, and re-verifying the Qwen3-8B SHA-256 against a live
     HuggingFace fetch (only checked against the on-disk repo copy this session)
     were all explicitly deferred — see D-0015.
+11. **D-0016 not manually verified end-to-end:** the FFI (`whisper-platform::permission`)
+    was exercised on a real macOS host in this session (both queries returned
+    `Granted`) and every gate (build/test/clippy, default + `--features
+    platform`) passed, but the actual triggering scenario — reinstall an
+    ad-hoc-signed build, watch macOS drop the grant, confirm whisperd's
+    preflight + the tray banner catch it — was not (and cannot be, without a
+    real reinstall cycle) reproduced this session. Also not independently
+    reviewed (single-agent pass, same caveat as item 9).
 
 ## Known issues / assumptions
 - Managed-daemon orphaning: if the tray dies abnormally (not Quit), the child
   whisperd survives until the next launch adopts it (accepted MVP risk, D-0014).
 - Ad-hoc signing only: first launch of Whisper.app needs right-click → Open
-  (Gatekeeper); no Developer ID / notarization (deferred).
+  (Gatekeeper); no Developer ID / notarization (deferred). It can also silently
+  drop the Input Monitoring/Accessibility TCC grants on reinstall — **D-0016**
+  (2026-07-11) closes the silent-failure gap this caused (whisperd now
+  preflights the grant and the tray shows a persistent banner + deep-link), but
+  the underlying ad-hoc-signing churn itself is unchanged, so re-granting after
+  an update is still a manual step (see `docs/install.md` "After updating the
+  app"). Not yet manually verified against a real ad-hoc-reinstall grant drop.
 - Duplicate ggml symbol linker warnings (whisper-rs-sys + llama-cpp-2 both vendor
   ggml) — pre-existing, links fine; worth a dedup look later.
 - rdev maintenance is a watched risk (fallback: CGEventTap); Secure Input behavior

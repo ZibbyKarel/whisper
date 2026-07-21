@@ -163,6 +163,20 @@ pub struct ModelStatus {
     pub error: Option<String>,
 }
 
+/// `GET /v1/platform/permissions` body (`ARCHITECTURE.md` §5, D-0016): current macOS TCC grant
+/// status for the two permissions the hotkey/paste path needs, so a UI can detect a missing
+/// grant *proactively* (e.g. after an ad-hoc-signed reinstall drops it) instead of waiting for
+/// a downstream failure that may never surface (`rdev::listen` can return `Ok` with the grant
+/// missing — see D-0016). Under a non-`platform` build both fields are `"unknown"` — there is no
+/// macOS adapter to query.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlatformPermissionsDto {
+    /// `"granted" | "denied" | "unknown"` — Input Monitoring (the global hotkey listener).
+    pub input_monitoring: String,
+    /// `"granted" | "denied" | "unknown"` — Accessibility (synthesized paste).
+    pub accessibility: String,
+}
+
 /// `GET /v1/status` body: engine phase, resident models, active session, and effective
 /// profile (`ARCHITECTURE.md` §4).
 #[derive(Debug, Clone, Serialize)]
@@ -418,5 +432,20 @@ mod tests {
         let ev_v = serde_json::to_value(&err_ev).unwrap();
         assert_eq!(ev_v["phase"], "error");
         assert_eq!(ev_v["error"], "integrity check failed");
+    }
+
+    #[test]
+    fn platform_permissions_wire_shape() {
+        // Fixture mirrored in `whisper-ux/src/api.rs` (contract-mirror discipline, HANDOFF item
+        // 8) — a drift here must fail the mirrored test on the ux side too.
+        let dto = PlatformPermissionsDto {
+            input_monitoring: "denied".to_string(),
+            accessibility: "granted".to_string(),
+        };
+        let v = serde_json::to_value(&dto).unwrap();
+        assert_eq!(v["input_monitoring"], "denied");
+        assert_eq!(v["accessibility"], "granted");
+        // Exactly the two documented keys, no more.
+        assert_eq!(v.as_object().unwrap().len(), 2);
     }
 }

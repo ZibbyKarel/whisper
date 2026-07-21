@@ -18,7 +18,12 @@ pub struct OnboardingState {
     pub daemon_seen: bool,
     /// The user confirmed the microphone permission step.
     pub mic_ack: bool,
-    /// The user confirmed the accessibility permission step.
+    /// Input Monitoring is granted (D-0016): auto-set once `GET /v1/platform/permissions`
+    /// reports `"granted"`; falls back to a manual "I granted it" ack when the daemon reports
+    /// `"unknown"` (e.g. an older daemon build without the endpoint).
+    pub input_monitoring_ack: bool,
+    /// Accessibility is granted (D-0016): same auto-set-or-manual-fallback rule as
+    /// `input_monitoring_ack`.
     pub accessibility_ack: bool,
     /// A test dictation produced text at least once.
     pub test_dictation_done: bool,
@@ -34,6 +39,7 @@ impl OnboardingState {
     pub fn all_steps_done(&self) -> bool {
         self.daemon_seen
             && self.mic_ack
+            && self.input_monitoring_ack
             && self.accessibility_ack
             && self.test_dictation_done
             && self.models_ready
@@ -95,6 +101,7 @@ mod tests {
             completed: true,
             daemon_seen: true,
             mic_ack: true,
+            input_monitoring_ack: true,
             accessibility_ack: true,
             test_dictation_done: true,
             models_ready: true,
@@ -120,6 +127,7 @@ mod tests {
         let mut s = OnboardingState {
             daemon_seen: true,
             mic_ack: true,
+            input_monitoring_ack: true,
             accessibility_ack: true,
             test_dictation_done: false,
             completed: false,
@@ -131,10 +139,27 @@ mod tests {
     }
 
     #[test]
+    fn all_steps_done_requires_input_monitoring_ack() {
+        let mut s = OnboardingState {
+            daemon_seen: true,
+            mic_ack: true,
+            input_monitoring_ack: false,
+            accessibility_ack: true,
+            test_dictation_done: true,
+            completed: false,
+            models_ready: true,
+        };
+        assert!(!s.all_steps_done());
+        s.input_monitoring_ack = true;
+        assert!(s.all_steps_done());
+    }
+
+    #[test]
     fn all_steps_done_requires_models_ready() {
         let mut s = OnboardingState {
             daemon_seen: true,
             mic_ack: true,
+            input_monitoring_ack: true,
             accessibility_ack: true,
             test_dictation_done: true,
             completed: false,

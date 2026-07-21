@@ -19,6 +19,7 @@ pub mod language;
 pub mod models_ui;
 pub mod onboarding;
 pub mod overlay;
+pub mod permissions_ui;
 pub mod save_report;
 pub mod shell_settings;
 pub mod theme;

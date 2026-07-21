@@ -28,8 +28,9 @@ pub struct IconImage {
     pub width: u32,
     pub height: u32,
     /// macOS "template" images are recolored by the system for light/dark menu
-    /// bars. Only the monochrome idle glyph is a template; the colored state
-    /// glyphs (red/teal/amber) must keep their color, so they are not.
+    /// bars. No state currently uses this: idle is an explicit solid white
+    /// glyph (matching the app's dark theme) and the other states carry their
+    /// own colors (red/teal/amber), so all icons keep their literal RGB.
     pub template: bool,
 }
 
@@ -51,14 +52,15 @@ struct WaveformStyle {
 
 fn style_for(state: TrayState) -> WaveformStyle {
     match state {
-        // Idle: template-style — pure black, alpha carries the shape; macOS
-        // recolors it for light/dark menu bars.
+        // Idle: an explicit solid white glyph, matching the app's dark theme.
+        // Not a template image, so it trades away automatic light/dark
+        // menu-bar recoloring for a guaranteed-visible white waveform.
         TrayState::Idle => WaveformStyle {
-            rgb: [0x00, 0x00, 0x00],
+            rgb: [0xFF, 0xFF, 0xFF],
             opacity: 1.0,
             weight: 1.0,
             height_scale: 1.0,
-            template: true,
+            template: false,
             badge: false,
         },
         // Recording: red, bolder and taller bars so the active state reads
@@ -311,20 +313,24 @@ mod tests {
     }
 
     #[test]
-    fn only_idle_is_a_template() {
-        assert!(render(TrayState::Idle).template);
+    fn no_state_is_a_template_icon() {
+        assert!(!render(TrayState::Idle).template);
         assert!(!render(TrayState::Recording).template);
         assert!(!render(TrayState::Processing).template);
         assert!(!render(TrayState::Error).template);
     }
 
     #[test]
-    fn idle_is_grayscale_with_alpha_only() {
+    fn idle_is_solid_white() {
         let img = render(TrayState::Idle);
         for px in img.rgba.chunks_exact(4) {
-            assert_eq!(px[0], px[1]);
-            assert_eq!(px[1], px[2]);
-            assert_eq!(px[0], 0, "idle glyph must be pure black, alpha-only");
+            if px[3] == 255 {
+                assert_eq!(
+                    [px[0], px[1], px[2]],
+                    [0xFF, 0xFF, 0xFF],
+                    "idle glyph's opaque pixels must be pure white"
+                );
+            }
         }
     }
 
