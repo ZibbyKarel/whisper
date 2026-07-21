@@ -48,8 +48,20 @@ macOS permission grants (Microphone, Input Monitoring, Accessibility).
 Default hotkey is **Ctrl+Alt** (push-to-talk, hold to record). Configure hotkeys,
 language, and cleanup behavior in the tray's Settings.
 
-To build a distributable `.app`/DMG instead: `scripts/package.sh` (see
-`docs/install.md`).
+## Building the .app / DMG
+
+```bash
+scripts/package.sh                # build Whisper.app + dist/Whisper.dmg
+scripts/package.sh --link-models   # also symlink repo models/ into the app-support
+                                    # dir + write a starter config (dev convenience)
+```
+
+This builds `whisperd` and `whisper-tray` in release mode, assembles `dist/Whisper.app`
+(menu-bar only, no Dock icon), ad-hoc signs it, and wraps it in `dist/Whisper.dmg`.
+Models are **not** bundled (multi-GB) — they're downloaded in-app on first run.
+
+There's no Developer ID / notarization yet, so the first launch is Gatekeeper-blocked:
+right-click → Open. See `docs/install.md` for the full install/update walkthrough.
 
 ## Using it headlessly
 
