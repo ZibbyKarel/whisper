@@ -13,6 +13,7 @@
 //! prompt (strict contract + few-shot examples), not the trait. Re-measured against Ollama by
 //! `tests/cleanup_trap_safety.rs` (the D-0017 evidence-transfer guard).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -45,6 +46,17 @@ pub struct OllamaCleanupEngine {
     model: Arc<RwLock<String>>,
     keep_alive: String,
     health: Arc<RwLock<CleanupHealth>>,
+    /// True while a background warm-up is in flight; further requests are dropped.
+    warming: Arc<AtomicBool>,
+}
+
+/// Clears the `warming` flag when the warm-up thread exits (even on panic).
+struct WarmingGuard(Arc<AtomicBool>);
+
+impl Drop for WarmingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl OllamaCleanupEngine {
@@ -59,6 +71,7 @@ impl OllamaCleanupEngine {
             model,
             keep_alive,
             health,
+            warming: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -88,18 +101,32 @@ impl OllamaCleanupEngine {
         if model.trim().is_empty() {
             return;
         }
+        if self
+            .warming
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let guard = WarmingGuard(self.warming.clone());
         let client = self.client.clone();
         let keep_alive = self.keep_alive.clone();
         let health = self.health.clone();
-        std::thread::spawn(move || match client.load(&model, &keep_alive) {
-            Ok(()) => set_health(&health, true, None),
-            Err(e) => set_health(&health, false, Some(e.to_string())),
+        std::thread::spawn(move || {
+            let _guard = guard;
+            match client.load(&model, &keep_alive) {
+                Ok(()) => set_health(&health, true, None),
+                Err(e) => set_health(&health, false, Some(e.to_string())),
+            }
         });
     }
 
-    fn fail(&self, msg: String) -> CleanupError {
+    /// Record a failure; `rewarm` retries the model load (transport/HTTP errors only).
+    fn fail(&self, msg: String, rewarm: bool) -> CleanupError {
         set_health(&self.health, false, Some(msg.clone()));
-        self.warm_up_async();
+        if rewarm {
+            self.warm_up_async();
+        }
         CleanupError::Failed(msg)
     }
 }
@@ -118,13 +145,13 @@ impl CleanupEngine for OllamaCleanupEngine {
             CHAT_TIMEOUT,
         ) {
             Ok(raw) => raw,
-            Err(e) => return Err(self.fail(e.to_string())),
+            Err(e) => return Err(self.fail(e.to_string(), true)),
         };
         // NFC boundary (§3.3): keep Czech diacritics byte-stable.
         let cleaned: String = strip_think(&raw).nfc().collect();
         let cleaned = cleaned.trim().to_string();
         if cleaned.is_empty() {
-            return Err(self.fail("empty cleanup output".to_string()));
+            return Err(self.fail("empty cleanup output".to_string(), false));
         }
         set_health(&self.health, true, None);
         Ok(cleaned)
@@ -345,6 +372,36 @@ mod tests {
         let h = health.read().unwrap().clone();
         assert!(!h.ready);
         assert!(h.error.is_some());
+    }
+
+    #[test]
+    fn empty_output_does_not_rewarm_and_error_persists() {
+        // Only one reply is served: a warm-up would fail or be refused, but a success would
+        // flip health to ready. Either way the empty-output error must stay visible.
+        let (url, _rx) = serve_chat(vec!["<think>x</think>"]);
+        let (e, _, health) = engine(url, "qwen3-vl:8b-instruct");
+        assert!(e.clean("Ahoj světe.", &ctx()).is_err());
+        std::thread::sleep(Duration::from_millis(300));
+        let h = health.read().unwrap().clone();
+        assert!(!h.ready);
+        assert_eq!(h.error.as_deref(), Some("empty cleanup output"));
+    }
+
+    #[test]
+    fn concurrent_prepare_spawns_one_warm_up() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (e, _, _) = engine(url, "qwen3-vl:8b-instruct");
+        for _ in 0..5 {
+            e.prepare();
+        }
+        listener.set_nonblocking(true).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let mut accepted = Vec::new();
+        while let Ok((stream, _)) = listener.accept() {
+            accepted.push(stream); // hold open: never reply
+        }
+        assert_eq!(accepted.len(), 1);
     }
 
     #[test]
