@@ -11,6 +11,7 @@ pub mod api;
 pub mod config;
 pub mod handlers;
 pub mod models;
+pub mod ollama;
 #[cfg(feature = "platform")]
 pub mod platform;
 pub mod state;
@@ -39,7 +40,7 @@ use self::state::{AppState, DictionaryState};
 use self::store::SessionStore;
 use self::worker::{null_sink_builder, BuildCtx, EngineBuilder, LangInjectingStt, ResidentEngines};
 use crate::ollama::OllamaClient;
-use crate::{CleanupHealth, OllamaCleanupEngine, SileroVad, WhisperCppEngine};
+use crate::{OllamaCleanupEngine, SileroVad, WhisperCppEngine};
 
 /// Broadcast backlog per WS subscriber before it starts lagging (best-effort, `ARCHITECTURE.md`
 /// §4: a lagging client may drop events; the authoritative result is `GET /v1/sessions/{id}`).
@@ -144,6 +145,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/platform/permissions",
             get(handlers::platform_permissions),
         )
+        .route("/v1/ollama", get(handlers::get_ollama))
+        .route("/v1/ollama/start", post(handlers::start_ollama))
         .route("/v1/events", get(ws_events))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -330,22 +333,20 @@ fn resolve_history_path(config: &Config) -> PathBuf {
 }
 
 /// Factory for the production engine set (`ARCHITECTURE.md` §3.1: heavy native adapters live in
-/// this crate). Loads whisper.cpp (D-0004) and, if configured, the Ollama cleanup engine (D-0017); the
-/// STT is wrapped so `/v1/config` `language` reaches decoding. A cleanup failure degrades to
+/// this crate). Loads whisper.cpp (D-0004) and builds the Ollama cleanup engine (D-0017); the
+/// STT is wrapped so `/v1/config` `language` reaches decoding. The cleanup engine is always
+/// constructed (even when Ollama is down or the model is empty): a cleanup failure degrades to
 /// dictionary text rather than failing the daemon (`ARCHITECTURE.md` §3.2).
-pub fn production_engine_builder(
-    stt_path: PathBuf,
-    cleanup_path: Option<PathBuf>,
-) -> EngineBuilder {
+pub fn production_engine_builder(stt_path: PathBuf, cleanup: CleanupConfig) -> EngineBuilder {
     // Headless default: delivery is "available via the API".
-    production_engine_builder_with_sink(stt_path, cleanup_path, null_sink_builder())
+    production_engine_builder_with_sink(stt_path, cleanup, null_sink_builder())
 }
 
 /// Like [`production_engine_builder`] but with an explicit delivery [`SinkBuilder`](worker::SinkBuilder)
 /// — the seam the `platform` feature uses to install the pasteboard sink (D-0012).
 pub fn production_engine_builder_with_sink(
     stt_path: PathBuf,
-    cleanup_path: Option<PathBuf>,
+    cleanup: CleanupConfig,
     sink_builder: worker::SinkBuilder,
 ) -> EngineBuilder {
     let stt_label = file_label(&stt_path);
@@ -353,21 +354,15 @@ pub fn production_engine_builder_with_sink(
         let stt = WhisperCppEngine::load(&stt_path).map_err(|e| e.to_string())?;
         let lang_stt = LangInjectingStt::new(Box::new(stt), ctx.lang.clone());
 
-        let (cleanup, cleanup_model_label) = if cleanup_path.is_some() {
-            let cfg = CleanupConfig::default();
-            let engine = OllamaCleanupEngine::new(
-                OllamaClient::new(cfg.ollama_url.clone()),
-                Arc::new(RwLock::new(cfg.model.clone())),
-                cfg.keep_alive.clone(),
-                Arc::new(RwLock::new(CleanupHealth::default())),
-            );
-            (
-                Some(Rc::new(engine) as Rc<dyn CleanupEngine>),
-                Some(cfg.model),
-            )
-        } else {
-            (None, None)
-        };
+        let engine = OllamaCleanupEngine::new(
+            OllamaClient::new(cleanup.ollama_url.clone()),
+            ctx.cleanup_model.clone(),
+            cleanup.keep_alive.clone(),
+            ctx.cleanup_health.clone(),
+        );
+        // Load the model in the background so the first utterance does not pay for it; a no-op
+        // when the model is empty (cleanup off).
+        engine.warm_up_async();
 
         // Read the shared VAD tuning each session, so a `/v1/config` `[vad]` edit applies to the
         // next session's VAD without a restart (D-0008).
@@ -382,9 +377,7 @@ pub fn production_engine_builder_with_sink(
         Ok(ResidentEngines {
             stt: Rc::new(lang_stt),
             stt_model_label: stt_label.clone(),
-            cleanup,
-            cleanup_model_label,
-            cleanup_load_error: None,
+            cleanup: Some(Rc::new(engine) as Rc<dyn CleanupEngine>),
             vad_builder,
             sink_builder,
         })

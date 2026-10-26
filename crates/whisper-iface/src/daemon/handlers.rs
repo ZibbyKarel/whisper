@@ -15,13 +15,18 @@ use tokio::sync::oneshot;
 use whisper_core::dictionary::Dictionary;
 use whisper_core::session::CancellationToken;
 
+use crate::cleanup::CleanupHealth;
+use crate::ollama::{is_loopback_url, OllamaClient};
+
 use super::api::{
     ApiEvent, AudioRequest, ConfigUpdateResponse, ErrorBody, ErrorEnvelope, HealthResponse,
-    ModelEntryDto, ModelProgressDto, ModelStatus, ModelsListResponse, PlatformPermissionsDto,
-    SessionAccepted, SessionRecord, SessionStatusDto, SourceKind, StatusResponse,
+    ModelEntryDto, ModelProgressDto, ModelStatus, ModelsListResponse, OllamaStatusDto,
+    PlatformPermissionsDto, SessionAccepted, SessionRecord, SessionStatusDto, SourceKind,
+    StatusResponse,
 };
 use super::config::{Config, DeliveryMode};
 use super::models::{self, DownloadProgress};
+use super::ollama as ollama_probe;
 use super::state::{
     now_ms, AppState, CaptureControl, EnginePhase, Job, JobAudio, LiveSourceCtx, SinkKind,
 };
@@ -105,8 +110,28 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
 pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let s = state.status.read().expect("status lock").clone();
     let cfg = state.config.read().expect("config lock").clone();
+    // Cleanup readiness is live (the engine updates it after every warm-up / utterance), so the
+    // phase is derived here rather than fixed once at startup (D-0017).
+    let model = state
+        .cleanup_model
+        .read()
+        .expect("cleanup model lock")
+        .clone();
+    let health = state
+        .cleanup_health
+        .read()
+        .expect("cleanup health lock")
+        .clone();
+    let enabled = !model.trim().is_empty();
+    // A pending first warm-up (not ready, no error) is not a failure: STT already works.
+    let degraded = enabled && !health.ready && health.error.is_some();
+    let phase = if s.phase == EnginePhase::Ready && degraded {
+        EnginePhase::Degraded
+    } else {
+        s.phase
+    };
     Json(StatusResponse {
-        phase: s.phase.as_str().to_string(),
+        phase: phase.as_str().to_string(),
         version: state.version.clone(),
         uptime_ms: state.started.elapsed().as_millis() as u64,
         active_session: state.active_session(),
@@ -116,9 +141,9 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
             error: s.stt_error,
         },
         cleanup: ModelStatus {
-            ready: s.cleanup_ready,
-            model: s.cleanup_model,
-            error: s.cleanup_error,
+            ready: enabled && health.ready,
+            model: enabled.then_some(model),
+            error: if enabled { health.error } else { None },
         },
         cleanup_mode: cfg.cleanup_mode,
         language: cfg.language,
@@ -371,6 +396,19 @@ pub async fn put_config(
             // next session (no restart) — hence `applied`, not `staged` (D-0008).
             *state.vad.write().expect("vad lock") = new.vad.to_vad_config();
             applied.push("vad".to_string());
+        }
+        if new.cleanup.model != cur.cleanup.model {
+            // The engine reads the shared tag per utterance, so a swap needs no restart. Health
+            // described the old model; reset it so status does not report stale readiness.
+            *state.cleanup_model.write().expect("cleanup model lock") = new.cleanup.model.clone();
+            *state.cleanup_health.write().expect("cleanup health lock") = CleanupHealth::default();
+            applied.push("cleanup.model".to_string());
+        }
+        if new.cleanup.ollama_url != cur.cleanup.ollama_url
+            || new.cleanup.keep_alive != cur.cleanup.keep_alive
+        {
+            // The Ollama client and keep-alive are fixed when the engine is built.
+            staged.push("cleanup".to_string());
         }
         if new.audio != cur.audio {
             // The capture stream (and its AGC) is built once at startup; a change needs a restart.
@@ -659,4 +697,87 @@ fn wav_bytes_to_mono_f32(bytes: &[u8]) -> Result<Vec<f32>, hound::Error> {
     } else {
         Ok(samples)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Local Ollama (D-0017): GET /v1/ollama, POST /v1/ollama/start
+// ---------------------------------------------------------------------------
+
+/// Probe the configured Ollama URL (blocking: a 2 s version request plus filesystem checks).
+fn ollama_status_blocking(url: &str) -> OllamaStatusDto {
+    let probe = ollama_probe::probe(&OllamaClient::new(url));
+    OllamaStatusDto {
+        can_start: probe.installed && !probe.running && is_loopback_url(url),
+        installed: probe.installed,
+        running: probe.running,
+        version: probe.version,
+        url: url.to_string(),
+    }
+}
+
+fn ollama_url(state: &AppState) -> String {
+    state
+        .config
+        .read()
+        .expect("config lock")
+        .cleanup
+        .ollama_url
+        .clone()
+}
+
+/// `GET /v1/ollama`: installed / running / version at `cleanup.ollama_url`, plus `can_start`.
+pub async fn get_ollama(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<OllamaStatusDto>, ApiErr> {
+    let url = ollama_url(&state);
+    let dto = tokio::task::spawn_blocking(move || ollama_status_blocking(&url))
+        .await
+        .map_err(|e| ApiErr::internal(format!("ollama probe: {e}")))?;
+    Ok(Json(dto))
+}
+
+/// `POST /v1/ollama/start`: launch a local Ollama (`202`, started in the background; the result
+/// arrives as an `ollama.status` WS event) or `409` when it cannot/need not be started.
+pub async fn start_ollama(State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiErr> {
+    let url = ollama_url(&state);
+    let probe_url = url.clone();
+    let dto = tokio::task::spawn_blocking(move || ollama_status_blocking(&probe_url))
+        .await
+        .map_err(|e| ApiErr::internal(format!("ollama probe: {e}")))?;
+    if !dto.can_start {
+        return Err(ApiErr::new(
+            StatusCode::CONFLICT,
+            "ollama_not_startable",
+            "ollama is not installed locally, is already running, or the configured url is not loopback",
+        ));
+    }
+
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new(url.as_str());
+            let path_env = std::env::var("PATH").ok();
+            let outcome = match ollama_probe::find_installation(path_env.as_deref(), |p| p.exists())
+            {
+                Some(inst) => ollama_probe::start(&inst, &client),
+                None => Err("ollama is not installed".to_string()),
+            };
+            if let Err(e) = outcome {
+                eprintln!("whisperd: ollama start failed: {e}");
+            }
+            ollama_status_blocking(&url)
+        })
+        .await;
+        if let Ok(dto) = result {
+            let _ = state.events.send(ApiEvent::OllamaStatus {
+                installed: dto.installed,
+                running: dto.running,
+                version: dto.version,
+                url: dto.url,
+                can_start: dto.can_start,
+                ts_ms: now_ms(),
+            });
+        }
+    });
+
+    Ok(StatusCode::ACCEPTED)
 }

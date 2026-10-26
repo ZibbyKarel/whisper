@@ -90,8 +90,6 @@ pub fn fake_builder() -> EngineBuilder {
             }),
             stt_model_label: "fake-stt".to_string(),
             cleanup: None,
-            cleanup_model_label: None,
-            cleanup_load_error: None,
             vad_builder: Box::new(|| Ok(Box::new(NoopVad::default()) as Box<dyn Vad>)),
             sink_builder: null_sink_builder(),
         })
@@ -108,8 +106,6 @@ pub fn fake_builder_with_cleanup() -> EngineBuilder {
             }),
             stt_model_label: "fake-stt".to_string(),
             cleanup: Some(Rc::new(IdentityCleanup)),
-            cleanup_model_label: Some("fake-cleanup".to_string()),
-            cleanup_load_error: None,
             vad_builder: Box::new(|| Ok(Box::new(NoopVad::default()) as Box<dyn Vad>)),
             sink_builder: null_sink_builder(),
         })
@@ -134,8 +130,6 @@ pub fn gate_builder() -> (
             }),
             stt_model_label: "gate-stt".to_string(),
             cleanup: None,
-            cleanup_model_label: None,
-            cleanup_load_error: None,
             vad_builder: Box::new(|| Ok(Box::new(NoopVad::default()) as Box<dyn Vad>)),
             sink_builder: null_sink_builder(),
         })
@@ -287,8 +281,6 @@ pub fn fake_builder_with_sink(
             }),
             stt_model_label: "fake-stt".to_string(),
             cleanup: None,
-            cleanup_model_label: None,
-            cleanup_load_error: None,
             vad_builder: Box::new(|| Ok(Box::new(NoopVad::default()) as Box<dyn Vad>)),
             sink_builder,
         })

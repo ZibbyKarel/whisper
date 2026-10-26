@@ -25,6 +25,7 @@ use super::api::{ApiEvent, SessionRecord};
 use super::config::Config;
 use super::models::DownloadRegistry;
 use super::store::SessionStore;
+use crate::cleanup::CleanupHealth;
 
 /// Unix-epoch milliseconds, the timestamp unit used across the `/v1` contract.
 pub fn now_ms() -> u64 {
@@ -111,7 +112,7 @@ pub type LiveSourceProvider = Box<dyn Fn(LiveSourceCtx) -> AudioSourceFactory + 
 pub enum EnginePhase {
     Loading,
     Ready,
-    /// STT up, cleanup LLM failed to load — the pipeline runs cleanup-off (`§3.2`).
+    /// STT up, cleanup (Ollama) unhealthy — the pipeline degrades to dictionary text (`§3.2`).
     Degraded,
     /// STT failed to load — sessions are rejected with a structured error.
     Unavailable,
@@ -135,9 +136,6 @@ pub struct EngineStatus {
     pub stt_ready: bool,
     pub stt_model: Option<String>,
     pub stt_error: Option<String>,
-    pub cleanup_ready: bool,
-    pub cleanup_model: Option<String>,
-    pub cleanup_error: Option<String>,
 }
 
 impl Default for EngineStatus {
@@ -147,9 +145,6 @@ impl Default for EngineStatus {
             stt_ready: false,
             stt_model: None,
             stt_error: None,
-            cleanup_ready: false,
-            cleanup_model: None,
-            cleanup_error: None,
         }
     }
 }
@@ -199,6 +194,11 @@ pub struct AppState {
     pub vad: std::sync::Arc<RwLock<VadConfig>>,
     pub store: SessionStore,
     pub status: RwLock<EngineStatus>,
+    /// Effective cleanup model tag (empty = cleanup off), shared with the Ollama cleanup engine
+    /// so a `/v1/config` model edit applies to the next utterance (D-0017).
+    pub cleanup_model: Arc<RwLock<String>>,
+    /// Live cleanup readiness written by the cleanup engine; `/v1/status` reads it per request.
+    pub cleanup_health: Arc<RwLock<CleanupHealth>>,
     /// App-support data dir (`ARCHITECTURE.md` §6, D-0014) — the root that model provisioning
     /// (D-0015) downloads into (`data_dir/models/<filename>`), mirroring `resolve_model_paths`'s
     /// rebase target.
@@ -223,6 +223,7 @@ impl AppState {
         live_source: Option<LiveSourceProvider>,
         data_dir: PathBuf,
     ) -> Self {
+        let cleanup_model = Arc::new(RwLock::new(config.cleanup.model.clone()));
         Self {
             started: Instant::now(),
             version,
@@ -240,6 +241,8 @@ impl AppState {
             vad,
             store,
             status: RwLock::new(EngineStatus::default()),
+            cleanup_model,
+            cleanup_health: Arc::new(RwLock::new(CleanupHealth::default())),
             data_dir,
             model_downloads: Arc::new(DownloadRegistry::default()),
             id_counter: AtomicU64::new(0),

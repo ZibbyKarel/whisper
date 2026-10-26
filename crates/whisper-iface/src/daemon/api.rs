@@ -364,6 +364,28 @@ pub enum ApiEvent {
         error: Option<String>,
         ts_ms: u64,
     },
+    /// The local Ollama server's state changed (D-0017): emitted when a `POST /v1/ollama/start`
+    /// finishes, whether or not the server came up.
+    #[serde(rename = "ollama.status")]
+    OllamaStatus {
+        installed: bool,
+        running: bool,
+        version: Option<String>,
+        url: String,
+        can_start: bool,
+        ts_ms: u64,
+    },
+}
+
+/// `GET /v1/ollama` body (D-0017): whether a local Ollama is installed/running at the configured
+/// `cleanup.ollama_url`, and whether the daemon may start it (installed, not running, loopback URL).
+#[derive(Debug, Clone, Serialize)]
+pub struct OllamaStatusDto {
+    pub installed: bool,
+    pub running: bool,
+    pub version: Option<String>,
+    pub url: String,
+    pub can_start: bool,
 }
 
 /// Structured error envelope returned for every non-2xx response (`ARCHITECTURE.md` §3:
@@ -433,6 +455,64 @@ mod tests {
         let ev_v = serde_json::to_value(&err_ev).unwrap();
         assert_eq!(ev_v["phase"], "error");
         assert_eq!(ev_v["error"], "integrity check failed");
+    }
+
+    #[test]
+    fn ollama_status_dto_wire_shape() {
+        // Fixture mirrored in `whisper-ux/src/api.rs` (Task 7): drift must fail both sides.
+        let running = OllamaStatusDto {
+            installed: true,
+            running: true,
+            version: Some("0.12.3".to_string()),
+            url: "http://127.0.0.1:11434".to_string(),
+            can_start: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&running).unwrap(),
+            serde_json::json!({
+                "installed": true,
+                "running": true,
+                "version": "0.12.3",
+                "url": "http://127.0.0.1:11434",
+                "can_start": false
+            })
+        );
+        // `version` is an explicit null when the server is not answering.
+        let stopped = OllamaStatusDto {
+            installed: true,
+            running: false,
+            version: None,
+            url: "http://127.0.0.1:11434".to_string(),
+            can_start: true,
+        };
+        let v = serde_json::to_value(&stopped).unwrap();
+        assert!(v["version"].is_null());
+        assert_eq!(v["can_start"], true);
+        assert_eq!(v.as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn ollama_status_event_wire_shape() {
+        let ev = ApiEvent::OllamaStatus {
+            installed: true,
+            running: true,
+            version: Some("0.12.3".to_string()),
+            url: "http://127.0.0.1:11434".to_string(),
+            can_start: false,
+            ts_ms: 42,
+        };
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            serde_json::json!({
+                "type": "ollama.status",
+                "installed": true,
+                "running": true,
+                "version": "0.12.3",
+                "url": "http://127.0.0.1:11434",
+                "can_start": false,
+                "ts_ms": 42
+            })
+        );
     }
 
     #[test]

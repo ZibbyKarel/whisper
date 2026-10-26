@@ -31,6 +31,7 @@ use super::api::{
     skip_reason_str, ApiEvent, CleanupInfo, LatencyInfo, SessionRecord, SessionStatusDto,
 };
 use super::state::{now_ms, AppState, EnginePhase, Job, JobAudio, SinkKind};
+use crate::cleanup::CleanupHealth;
 
 /// Context handed to the engine builder so it can wire runtime-configurable knobs into the
 /// resident engines without rebuilding them later (e.g. STT language, D-0004 `-l cs`).
@@ -41,6 +42,11 @@ pub struct BuildCtx {
     /// Shared VAD tuning; the per-session `vad_builder` reads it each session, so a `/v1/config`
     /// `[vad]` edit takes effect on the next session without a restart (D-0008).
     pub vad: Arc<RwLock<whisper_core::vad::VadConfig>>,
+    /// Shared cleanup model tag (empty = off); the Ollama cleanup engine reads it per utterance
+    /// so a `/v1/config` model edit applies without a restart (D-0017).
+    pub cleanup_model: Arc<RwLock<String>>,
+    /// Live cleanup readiness the engine writes and `/v1/status` reads.
+    pub cleanup_health: Arc<RwLock<CleanupHealth>>,
 }
 
 /// The resident engines the worker keeps loaded for the process lifetime. STT is required;
@@ -50,10 +56,6 @@ pub struct ResidentEngines {
     pub stt: Rc<dyn SttEngine>,
     pub stt_model_label: String,
     pub cleanup: Option<Rc<dyn CleanupEngine>>,
-    pub cleanup_model_label: Option<String>,
-    /// Populated when a cleanup model was configured but failed to load — the daemon degrades
-    /// to cleanup-off and reports the reason in `/v1/status` (`ARCHITECTURE.md` §3.2).
-    pub cleanup_load_error: Option<String>,
     /// Builds a fresh VAD per session (segmenter/buffer state must start clean each time).
     pub vad_builder: Box<dyn Fn() -> Result<Box<dyn Vad>, String>>,
     /// Builds the delivery sink for a session's [`SinkKind`] (D-0012). The default (headless)
@@ -94,11 +96,18 @@ pub fn spawn_weak(
                 let Some(state) = state.upgrade() else { return };
                 let lang = state.lang.clone();
                 let vad = state.vad.clone();
+                let cleanup_model = state.cleanup_model.clone();
+                let cleanup_health = state.cleanup_health.clone();
                 state.emit(ApiEvent::ModelLoading {
                     model: "stt".to_string(),
                     ts_ms: now_ms(),
                 });
-                match builder(BuildCtx { lang, vad }) {
+                match builder(BuildCtx {
+                    lang,
+                    vad,
+                    cleanup_model,
+                    cleanup_health,
+                }) {
                     Ok(engines) => {
                         update_status_ready(&state, &engines);
                         Some(engines)
@@ -131,35 +140,15 @@ fn update_status_ready(state: &AppState, engines: &ResidentEngines) {
     let mut status = state.status.write().expect("status lock");
     status.stt_ready = true;
     status.stt_model = Some(engines.stt_model_label.clone());
-    status.cleanup_model = engines.cleanup_model_label.clone();
-    if engines.cleanup.is_some() {
-        status.cleanup_ready = true;
-        status.phase = EnginePhase::Ready;
-    } else if let Some(err) = &engines.cleanup_load_error {
-        status.cleanup_error = Some(err.clone());
-        status.phase = EnginePhase::Degraded;
-    } else {
-        // Cleanup deliberately disabled (no model configured) — a supported profile (D-0005).
-        status.phase = EnginePhase::Ready;
-    }
+    // Cleanup health is live (the `status` handler derives `Degraded` from it), so STT being up
+    // is all the worker decides here.
+    status.phase = EnginePhase::Ready;
     drop(status);
 
     state.emit(ApiEvent::ModelReady {
         model: "stt".to_string(),
         ts_ms: now_ms(),
     });
-    if engines.cleanup.is_some() {
-        state.emit(ApiEvent::ModelReady {
-            model: "cleanup".to_string(),
-            ts_ms: now_ms(),
-        });
-    } else if let Some(err) = &engines.cleanup_load_error {
-        state.emit(ApiEvent::ModelLoadFailed {
-            model: "cleanup".to_string(),
-            error: err.clone(),
-            ts_ms: now_ms(),
-        });
-    }
 }
 
 fn set_stt_unavailable(state: &AppState, err: &str) {

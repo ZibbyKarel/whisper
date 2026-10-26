@@ -101,9 +101,9 @@ pub fn pasteboard_sink_builder() -> SinkBuilder {
 /// as [`crate::production_engine_builder`], differing only in the delivery sink.
 pub fn platform_engine_builder(
     stt_path: std::path::PathBuf,
-    cleanup_path: Option<std::path::PathBuf>,
+    cleanup: super::config::CleanupConfig,
 ) -> EngineBuilder {
-    super::production_engine_builder_with_sink(stt_path, cleanup_path, pasteboard_sink_builder())
+    super::production_engine_builder_with_sink(stt_path, cleanup, pasteboard_sink_builder())
 }
 
 /// Start a live mic session synchronously (from the hotkey thread — outside the tokio runtime).

@@ -507,3 +507,147 @@ async fn opt_in_history_writes_sqlite_and_reports_enabled() {
 
     let _ = std::fs::remove_file(&db);
 }
+
+// ---------------------------------------------------------------------------
+// Ollama-backed cleanup wiring (D-0017): live status, runtime model swap, /v1/ollama
+// ---------------------------------------------------------------------------
+
+/// A loopback URL nothing listens on (bind to get a free port, then drop the listener).
+fn dead_ollama_url() -> String {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    format!("http://127.0.0.1:{port}")
+}
+
+fn cfg_with_cleanup(url: &str, model: &str) -> Config {
+    let mut c = cfg(CleanupModeDto::Auto);
+    c.cleanup.ollama_url = url.to_string();
+    c.cleanup.model = model.to_string();
+    c
+}
+
+#[tokio::test]
+async fn get_ollama_reports_not_running_for_dead_url() {
+    let url = dead_ollama_url();
+    let (_state, router) = harness(cfg_with_cleanup(&url, "qwen3:8b"), fake_builder());
+    let (status, body) = call(&router, "GET", "/v1/ollama", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["running"], false);
+    assert!(body["version"].is_null());
+    assert_eq!(body["url"], url);
+    assert!(body["installed"].is_boolean());
+    // Not running is not startable unless it is installed; either way the field is a bool and
+    // a running server could never be startable.
+    assert!(body["can_start"].is_boolean());
+}
+
+#[tokio::test]
+async fn post_ollama_start_conflicts_for_non_loopback_url() {
+    let (_state, router) = harness(
+        cfg_with_cleanup("http://203.0.113.9:11434", "qwen3:8b"),
+        fake_builder(),
+    );
+    let (status, body) = call(&router, "POST", "/v1/ollama/start", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "ollama_not_startable");
+}
+
+#[tokio::test]
+async fn put_config_cleanup_model_applies_at_runtime() {
+    let (state, router) = harness(
+        cfg_with_cleanup(&dead_ollama_url(), "qwen3-vl:8b-instruct"),
+        fake_builder(),
+    );
+    let mut new = state.config.read().unwrap().clone();
+    new.cleanup.model = "qwen3:8b".to_string();
+    let (status, body) = call(
+        &router,
+        "PUT",
+        "/v1/config",
+        Some(serde_json::to_value(&new).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let applied: Vec<String> = serde_json::from_value(body["applied"].clone()).unwrap();
+    assert!(applied.contains(&"cleanup.model".to_string()));
+    assert_eq!(*state.cleanup_model.read().unwrap(), "qwen3:8b");
+    let (_s, sbody) = call(&router, "GET", "/v1/status", None).await;
+    assert_eq!(sbody["cleanup"]["model"], "qwen3:8b");
+
+    // Empty model turns cleanup off: no model reported.
+    new.cleanup.model = String::new();
+    let (status, _) = call(
+        &router,
+        "PUT",
+        "/v1/config",
+        Some(serde_json::to_value(&new).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_s, sbody) = call(&router, "GET", "/v1/status", None).await;
+    assert!(sbody["cleanup"]["model"].is_null());
+    assert_eq!(sbody["cleanup"]["ready"], false);
+}
+
+#[tokio::test]
+async fn put_config_cleanup_url_and_keep_alive_are_staged() {
+    let (state, router) = harness(
+        cfg_with_cleanup(&dead_ollama_url(), "qwen3:8b"),
+        fake_builder(),
+    );
+    let mut new = state.config.read().unwrap().clone();
+    new.cleanup.keep_alive = "5m".to_string();
+    let (_s, body) = call(
+        &router,
+        "PUT",
+        "/v1/config",
+        Some(serde_json::to_value(&new).unwrap()),
+    )
+    .await;
+    let applied: Vec<String> = serde_json::from_value(body["applied"].clone()).unwrap();
+    let staged: Vec<String> = serde_json::from_value(body["staged"].clone()).unwrap();
+    assert!(staged.contains(&"cleanup".to_string()));
+    assert!(!applied.contains(&"cleanup.model".to_string()));
+}
+
+#[tokio::test]
+async fn status_reflects_last_cleanup_failure() {
+    let (state, router) = harness(
+        cfg_with_cleanup(&dead_ollama_url(), "qwen3:8b"),
+        fake_builder(),
+    );
+    // Pending first warm-up (not ready, no error) stays Ready: STT works.
+    let (_s, body) = call(&router, "GET", "/v1/status", None).await;
+    assert_eq!(body["phase"], "ready");
+    assert_eq!(body["cleanup"]["model"], "qwen3:8b");
+
+    *state.cleanup_health.write().unwrap() = whisper_iface::CleanupHealth {
+        ready: false,
+        error: Some("model 'x' not found".to_string()),
+    };
+    let (_s, body) = call(&router, "GET", "/v1/status", None).await;
+    assert_eq!(body["cleanup"]["error"], "model 'x' not found");
+    assert_eq!(body["cleanup"]["ready"], false);
+    assert_eq!(body["phase"], "degraded");
+
+    *state.cleanup_health.write().unwrap() = whisper_iface::CleanupHealth {
+        ready: true,
+        error: None,
+    };
+    let (_s, body) = call(&router, "GET", "/v1/status", None).await;
+    assert_eq!(body["cleanup"]["ready"], true);
+    assert_eq!(body["phase"], "ready");
+}
+
+#[tokio::test]
+async fn status_is_not_degraded_when_cleanup_is_off() {
+    let (state, router) = harness(cfg_with_cleanup(&dead_ollama_url(), ""), fake_builder());
+    *state.cleanup_health.write().unwrap() = whisper_iface::CleanupHealth {
+        ready: false,
+        error: Some("stale".to_string()),
+    };
+    let (_s, body) = call(&router, "GET", "/v1/status", None).await;
+    assert_eq!(body["phase"], "ready");
+    assert!(body["cleanup"]["error"].is_null());
+}

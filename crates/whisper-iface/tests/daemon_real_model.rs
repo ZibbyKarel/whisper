@@ -27,8 +27,13 @@ async fn real_daemon_transcribes_czech_fixture() {
         cleanup_mode: whisper_iface::daemon::api::CleanupModeDto::Never,
         ..Config::default()
     };
-    // STT only (no cleanup LLM) keeps the test light — the transcribe path is what we assert.
-    let builder = production_engine_builder(stt_model, None);
+    // STT only (empty cleanup model = cleanup off) keeps the test light — the transcribe path is
+    // what we assert.
+    let cleanup = whisper_iface::daemon::config::CleanupConfig {
+        model: String::new(),
+        ..Default::default()
+    };
+    let builder = production_engine_builder(stt_model, cleanup);
     let daemon = Daemon::start(config, None, builder, None)
         .await
         .expect("start daemon");
