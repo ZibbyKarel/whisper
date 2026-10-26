@@ -172,8 +172,11 @@ impl Pipeline {
             .expect("Idle->Recording is always valid");
         self.emit(PipelineEvent::SessionStarted);
         // Warm the cleanup backend while the user is still speaking.
-        if let Some(engine) = self.cleanup.as_ref().filter(|e| e.is_enabled()) {
-            engine.prepare();
+        // `Never` skips it: warming a model nobody will ask is pure cost.
+        if self.config.cleanup_mode != CleanupMode::Never {
+            if let Some(engine) = self.cleanup.as_ref().filter(|e| e.is_enabled()) {
+                engine.prepare();
+            }
         }
 
         let mut stream = match self.audio.start(audio_cfg) {

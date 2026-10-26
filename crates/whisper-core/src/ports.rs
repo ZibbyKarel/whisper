@@ -1,5 +1,5 @@
 //! Ports (traits): the only seams between the core engine and the outside world
-//! (`ARCHITECTURE.md` §3.1). Production adapters (cpal mic, whisper.cpp, llama.cpp,
+//! (`ARCHITECTURE.md` §3.1). Production adapters (cpal mic, whisper.cpp, Ollama client,
 //! pasteboard) live in `whisper-iface`/`whisper-platform`; test adapters (fixture WAV,
 //! canned STT, identity cleanup, capture sink) live in this crate's integration tests so
 //! CI stays hardware-free.
@@ -33,6 +33,8 @@ pub trait CleanupEngine {
     /// Called once when a session enters `Recording`, before capture frames are consumed —
     /// a hook to warm the backend (e.g. load a model) while the user is still speaking.
     /// Best-effort and infallible: a failure here surfaces later as a `clean` error.
+    /// Runs before audio capture starts, so it must return promptly: spawn any slow work
+    /// (model load, network) in the background instead of blocking.
     fn prepare(&self) {}
 
     /// Whether the engine is currently usable. `false` is treated exactly like no engine

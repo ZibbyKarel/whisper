@@ -2,7 +2,7 @@
 //! pass, and the ports (traits) that adapters implement.
 //!
 //! No UI/OS dependencies; see `ARCHITECTURE.md` §3 ("Core Engine") and D-0006. Production
-//! adapters (whisper.cpp, llama.cpp, cpal, pasteboard) live outside this crate
+//! adapters (whisper.cpp, Ollama client, cpal, pasteboard) live outside this crate
 //! (`whisper-iface`, `whisper-platform`); this crate depends only on the port traits, so
 //! it stays hardware-free and fully testable in CI with fixture audio (`ARCHITECTURE.md`
 //! §3.1). The session FSM and cancellation model are described in §3.2.

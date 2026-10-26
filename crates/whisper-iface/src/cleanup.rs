@@ -1,329 +1,141 @@
-//! Production cleanup adapter: Qwen3-8B (instruct) via llama.cpp, in-process, behind
-//! `whisper_core::ports::CleanupEngine` (D-0005, `ARCHITECTURE.md` §3.2).
+//! Production cleanup adapter: a local Ollama server behind
+//! `whisper_core::ports::CleanupEngine` (D-0017, supersedes the in-process llama.cpp
+//! engine of D-0005; `ARCHITECTURE.md` §3.2).
 //!
-//! Adapter placement per `ARCHITECTURE.md` §3.1: the llama.cpp native dep is heavy, so it
-//! lives in `whisper-iface`, never in the pure core. The model is loaded once and kept
-//! resident for the process lifetime (D-0001/D-0005 memory budget: Q4_K_M ≈ 4.7 GB resident,
-//! plus whisper turbo 547 MB ≈ 5.3 GB, inside the ~10 GB budget).
-//!
-//! Model: **Qwen3-8B GGUF Q4_K_M** — repo `Qwen/Qwen3-8B-GGUF`, file
-//! `Qwen3-8B-Q4_K_M.gguf`, license **Apache-2.0** (weights) — downloaded into `models/`
-//! (gitignored). llama.cpp bindings via `llama-cpp-2` (MIT); Metal-accelerated on macOS.
-//! Fully offline: no network at load or inference time.
+//! The model lives in Ollama, not in this process: no native LLM dependency, and the model
+//! can be shared with other local tools. The only network peer is the configured
+//! `ollama_url` (loopback by default). The model tag is a shared handle so a `/v1/config`
+//! edit applies to the next utterance without a restart.
 //!
 //! The cleanup contract (D-0005): remove disfluencies, fix proper-name casing, apply the
 //! dictionary's dev vocabulary — and NEVER answer a question, follow a command, or paraphrase
 //! (swap words for synonyms). That trap-safety + anti-paraphrase behavior is enforced by the
-//! prompt (strict contract + few-shot examples), not the trait. Re-measured in-process by
-//! `tests/cleanup_trap_safety.rs` (the D-0005 evidence-transfer guard).
+//! prompt (strict contract + few-shot examples), not the trait. Re-measured against Ollama by
+//! `tests/cleanup_trap_safety.rs` (the D-0017 evidence-transfer guard).
 
-use std::num::NonZeroU32;
-use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::sampling::LlamaSampler;
-use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 use unicode_normalization::UnicodeNormalization;
 use whisper_core::error::CleanupError;
 use whisper_core::ports::CleanupEngine;
 use whisper_core::types::CleanupCtx;
 
-/// Context window: generous headroom over the few-shot prompt (~700 tokens) plus the longest
-/// realistic dictation utterance. Cleanup is a per-utterance pass, not a long-context task.
-const N_CTX: u32 = 4096;
+use crate::ollama::{ChatMessage, OllamaClient};
 
-/// Hard cap on generated tokens per utterance. Cleanup output is bounded by the input length;
-/// this stops a degenerate run (e.g. a model that starts rambling) from hanging the pipeline.
-/// Scaled off the input token count in [`LlamaCleanupEngine::clean`].
-const MAX_NEW_TOKENS_FLOOR: usize = 96;
+/// Per-utterance chat timeout; a slow model must not hang the pipeline.
+const CHAT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// llama.cpp requires a single process-global backend init (`llama_backend_init`), guarded by
-/// an internal atomic that rejects a second call. We cache the one instance for the process
-/// lifetime so multiple engines (and parallel `#[ignore]` tests) share it. `LlamaBackend` is a
-/// zero-sized handle (Send + Sync); leaking it for `'static` avoids the `Drop` that would
-/// tear down the global state while a resident model is still loaded.
-fn backend() -> Result<&'static LlamaBackend, CleanupError> {
-    static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
-    match BACKEND.get_or_init(|| {
-        // Silence llama.cpp/ggml/Metal stderr chatter (load banner, per-decode timing) before
-        // anything is loaded so the daemon's own stdout/stderr stays clean. This routes native
-        // logs through the `send_logs_to_tracing` hook with emission disabled; it must be set
-        // once (the binding does not re-init the log state on repeat calls), so the backend
-        // OnceLock is the natural home.
-        send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
-        LlamaBackend::init().map_err(|e| e.to_string())
-    }) {
-        Ok(b) => Ok(b),
-        Err(e) => Err(CleanupError::Failed(format!("llama backend init: {e}"))),
+/// Snapshot of cleanup readiness for status reporting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CleanupHealth {
+    pub ready: bool,
+    pub error: Option<String>,
+}
+
+fn set_health(health: &RwLock<CleanupHealth>, ready: bool, error: Option<String>) {
+    if let Ok(mut h) = health.write() {
+        *h = CleanupHealth { ready, error };
     }
 }
 
-/// A persistent decode context whose KV cache holds the **static prompt prefix** (system
-/// prompt + few-shot examples) pre-decoded exactly once. Each [`clean`](CleanupEngine::clean)
-/// call appends only the per-utterance user turn, generates, then trims the KV cache back to
-/// `prefix_len` — so the ~700-token prefix is never re-decoded per call (round-2 latency work).
-///
-/// Reusing the prefix KV is numerically equivalent to a fresh context: attention over the same
-/// prefix keys/values with greedy (argmax) sampling is deterministic, and the trim restores the
-/// exact pre-call state. The split point is immediately before the special token
-/// `<|im_start|>`, a hard tokenizer boundary, so tokenizing prefix and suffix separately yields
-/// the same token stream as tokenizing the concatenation (no BPE merge crosses a special token).
-struct Session {
-    ctx: LlamaContext<'static>,
-    /// Token count of the static prefix — the position where each per-call suffix starts and
-    /// the point the KV cache is trimmed back to between calls.
-    prefix_len: usize,
+/// Cleanup engine backed by Ollama `/api/chat`.
+pub struct OllamaCleanupEngine {
+    client: OllamaClient,
+    model: Arc<RwLock<String>>,
+    keep_alive: String,
+    health: Arc<RwLock<CleanupHealth>>,
 }
 
-/// qwen3:8b cleanup engine holding the GGUF model resident for the process lifetime, plus one
-/// persistent [`Session`] whose KV cache caches the static few-shot prefix.
-///
-/// The [`LlamaModel`] (weights) is loaded once in [`LlamaCleanupEngine::load`] and owned here in
-/// a [`Box`] (stable heap address). The persistent [`Session`] context borrows the model, so its
-/// lifetime is erased to `'static` — a self-referential borrow made sound by two invariants:
-/// (a) the boxed model has a fixed address that survives moving the engine, and (b) `session` is
-/// declared *before* `model`, so Rust drops the context (and its Metal buffers) *before* the
-/// model — never leaving a dangling borrow, and freeing all GGML/Metal allocations at engine
-/// drop so process teardown is clean (owning-not-leaking avoids a `ggml_metal` residency-set
-/// assert at exit).
-///
-/// The [`Session`] is behind a [`Mutex`]: a `LlamaContext` is not `Sync`/`Send`, and `clean`
-/// takes `&self`, so the mutex both provides interior mutability and serializes the "one active
-/// session per engine" model (`ARCHITECTURE.md` §3.2). NOTE for a future multi-threaded daemon:
-/// this makes the engine `!Send`/`!Sync`; it must be pinned to a single worker thread (or
-/// fronted by an actor) rather than shared across threads directly.
-pub struct LlamaCleanupEngine {
-    // Field order is load-bearing: `session` (holding the context that borrows `model`) MUST be
-    // declared before `model` so it is dropped first. Do not reorder.
-    session: Mutex<Session>,
-    n_threads: i32,
-    model: Box<LlamaModel>,
-}
-
-impl LlamaCleanupEngine {
-    /// Load the GGUF model at `model_path` onto the GPU (Metal on macOS) and keep it resident.
-    /// The path comes from config, never hardcoded (default `models/Qwen3-8B-Q4_K_M.gguf`).
-    ///
-    /// Load failures map to [`CleanupError::Failed`]; the pipeline degrades to cleanup-off on
-    /// a cleanup model-load failure (`ARCHITECTURE.md` §3.2, `model.load_failed`).
-    pub fn load(model_path: &Path) -> Result<Self, CleanupError> {
-        let backend = backend()?;
-        // Offload all layers to the GPU; on non-Metal builds llama.cpp clamps this to what the
-        // backend supports, so a large value is a safe "all layers" request.
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(1000);
-        let model = LlamaModel::load_from_file(backend, model_path, &model_params)
-            .map_err(|e| CleanupError::Failed(format!("load {}: {e}", model_path.display())))?;
-        let model = Box::new(model);
-        let n_threads = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4);
-
-        // SAFETY: erase the model borrow to `'static` for the persistent session. The model is
-        // boxed (stable address that outlives moving the engine) and, by the field order above,
-        // `session` is dropped before `model`, so this borrow never outlives its referent.
-        let model_ref: &'static LlamaModel = unsafe { &*std::ptr::from_ref::<LlamaModel>(&*model) };
-        let session = Self::new_session(model_ref, backend, n_threads)?;
-        Ok(Self {
-            session: Mutex::new(session),
-            n_threads,
+impl OllamaCleanupEngine {
+    pub fn new(
+        client: OllamaClient,
+        model: Arc<RwLock<String>>,
+        keep_alive: String,
+        health: Arc<RwLock<CleanupHealth>>,
+    ) -> Self {
+        Self {
+            client,
             model,
-        })
+            keep_alive,
+            health,
+        }
     }
 
-    fn context_params(n_threads: i32) -> LlamaContextParams {
-        LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(N_CTX))
-            .with_n_threads(n_threads)
-            .with_n_threads_batch(n_threads)
+    fn model_tag(&self) -> String {
+        self.model.read().map(|m| m.clone()).unwrap_or_default()
     }
 
-    /// Build the persistent session: create a context and pre-decode the static prefix into its
-    /// KV cache once.
-    fn new_session(
-        model: &'static LlamaModel,
-        backend: &'static LlamaBackend,
-        n_threads: i32,
-    ) -> Result<Session, CleanupError> {
-        let mut ctx = model
-            .new_context(backend, Self::context_params(n_threads))
-            .map_err(|e| CleanupError::Failed(format!("new_context: {e}")))?;
-
-        let prefix = build_prefix();
-        let tokens = model
-            .str_to_token(&prefix, AddBos::Never)
-            .map_err(|e| CleanupError::Failed(format!("tokenize prefix: {e}")))?;
-        let prefix_len = tokens.len();
-        if prefix_len >= N_CTX as usize {
-            return Err(CleanupError::Failed(format!(
-                "few-shot prefix ({prefix_len} tokens) does not fit context window {N_CTX}"
-            )));
+    /// System prompt, the few-shot user/assistant pairs, then the utterance.
+    pub fn messages_for(text: &str) -> Vec<ChatMessage> {
+        let msg = |role: &str, content: &str| ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+        };
+        let mut messages = Vec::with_capacity(2 + 2 * FEW_SHOT.len());
+        messages.push(msg("system", SYSTEM_PROMPT));
+        for (user, assistant) in FEW_SHOT {
+            messages.push(msg("user", user));
+            messages.push(msg("assistant", assistant));
         }
-
-        // Prefix logits are never sampled (we only sample after the per-call suffix), so no
-        // token here requests logits.
-        let mut batch = LlamaBatch::new(prefix_len.max(1), 1);
-        for (i, tok) in tokens.iter().enumerate() {
-            batch
-                .add(*tok, i as i32, &[0], false)
-                .map_err(|e| CleanupError::Failed(format!("batch add prefix: {e}")))?;
-        }
-        ctx.decode(&mut batch)
-            .map_err(|e| CleanupError::Failed(format!("decode prefix: {e}")))?;
-
-        Ok(Session { ctx, prefix_len })
+        messages.push(msg("user", text));
+        messages
     }
 
-    /// Generation loop shared by the cached and fallback paths: `batch` already holds a decoded
-    /// prompt (its last token carrying logits), positioned so the next token lands at
-    /// `first_pos`. Samples greedily up to `max_new` tokens into `out_bytes`.
-    fn decode_generation(
-        &self,
-        ctx: &mut LlamaContext<'_>,
-        batch: &mut LlamaBatch,
-        first_pos: i32,
-        max_new: usize,
-    ) -> Result<Vec<u8>, CleanupError> {
-        // Temperature 0 == greedy/argmax (D-0005: deterministic cleanup). Fresh per call so a
-        // reused context is bit-for-bit equivalent to a fresh one.
-        let mut sampler = LlamaSampler::greedy();
-        // Accumulate raw output bytes and decode once at the end, so a multi-byte Czech
-        // diacritic that straddles a token boundary is not split (§3.3). `special = false`
-        // never renders control tokens like `<|im_end|>` into the text.
-        let mut out_bytes: Vec<u8> = Vec::new();
-        for n_cur in (first_pos..).take(max_new) {
-            let token = sampler.sample(ctx, batch.n_tokens() - 1);
-            sampler.accept(token);
-            // `<|im_end|>` / EOS end the assistant turn.
-            if self.model.is_eog_token(token) {
-                break;
-            }
-            let piece = self
-                .model
-                .token_to_piece_bytes(token, 32, false, None)
-                .map_err(|e| CleanupError::Failed(format!("detokenize: {e}")))?;
-            out_bytes.extend_from_slice(&piece);
-
-            batch.clear();
-            batch
-                .add(token, n_cur, &[0], true)
-                .map_err(|e| CleanupError::Failed(format!("batch add gen: {e}")))?;
-            ctx.decode(batch)
-                .map_err(|e| CleanupError::Failed(format!("decode gen: {e}")))?;
+    /// Load the model in a background thread and record the outcome in the health handle.
+    pub fn warm_up_async(&self) {
+        let model = self.model_tag();
+        if model.trim().is_empty() {
+            return;
         }
-        Ok(out_bytes)
+        let client = self.client.clone();
+        let keep_alive = self.keep_alive.clone();
+        let health = self.health.clone();
+        std::thread::spawn(move || match client.load(&model, &keep_alive) {
+            Ok(()) => set_health(&health, true, None),
+            Err(e) => set_health(&health, false, Some(e.to_string())),
+        });
     }
 
-    /// Fast path: reuse the persistent session's cached prefix KV, decoding only `suffix` (the
-    /// per-utterance user turn + assistant prefill). Returns the raw decoded assistant text.
-    fn generate_cached(&self, session: &mut Session, suffix: &str) -> Result<String, CleanupError> {
-        let tokens = self
-            .model
-            .str_to_token(suffix, AddBos::Never)
-            .map_err(|e| CleanupError::Failed(format!("tokenize: {e}")))?;
-        let suffix_len = tokens.len();
-        let prefix_len = session.prefix_len;
-        // Cleanup never legitimately expands text much; cap generation at input length + floor.
-        let max_new = suffix_len + MAX_NEW_TOKENS_FLOOR;
-
-        // Recover a clean prefix-only KV cache: if a previous call errored mid-generation it
-        // would have left stale suffix cells at positions >= prefix_len. This trim makes the
-        // cached path self-healing and equivalent to a fresh context every call.
-        session
-            .ctx
-            .clear_kv_cache_seq(Some(0), Some(prefix_len as u32), None)
-            .map_err(|e| CleanupError::Failed(format!("kv trim: {e}")))?;
-
-        let mut batch = LlamaBatch::new(suffix_len.max(1), 1);
-        for (i, tok) in tokens.iter().enumerate() {
-            let is_last = i == suffix_len - 1;
-            batch
-                .add(*tok, (prefix_len + i) as i32, &[0], is_last)
-                .map_err(|e| CleanupError::Failed(format!("batch add: {e}")))?;
-        }
-        session
-            .ctx
-            .decode(&mut batch)
-            .map_err(|e| CleanupError::Failed(format!("decode suffix: {e}")))?;
-
-        let first_pos = (prefix_len + suffix_len) as i32;
-        let out_bytes = self.decode_generation(&mut session.ctx, &mut batch, first_pos, max_new)?;
-        Ok(String::from_utf8_lossy(&out_bytes).into_owned())
-    }
-
-    /// Fallback path (rare: only utterances long enough that prefix + suffix + generation would
-    /// overflow `N_CTX`). Builds the full ChatML prompt in a throwaway context, matching the
-    /// pre-caching behavior so the output is unaffected by the cache.
-    fn generate_fresh(&self, prompt: &str) -> Result<String, CleanupError> {
-        let backend = backend()?;
-        let tokens = self
-            .model
-            .str_to_token(prompt, AddBos::Never)
-            .map_err(|e| CleanupError::Failed(format!("tokenize: {e}")))?;
-        let n_prompt = tokens.len();
-        if n_prompt >= N_CTX as usize {
-            return Err(CleanupError::Failed(format!(
-                "prompt ({n_prompt} tokens) exceeds context window {N_CTX}"
-            )));
-        }
-        let max_new = MAX_NEW_TOKENS_FLOOR + n_prompt;
-
-        let mut ctx = self
-            .model
-            .new_context(backend, Self::context_params(self.n_threads))
-            .map_err(|e| CleanupError::Failed(format!("new_context: {e}")))?;
-
-        let mut batch = LlamaBatch::new(n_prompt.max(1), 1);
-        for (i, tok) in tokens.iter().enumerate() {
-            let is_last = i == n_prompt - 1;
-            batch
-                .add(*tok, i as i32, &[0], is_last)
-                .map_err(|e| CleanupError::Failed(format!("batch add: {e}")))?;
-        }
-        ctx.decode(&mut batch)
-            .map_err(|e| CleanupError::Failed(format!("decode prompt: {e}")))?;
-
-        let out_bytes = self.decode_generation(&mut ctx, &mut batch, n_prompt as i32, max_new)?;
-        Ok(String::from_utf8_lossy(&out_bytes).into_owned())
+    fn fail(&self, msg: String) -> CleanupError {
+        set_health(&self.health, false, Some(msg.clone()));
+        self.warm_up_async();
+        CleanupError::Failed(msg)
     }
 }
 
-impl CleanupEngine for LlamaCleanupEngine {
+impl CleanupEngine for OllamaCleanupEngine {
     fn clean(&self, text: &str, _ctx: &CleanupCtx) -> Result<String, CleanupError> {
         // An empty/whitespace utterance has nothing to clean; skip the model entirely.
         if text.trim().is_empty() {
             return Ok(text.to_string());
         }
-
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| CleanupError::Failed("cleanup session mutex poisoned".to_string()))?;
-
-        // Fast path reuses the cached prefix KV. Fall back to a fresh full-prompt context only
-        // when this utterance is long enough that prefix + suffix + generation would overflow
-        // `N_CTX` — rare for per-utterance dictation, but keeps long inputs correct.
-        let suffix = build_user_turn(text);
-        let suffix_len = self
-            .model
-            .str_to_token(&suffix, AddBos::Never)
-            .map(|t| t.len())
-            .unwrap_or(0);
-        let raw = if session.prefix_len + 2 * suffix_len + MAX_NEW_TOKENS_FLOOR > N_CTX as usize {
-            self.generate_fresh(&build_prompt(text))?
-        } else {
-            self.generate_cached(&mut session, &suffix)?
+        let model = self.model_tag();
+        let raw = match self.client.chat(
+            &model,
+            &Self::messages_for(text),
+            &self.keep_alive,
+            CHAT_TIMEOUT,
+        ) {
+            Ok(raw) => raw,
+            Err(e) => return Err(self.fail(e.to_string())),
         };
-
-        // NFC boundary (§3.3): keep Czech diacritics byte-stable regardless of how the
-        // tokenizer emitted them.
+        // NFC boundary (§3.3): keep Czech diacritics byte-stable.
         let cleaned: String = strip_think(&raw).nfc().collect();
+        let cleaned = cleaned.trim().to_string();
+        if cleaned.is_empty() {
+            return Err(self.fail("empty cleanup output".to_string()));
+        }
+        set_health(&self.health, true, None);
         Ok(cleaned)
+    }
+
+    fn prepare(&self) {
+        self.warm_up_async();
+    }
+
+    fn is_enabled(&self) -> bool {
+        !self.model_tag().trim().is_empty()
     }
 }
 
@@ -397,49 +209,6 @@ const FEW_SHOT: &[(&str, &str)] = &[
     ),
 ];
 
-/// Build the **static ChatML prefix**: system prompt + few-shot examples. This is identical
-/// for every utterance, so its KV cache is decoded once and reused (see [`Session`]). It ends
-/// right after a few-shot `<|im_end|>\n`, i.e. immediately before the next `<|im_start|>`
-/// special token — a hard tokenizer boundary, which is what makes separate prefix/suffix
-/// tokenization equivalent to tokenizing the whole prompt.
-fn build_prefix() -> String {
-    let mut p = String::new();
-    p.push_str("<|im_start|>system\n");
-    p.push_str(SYSTEM_PROMPT);
-    p.push_str("<|im_end|>\n");
-    for (u, a) in FEW_SHOT {
-        p.push_str("<|im_start|>user\n");
-        p.push_str(u);
-        p.push_str("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
-        p.push_str(a);
-        p.push_str("<|im_end|>\n");
-    }
-    p
-}
-
-/// Build the **per-utterance suffix**: the user turn plus the thinking-disabled assistant
-/// prefill the model continues from.
-///
-/// Manual ChatML (rather than llama.cpp's built-in template engine) gives deterministic
-/// control over Qwen3's conditional thinking block: we prefill the final assistant turn with a
-/// pre-closed `<think>\n\n</think>` block, which is exactly what Qwen3's official template
-/// emits for `enable_thinking=false`. The model then continues after the closed block and
-/// produces no reasoning trace; [`strip_think`] removes any that leaks anyway (defensive).
-fn build_user_turn(user_text: &str) -> String {
-    let mut p = String::new();
-    p.push_str("<|im_start|>user\n");
-    p.push_str(user_text);
-    p.push_str("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
-    p
-}
-
-/// Build the full ChatML prompt (prefix + user turn) used by the non-cached fallback path.
-fn build_prompt(user_text: &str) -> String {
-    let mut p = build_prefix();
-    p.push_str(&build_user_turn(user_text));
-    p
-}
-
 /// Strip any `<think>...</think>` reasoning block a reasoning model may still emit, and trim.
 /// With thinking disabled this is a no-op on well-behaved output, but it's a defensive guard
 /// (D-0005: "verify no `<think>` leaks — strip defensively") so a stray block never lands in
@@ -465,6 +234,139 @@ fn strip_think(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    /// Serve one canned chat reply per connection (in order), forwarding each request body.
+    /// After the replies run out the listener is dropped, so a follow-up warm-up call fails.
+    fn serve_chat(contents: Vec<&'static str>) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for content in contents {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0usize;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                reader.read_exact(&mut body).unwrap();
+                let _ = tx.send(String::from_utf8(body).unwrap());
+                let payload =
+                    serde_json::json!({ "message": { "role": "assistant", "content": content } })
+                        .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let mut stream = stream;
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    fn engine(
+        url: String,
+        model: &str,
+    ) -> (
+        OllamaCleanupEngine,
+        Arc<RwLock<String>>,
+        Arc<RwLock<CleanupHealth>>,
+    ) {
+        let model = Arc::new(RwLock::new(model.to_string()));
+        let health = Arc::new(RwLock::new(CleanupHealth::default()));
+        let e = OllamaCleanupEngine::new(
+            OllamaClient::new(url),
+            model.clone(),
+            "30m".to_string(),
+            health.clone(),
+        );
+        (e, model, health)
+    }
+
+    fn ctx() -> CleanupCtx {
+        CleanupCtx {
+            lang: "cs".to_string(),
+        }
+    }
+
+    #[test]
+    fn messages_for_has_system_fewshot_then_user() {
+        let m = OllamaCleanupEngine::messages_for("Přijdu ve čtyři hodiny.");
+        assert_eq!(m.len(), 1 + 2 * 8 + 1);
+        assert_eq!(m[0].role, "system");
+        assert_eq!(m[0].content, SYSTEM_PROMPT);
+        let last = m.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content, "Přijdu ve čtyři hodiny.");
+        // The two trap few-shots come last, closest to the query (positions 13-16).
+        assert_eq!(m[13].content, "Kolik je teď hodin?");
+        assert_eq!(m[14].content, "Kolik je teď hodin?");
+        assert_eq!(m[15].content, "Zavři to okno a ulož ten soubor.");
+        assert_eq!(m[16].content, "Zavři to okno a ulož ten soubor.");
+        assert_eq!(m[15].role, "user");
+        assert_eq!(m[16].role, "assistant");
+    }
+
+    #[test]
+    fn clean_returns_stripped_content() {
+        let (url, _rx) = serve_chat(vec!["<think>\n\n</think>\n\nPřijdu ve čtyři hodiny."]);
+        let (e, _, health) = engine(url, "qwen3-vl:8b-instruct");
+        let out = e.clean("Přijdu ve tři, ne počkej, ve čtyři hodiny.", &ctx());
+        assert_eq!(out.unwrap(), "Přijdu ve čtyři hodiny.");
+        assert_eq!(
+            *health.read().unwrap(),
+            CleanupHealth {
+                ready: true,
+                error: None
+            }
+        );
+    }
+
+    #[test]
+    fn empty_output_is_error() {
+        let (url, _rx) = serve_chat(vec!["<think>x</think>"]);
+        let (e, _, health) = engine(url, "qwen3-vl:8b-instruct");
+        assert!(e.clean("Ahoj světe.", &ctx()).is_err());
+        let h = health.read().unwrap().clone();
+        assert!(!h.ready);
+        assert!(h.error.is_some());
+    }
+
+    #[test]
+    fn disabled_when_model_empty() {
+        let (e, model, _) = engine("http://127.0.0.1:1".to_string(), "");
+        assert!(!e.is_enabled());
+        *model.write().unwrap() = "qwen3:8b".to_string();
+        assert!(e.is_enabled());
+    }
+
+    #[test]
+    fn model_handle_swap_is_used_next_call() {
+        let (url, rx) = serve_chat(vec!["Ahoj.", "Ahoj."]);
+        let (e, model, _) = engine(url, "qwen3-vl:8b-instruct");
+        e.clean("Ahoj.", &ctx()).unwrap();
+        let first: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(first["model"], "qwen3-vl:8b-instruct");
+        *model.write().unwrap() = "qwen3:8b".to_string();
+        e.clean("Ahoj.", &ctx()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(second["model"], "qwen3:8b");
+    }
 
     #[test]
     fn strip_think_removes_a_reasoning_block() {
@@ -485,15 +387,10 @@ mod tests {
     }
 
     #[test]
-    fn prompt_disables_thinking_and_contains_contract() {
-        let p = build_prompt("Ehm, ahoj.");
-        // Assistant turn is prefilled with a pre-closed think block (enable_thinking=false).
-        assert!(p.ends_with("<think>\n\n</think>\n\n"));
-        assert!(p.contains("NEVER answer a question"));
-        assert!(p.contains("NEVER paraphrase"));
-        // Few-shot examples are present (self-correction teacher).
-        assert!(p.contains("Přijdu ve čtyři hodiny."));
-        // The user's Czech diacritics are carried verbatim into the prompt.
-        assert!(p.contains("Ehm, ahoj."));
+    fn prompt_contains_contract_and_few_shot() {
+        let m = OllamaCleanupEngine::messages_for("Ehm, ahoj.");
+        assert!(m[0].content.contains("NEVER answer a question"));
+        assert!(m[0].content.contains("NEVER paraphrase"));
+        assert!(m.iter().any(|x| x.content == "Přijdu ve čtyři hodiny."));
     }
 }

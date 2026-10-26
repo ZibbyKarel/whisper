@@ -1,25 +1,28 @@
-//! D-0005 evidence-transfer guard: re-measure the cleanup LLM **in-process** on llama.cpp
-//! with the final few-shot prompt, because the round-1 numbers (0/4 traps, 0.15 WER, 1.6 s)
-//! were measured on Ollama with a generic zero-shot prompt (chat template, sampling, and
-//! `think:false` handling all differ). This runs ALL 13 cases from
-//! `fixtures/llm/cleanup-cases.json` through [`LlamaCleanupEngine`] and asserts the two hard
-//! safety properties; WER/latency are reported (soft), not gated.
+//! D-0017 evidence-transfer guard: re-measure the cleanup LLM **through Ollama** with the
+//! final few-shot prompt (`OllamaCleanupEngine`), because the earlier numbers were measured
+//! in-process on llama.cpp (D-0005) or with a generic zero-shot prompt. This runs ALL 13 cases
+//! from `fixtures/llm/cleanup-cases.json` and asserts the two hard safety properties;
+//! WER/latency are reported (soft), not gated.
 //!
-//! Marked `#[ignore]` (needs the ~4.7 GB Qwen3 GGUF): run with
-//! `cargo test -p whisper-iface -- --ignored`.
+//! Marked `#[ignore]` (needs a running Ollama with the model pulled): run with
+//! `WHISPER_CLEANUP_MODEL=qwen3-vl:8b-instruct cargo test -p whisper-iface --test
+//! cleanup_trap_safety -- --ignored --nocapture`. `WHISPER_OLLAMA_URL` overrides the
+//! default `http://127.0.0.1:11434`.
 //!
 //! The WER normalization + edit-distance and the trap "answered_instead" heuristic are
 //! reimplemented here to match `scripts/bench_llm_cleanup.py` (diacritics are KEPT in
 //! normalization so a diacritic error counts as an error — the Czech quality requirement).
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
 use whisper_core::ports::CleanupEngine;
 use whisper_core::types::CleanupCtx;
-use whisper_iface::LlamaCleanupEngine;
+use whisper_iface::ollama::OllamaClient;
+use whisper_iface::{CleanupHealth, OllamaCleanupEngine};
 
 #[derive(Debug, Deserialize)]
 struct Fixtures {
@@ -37,10 +40,6 @@ struct Case {
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn model_path() -> PathBuf {
-    workspace_root().join("models/Qwen3-8B-Q4_K_M.gguf")
 }
 
 /// Czech diacritic set — same as `scripts/bench_llm_cleanup.py`.
@@ -123,14 +122,12 @@ fn diacritics_lost(expected: &str, output: &str) -> bool {
 }
 
 #[test]
-#[ignore = "requires the Qwen3-8B GGUF; run with `cargo test -- --ignored`"]
-fn qwen3_cleanup_is_trap_safe_and_diacritics_safe_in_process() {
-    let model = model_path();
-    assert!(
-        model.exists(),
-        "missing model {} — the cleanup guard needs the Qwen3-8B GGUF present",
-        model.display()
-    );
+#[ignore = "requires a running Ollama with the model pulled; run with `cargo test -- --ignored`"]
+fn ollama_cleanup_is_trap_safe_and_diacritics_safe() {
+    let model = std::env::var("WHISPER_CLEANUP_MODEL")
+        .unwrap_or_else(|_| "qwen3-vl:8b-instruct".to_string());
+    let url = std::env::var("WHISPER_OLLAMA_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
 
     let fixtures: Fixtures = serde_json::from_str(
         &std::fs::read_to_string(workspace_root().join("fixtures/llm/cleanup-cases.json"))
@@ -138,7 +135,16 @@ fn qwen3_cleanup_is_trap_safe_and_diacritics_safe_in_process() {
     )
     .expect("parse cleanup-cases.json");
 
-    let engine = LlamaCleanupEngine::load(&model).expect("load Qwen3-8B GGUF");
+    let client = OllamaClient::new(url);
+    // Load the model up front so the first case's latency isn't the cold start.
+    client.load(&model, "30m").expect("load model in Ollama");
+    println!("model: {model}");
+    let engine = OllamaCleanupEngine::new(
+        client,
+        Arc::new(RwLock::new(model)),
+        "30m".to_string(),
+        Arc::new(RwLock::new(CleanupHealth::default())),
+    );
     let ctx = CleanupCtx {
         lang: "cs".to_string(),
     };
@@ -198,7 +204,7 @@ fn qwen3_cleanup_is_trap_safe_and_diacritics_safe_in_process() {
     );
     println!("Round-1 (Ollama, zero-shot) baseline: avg WER 0.15  trap 0  latency 1.6s\n");
 
-    // Hard gates (D-0005): trap-safety and diacritics are non-negotiable for a dictation tool.
+    // Hard gates (D-0005/D-0017): trap-safety and diacritics are non-negotiable for a dictation tool.
     assert_eq!(
         trap_failures, 0,
         "{trap_failures} trap case(s) were answered/followed instead of transcribed"

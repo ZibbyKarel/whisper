@@ -13,7 +13,7 @@ pub mod ollama;
 pub mod stt;
 pub mod vad;
 
-pub use cleanup::LlamaCleanupEngine;
+pub use cleanup::{CleanupHealth, OllamaCleanupEngine};
 pub use daemon::{
     build_router, build_state, build_state_with_data_dir, production_engine_builder, Daemon,
 };

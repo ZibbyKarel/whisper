@@ -32,13 +32,14 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use whisper_core::ports::{CleanupEngine, Vad};
 
-use self::config::Config;
+use self::config::{CleanupConfig, Config};
 use self::handlers::ApiErr;
 use self::state::LiveSourceProvider;
 use self::state::{AppState, DictionaryState};
 use self::store::SessionStore;
 use self::worker::{null_sink_builder, BuildCtx, EngineBuilder, LangInjectingStt, ResidentEngines};
-use crate::{LlamaCleanupEngine, SileroVad, WhisperCppEngine};
+use crate::ollama::OllamaClient;
+use crate::{CleanupHealth, OllamaCleanupEngine, SileroVad, WhisperCppEngine};
 
 /// Broadcast backlog per WS subscriber before it starts lagging (best-effort, `ARCHITECTURE.md`
 /// §4: a lagging client may drop events; the authoritative result is `GET /v1/sessions/{id}`).
@@ -329,9 +330,9 @@ fn resolve_history_path(config: &Config) -> PathBuf {
 }
 
 /// Factory for the production engine set (`ARCHITECTURE.md` §3.1: heavy native adapters live in
-/// this crate). Loads whisper.cpp (D-0004) and, if configured, llama.cpp cleanup (D-0005); the
-/// STT is wrapped so `/v1/config` `language` reaches decoding. A cleanup load failure degrades to
-/// cleanup-off rather than failing the daemon (`ARCHITECTURE.md` §3.2).
+/// this crate). Loads whisper.cpp (D-0004) and, if configured, the Ollama cleanup engine (D-0017); the
+/// STT is wrapped so `/v1/config` `language` reaches decoding. A cleanup failure degrades to
+/// dictionary text rather than failing the daemon (`ARCHITECTURE.md` §3.2).
 pub fn production_engine_builder(
     stt_path: PathBuf,
     cleanup_path: Option<PathBuf>,
@@ -352,19 +353,20 @@ pub fn production_engine_builder_with_sink(
         let stt = WhisperCppEngine::load(&stt_path).map_err(|e| e.to_string())?;
         let lang_stt = LangInjectingStt::new(Box::new(stt), ctx.lang.clone());
 
-        let (cleanup, cleanup_model_label, cleanup_load_error) = match &cleanup_path {
-            Some(path) => {
-                let label = file_label(path);
-                match LlamaCleanupEngine::load(path) {
-                    Ok(engine) => (
-                        Some(Rc::new(engine) as Rc<dyn CleanupEngine>),
-                        Some(label),
-                        None,
-                    ),
-                    Err(err) => (None, Some(label), Some(err.to_string())),
-                }
-            }
-            None => (None, None, None),
+        let (cleanup, cleanup_model_label) = if cleanup_path.is_some() {
+            let cfg = CleanupConfig::default();
+            let engine = OllamaCleanupEngine::new(
+                OllamaClient::new(cfg.ollama_url.clone()),
+                Arc::new(RwLock::new(cfg.model.clone())),
+                cfg.keep_alive.clone(),
+                Arc::new(RwLock::new(CleanupHealth::default())),
+            );
+            (
+                Some(Rc::new(engine) as Rc<dyn CleanupEngine>),
+                Some(cfg.model),
+            )
+        } else {
+            (None, None)
         };
 
         // Read the shared VAD tuning each session, so a `/v1/config` `[vad]` edit applies to the
@@ -382,7 +384,7 @@ pub fn production_engine_builder_with_sink(
             stt_model_label: stt_label.clone(),
             cleanup,
             cleanup_model_label,
-            cleanup_load_error,
+            cleanup_load_error: None,
             vad_builder,
             sink_builder,
         })

@@ -1,11 +1,10 @@
 //! The engine worker thread — the actor that owns the `!Send` engines and the `Pipeline`
-//! (D-0011). This is the ONLY thread that touches whisper.cpp / llama.cpp; the async axum side
+//! (D-0011). This is the ONLY thread that touches whisper.cpp; the async axum side
 //! never does. It receives [`Job`]s over a channel, runs one at a time (the single-active-session
 //! invariant of `ARCHITECTURE.md` §3.2), and finalizes an authoritative [`SessionRecord`].
 //!
-//! Why a thread and not a task: [`crate::cleanup::LlamaCleanupEngine`] holds a persistent
-//! `LlamaContext` and is `!Send`/`!Sync`; pinning it (and the whisper context) to one OS thread
-//! is the constraint D-0011 is built around. Engines are constructed *on this thread* by the
+//! Why a thread and not a task: the whisper context is `!Send`/`!Sync`, and the engines are
+//! shared via `Rc`; pinning them to one OS thread is the constraint D-0011 is built around. Engines are constructed *on this thread* by the
 //! `builder` closure — they never cross a thread boundary.
 //!
 //! Per job, a fresh `Pipeline` is assembled from the resident engines (shared cheaply via `Rc`)

@@ -405,6 +405,13 @@ impl CleanupEngine for CountingCleanup {
 /// Runs one `Always` session with a `CountingCleanup`; returns (prepare count, clean count,
 /// events).
 fn run_counting_session(enabled: bool) -> (usize, usize, Vec<PipelineEvent>) {
+    run_counting_session_with(enabled, CleanupMode::Always)
+}
+
+fn run_counting_session_with(
+    enabled: bool,
+    cleanup_mode: CleanupMode,
+) -> (usize, usize, Vec<PipelineEvent>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let prepared = Arc::new(AtomicUsize::new(0));
     let cleaned = Arc::new(AtomicUsize::new(0));
@@ -423,7 +430,7 @@ fn run_counting_session(enabled: bool) -> (usize, usize, Vec<PipelineEvent>) {
         })),
         Box::new(CaptureSink::default()),
         PipelineConfig {
-            cleanup_mode: CleanupMode::Always,
+            cleanup_mode,
             skip_gate: SkipGateConfig::default(),
         },
     );
@@ -443,6 +450,13 @@ fn prepare_called_once_per_session() {
     let (prepared, cleaned, _) = run_counting_session(true);
     assert_eq!(prepared, 1);
     assert_eq!(cleaned, 1);
+}
+
+#[test]
+fn prepare_not_called_when_cleanup_mode_is_never() {
+    let (prepared, cleaned, _) = run_counting_session_with(true, CleanupMode::Never);
+    assert_eq!(prepared, 0, "Never must not warm the cleanup backend");
+    assert_eq!(cleaned, 0);
 }
 
 #[test]
