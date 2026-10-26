@@ -987,8 +987,7 @@ mod tests {
                 // Drain the whole request (headers + body) so closing never resets the client.
                 let mut req = Vec::new();
                 let mut buf = [0u8; 4096];
-                loop {
-                    let Ok(n) = s.read(&mut buf) else { break };
+                while let Ok(n) = s.read(&mut buf) {
                     if n == 0 {
                         break;
                     }
