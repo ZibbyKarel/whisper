@@ -1,6 +1,6 @@
 # Cleanup LLM via Ollama — design
 
-Date: 2026-10-26 · Status: approved-pending · Supersedes the cleanup half of D-0005 and D-0015.
+Date: 2026-10-26 · Status: approved 2026-10-26 · Supersedes the cleanup half of D-0005 and D-0015.
 
 ## Intent / why
 
@@ -35,11 +35,21 @@ generation). STT stays on in-process whisper.cpp with its own 574 MB model downl
 1. The cleanup stage calls a **local Ollama server** (`/api/chat`) instead of in-process
    llama.cpp. llama.cpp (`llama-cpp-2`) and the GGUF download are removed completely.
 2. Whisper **offers cleanup models to download through Ollama**:
-   - a curated **validated** list (passed the Czech cleanup benchmark + trap set), with
-     `qwen3:8b` as the default and, for now, the only entry. Re-measured 2026-10-26 on
-     Ollama 0.31.1: avg WER 0.15, 0/4 trap failures, 1.4 s. `qwen3:4b` was tested and
-     **rejected**: it ignores `think:false` and runs away (avg WER 261, 86.7 s/case). The
-     list grows only through the same gate (0 trap failures, no diacritics loss);
+   - a curated **validated** list (passed the Czech cleanup benchmark + trap set through
+     the **production** prompt):
+     - **`qwen3-vl:8b-instruct` is the default.** The user's other app (z.i.b.b.y's
+       coloring-book factory, `scripts/setup-coloring-book.sh`) already uses it, so the
+       machine holds a single copy of the model. Measured 2026-10-26 on Ollama 0.31.1 with
+       the production system prompt + few-shot: avg WER 0.01, 0/4 trap failures,
+       ~1.4 s/case.
+     - `qwen3:8b`: production prompt avg WER 0.03, 0/4 traps.
+     - Note: with the old *generic zero-shot* prompt (`scripts/bench_llm_cleanup.py`),
+       qwen3-vl **obeyed the prompt-injection trap** (wrote a poem). The production
+       few-shot prompt is therefore **load-bearing**, and the live gate test must use
+       exactly the adapter's prompt.
+     - `qwen3:4b` was tested and **rejected**: it ignores `think:false` and runs away
+       (avg WER 261, 86.7 s/case).
+     - The list grows only through the same gate (0 trap failures, no diacritics loss).
    - beneath it, **every model already installed in Ollama** that isn't on the list,
      labeled "not validated for Czech". The user can still select it.
 3. Whisper **makes sure Ollama is there**: the onboarding gets an Ollama step, and a
@@ -86,7 +96,7 @@ New section (my call on the names):
 ```toml
 [cleanup]
 ollama_url = "http://127.0.0.1:11434"
-model = "qwen3:8b"        # empty string / absent section-key => cleanup engine disabled
+model = "qwen3-vl:8b-instruct"  # default when absent; "" => cleanup engine disabled
 keep_alive = "30m"
 ```
 The legacy `models.cleanup` (GGUF path) is accepted on load and ignored, with one log
@@ -94,9 +104,9 @@ line, so existing configs (incl. the user's real one) still parse. The user's re
 `~/Library/Application Support/whisper-engine/config.toml` keeps working with no edit.
 
 Defaults and migration (my call):
-- A missing `[cleanup]` section or a missing `model` key → `"qwen3:8b"`. Cleanup is on
+- A missing `[cleanup]` section or a missing `model` key → `"qwen3-vl:8b-instruct"`. Cleanup is on
   by default, as before. A legacy config that had a GGUF path therefore lands on
-  `qwen3:8b`, the same model.
+  `qwen3-vl:8b-instruct`.
 - `model = ""` → cleanup engine disabled (the "Off" choice).
 - Turning cleanup off for a session stays `cleanup_mode = "never"`, unchanged.
 - A fresh install without Ollama therefore shows the banner and onboarding step on
@@ -137,7 +147,9 @@ The session no longer fails. Update the existing test that expects failure.
   `/usr/local/bin/ollama`, or `/Applications/Ollama.app`. `running` =
   `GET {url}/api/version` succeeds. The response also carries `version`.
 - Auto-start at daemon startup, and on `POST /v1/ollama/start`, when installed but not
-  running: `open -a Ollama` if the app exists, else spawn `ollama serve` detached. Then
+  running: `brew services start ollama` when Ollama is a Homebrew install (the same mechanism
+  the coloring-book setup uses, so both apps share one service), else `open -a Ollama` if
+  the app exists, else spawn `ollama serve` detached. Then
   poll `/api/version` for up to ~10 s. Auto-start and Start only apply when `ollama_url`
   is a loopback address.
 - `GET /v1/ollama` → `{installed, running, version?, url}`.
@@ -152,7 +164,7 @@ The session no longer fails. Update the existing test that expects failure.
 - STT entry unchanged (file download, sha256).
 - The GGUF cleanup entry is removed. Cleanup entries become Ollama entries
   `{id, kind:"cleanup", source:"ollama", ollama_tag, validated:true, size_hint}`.
-  `qwen3:8b` is the only validated entry for now.
+  Validated entries: `qwen3-vl:8b-instruct` (default), `qwen3:8b`.
 - Presence for Ollama entries = the tag is listed in `GET {url}/api/tags`.
 - `GET /v1/models` additionally returns installed Ollama models that aren't in the
   catalog (`validated:false`, `source:"ollama"`). Embedding-only models and models
@@ -205,7 +217,7 @@ The session no longer fails. Update the existing test that expects failure.
   - pipeline degrade-on-error.
 - ux: JSON fixtures for new DTOs; `models_ui`/onboarding state unit tests.
 - `#[ignore]` live test: runs every case of `fixtures/llm/cleanup-cases.json` through
-  `OllamaCleanupEngine` against a real `qwen3:8b`. Must report **0 trap failures and 0
+  `OllamaCleanupEngine` against each validated model (`qwen3-vl:8b-instruct`, `qwen3:8b`). Must report **0 trap failures and 0
   diacritics loss**, and its results are recorded in the ADR. The same gate applies to any future catalog addition.
 
 ## Left to the builder
