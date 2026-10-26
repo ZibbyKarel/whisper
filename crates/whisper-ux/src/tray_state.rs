@@ -83,7 +83,8 @@ impl TrayState {
             | ApiEvent::SecureInputBlocked { .. }
             | ApiEvent::AudioDeviceLost { .. }
             | ApiEvent::PlatformPermission { .. }
-            | ApiEvent::ModelDownload { .. } => self,
+            | ApiEvent::ModelDownload { .. }
+            | ApiEvent::OllamaStatus { .. } => self,
         }
     }
 

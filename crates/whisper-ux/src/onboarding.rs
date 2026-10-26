@@ -31,6 +31,9 @@ pub struct OnboardingState {
     /// `ModelsPanel::required_satisfied()` is true, so a later deletion does not un-complete
     /// onboarding retroactively (the startup gate, not onboarding, is what re-blocks that).
     pub models_ready: bool,
+    /// The optional text-cleanup step (D-0017) is settled: Ollama running with the selected
+    /// model present, or the user chose Off / "Skip (no cleanup)". Latched like `models_ready`.
+    pub ollama_ready: bool,
 }
 
 impl OnboardingState {
@@ -43,6 +46,7 @@ impl OnboardingState {
             && self.accessibility_ack
             && self.test_dictation_done
             && self.models_ready
+            && self.ollama_ready
     }
 
     /// Load from `path`; a missing file yields the default (fresh) state. A
@@ -105,6 +109,7 @@ mod tests {
             accessibility_ack: true,
             test_dictation_done: true,
             models_ready: true,
+            ollama_ready: true,
         };
         s.save(&p).unwrap();
         let back = OnboardingState::load(&p);
@@ -132,6 +137,7 @@ mod tests {
             test_dictation_done: false,
             completed: false,
             models_ready: true,
+            ollama_ready: true,
         };
         assert!(!s.all_steps_done());
         s.test_dictation_done = true;
@@ -148,6 +154,7 @@ mod tests {
             test_dictation_done: true,
             completed: false,
             models_ready: true,
+            ollama_ready: true,
         };
         assert!(!s.all_steps_done());
         s.input_monitoring_ack = true;
@@ -164,9 +171,42 @@ mod tests {
             test_dictation_done: true,
             completed: false,
             models_ready: false,
+            ollama_ready: true,
         };
         assert!(!s.all_steps_done());
         s.models_ready = true;
         assert!(s.all_steps_done());
+    }
+
+    #[test]
+    fn all_steps_done_requires_ollama_ready() {
+        let mut s = OnboardingState {
+            daemon_seen: true,
+            mic_ack: true,
+            input_monitoring_ack: true,
+            accessibility_ack: true,
+            test_dictation_done: true,
+            completed: false,
+            models_ready: true,
+            ollama_ready: false,
+        };
+        assert!(!s.all_steps_done());
+        s.ollama_ready = true;
+        assert!(s.all_steps_done());
+    }
+
+    #[test]
+    fn old_state_file_without_ollama_ready_loads_false() {
+        let p = temp_path("old-state");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"completed":true,"daemon_seen":true,"mic_ack":true,"input_monitoring_ack":true,"accessibility_ack":true,"test_dictation_done":true,"models_ready":true}"#,
+        )
+        .unwrap();
+        let s = OnboardingState::load(&p);
+        assert!(s.completed && s.models_ready);
+        assert!(!s.ollama_ready);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }

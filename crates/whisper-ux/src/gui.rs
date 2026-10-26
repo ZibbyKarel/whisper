@@ -21,7 +21,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use tungstenite::Message;
 
 use whisper_ux::api::{
-    ApiEvent, CleanupMode, Config, DeliveryMode, DownloadPhase, HotkeyMode, Incoming,
+    ApiEvent, CleanupMode, Config, DeliveryMode, DownloadPhase, HotkeyMode, Incoming, ModelEntry,
 };
 use whisper_ux::client::{backoff_delay, events_ws_url, Api, ApiError, HttpClient};
 use whisper_ux::daemon_ctl::DaemonController;
@@ -29,6 +29,7 @@ use whisper_ux::dict_editor::DictEditor;
 use whisper_ux::icons::{self, IconImage};
 use whisper_ux::language::{self, LanguagePreset};
 use whisper_ux::models_ui::ModelsPanel;
+use whisper_ux::ollama_ui::{self, OllamaAttention, OllamaPanel};
 use whisper_ux::onboarding::{self, OnboardingState};
 use whisper_ux::overlay::{self, Overlay, OverlayPhase};
 use whisper_ux::permissions_ui::{self, PermissionsPanel};
@@ -103,8 +104,8 @@ impl Section {
             Section::Status => "Live engine state, input level and the last transcript.",
             Section::Dictation => "Dictation language, global hotkey and delivery.",
             Section::Audio => "Voice activity detection and automatic gain control.",
-            Section::Cleanup => "LLM disfluency cleanup mode.",
-            Section::Models => "Local STT + LLM model downloads and raw model paths.",
+            Section::Cleanup => "LLM disfluency cleanup mode and the local Ollama model.",
+            Section::Models => "Local speech-recognition model download and raw model path.",
             Section::Dictionary => "Deterministic substitutions applied before cleanup.",
             Section::Advanced => "Server bind/port, history and dictionary file locations.",
         }
@@ -159,6 +160,12 @@ pub struct ShellApp {
     permissions: PermissionsPanel,
     last_permissions_poll: std::time::Instant,
 
+    // --- text cleanup via a local Ollama server (D-0017): status polled with the models poll
+    // (same 5 s cadence) and live-updated by `ollama.status` WS events; feeds the Settings →
+    // Cleanup card, the onboarding step and the attention banner. Cleanup is optional, so this
+    // never gates the app. ---
+    ollama: OllamaPanel,
+
     // --- floating overlay (shell-local, D-0013) ---
     shell_settings: ShellSettings,
     shell_settings_path: Option<PathBuf>,
@@ -175,7 +182,6 @@ pub struct ShellApp {
     token_input: String,
     dictionary_path_input: String,
     history_path_input: String,
-    cleanup_model_input: String,
     dict: DictEditor,
     status_msg: Option<String>,
     save_report: SaveReport,
@@ -256,6 +262,7 @@ impl ShellApp {
             last_models_poll: std::time::Instant::now(),
             permissions: PermissionsPanel::default(),
             last_permissions_poll: std::time::Instant::now(),
+            ollama: OllamaPanel::default(),
             shell_settings,
             shell_settings_path,
             overlay: Overlay::new(),
@@ -264,7 +271,6 @@ impl ShellApp {
             token_input: String::new(),
             dictionary_path_input: String::new(),
             history_path_input: String::new(),
-            cleanup_model_input: String::new(),
             dict: DictEditor::default(),
             status_msg: None,
             save_report: SaveReport::default(),
@@ -276,6 +282,7 @@ impl ShellApp {
         app.load_settings();
         app.models.refresh(&app.client);
         app.refresh_permissions();
+        app.ollama.refresh(&app.client);
         app
     }
 
@@ -303,7 +310,6 @@ impl ShellApp {
                 self.token_input = cfg.token.clone().unwrap_or_default();
                 self.dictionary_path_input = cfg.dictionary_path.clone().unwrap_or_default();
                 self.history_path_input = cfg.history.path.clone().unwrap_or_default();
-                self.cleanup_model_input = cfg.models.cleanup.clone().unwrap_or_default();
                 self.language_other_mode =
                     language::preset_for(&cfg.language) == LanguagePreset::Other;
                 self.cfg = Some(cfg);
@@ -326,7 +332,6 @@ impl ShellApp {
         cfg.token = non_empty(&self.token_input);
         cfg.dictionary_path = non_empty(&self.dictionary_path_input);
         cfg.history.path = non_empty(&self.history_path_input);
-        cfg.models.cleanup = non_empty(&self.cleanup_model_input);
     }
 
     fn save_settings(&mut self) {
@@ -405,6 +410,7 @@ impl ShellApp {
 
     fn refresh_models(&mut self) {
         self.models.refresh(&self.client);
+        self.ollama.refresh(&self.client);
         self.last_models_poll = std::time::Instant::now();
         if self.models.required_satisfied() {
             self.mark_models_ready();
@@ -425,6 +431,45 @@ impl ShellApp {
             self.onboarding.models_ready = true;
             self.persist_onboarding();
         }
+    }
+
+    // -- text cleanup via Ollama (D-0017) ----------------------------------
+
+    /// Latch `onboarding.ollama_ready` once Ollama is running with the selected model present,
+    /// or cleanup is off. Cheap; run every frame so a download finishing, a start, or "Off"
+    /// all latch without per-site wiring.
+    fn update_ollama_ready(&mut self) {
+        if self.onboarding.ollama_ready {
+            return;
+        }
+        let model = self.cfg.as_ref().map(|c| c.cleanup.model.as_str());
+        if ollama_ui::onboarding_ready(&self.ollama, &self.models, model) {
+            self.onboarding.ollama_ready = true;
+            self.persist_onboarding();
+        }
+    }
+
+    /// "Use" / "Off": GET config → set `cleanup.model` → PUT config (applied at runtime), then
+    /// re-poll models so the `selected` flags follow. Returns whether the daemon accepted it.
+    fn set_cleanup_model(&mut self, model: &str) -> bool {
+        match ollama_ui::set_cleanup_model(&self.client, model) {
+            Ok(_) => {
+                if let Some(cfg) = &mut self.cfg {
+                    cfg.cleanup.model = model.to_string();
+                }
+                self.status_msg = None;
+                self.refresh_models();
+                true
+            }
+            Err(e) => {
+                self.status_msg = Some(format!("cleanup model: {e}"));
+                false
+            }
+        }
+    }
+
+    fn start_ollama(&mut self) {
+        self.ollama.start(&self.client);
     }
 
     /// `POST /v1/models/{id}/download`, with an optimistic local flip to "downloading" so the
@@ -508,11 +553,7 @@ impl ShellApp {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if entry.downloading {
-                        let verb = if phase == Some(DownloadPhase::Verifying) {
-                            "Verifying…".to_string()
-                        } else {
-                            format!("Downloading {}%", entry.progress_percent().unwrap_or(0))
-                        };
+                        let verb = download_verb(&entry, phase);
                         if ui.button("Cancel").clicked() {
                             self.cancel_model_download(&entry.id);
                         }
@@ -549,8 +590,8 @@ impl ShellApp {
 
     /// Blocking "Download models" screen (D-0015 surface 1): shown instead of the sidebar/app
     /// whenever [`Self::models_gate_active`] is true, including reappearing after an
-    /// accidental deletion. STT (required) and the optional cleanup LLM both get their own
-    /// row via the shared [`Self::ui_model_row`] component; it disappears on its own the
+    /// accidental deletion. Only the required STT model gates the app (text cleanup is
+    /// optional and lives in Settings → Cleanup); it gets its row via the shared [`Self::ui_model_row`] component; it disappears on its own the
     /// frame after the required model's `model.download` `done` event lands.
     fn ui_model_gate(&mut self, ui: &mut egui::Ui) {
         theme::card_frame().show(ui, |ui| {
@@ -564,7 +605,7 @@ impl ShellApp {
             );
         });
         ui.add_space(theme::CARD_GAP);
-        let ids: Vec<String> = self.models.entries.iter().map(|m| m.id.clone()).collect();
+        let ids: Vec<String> = self.models.stt_entries().map(|m| m.id.clone()).collect();
         for id in ids {
             self.ui_model_row(ui, &id);
         }
@@ -644,6 +685,7 @@ impl ShellApp {
         if matches!(ev, ApiEvent::ModelDownload { .. }) && self.models.required_satisfied() {
             self.mark_models_ready();
         }
+        self.ollama.apply_event(ev);
         match ev {
             ApiEvent::SessionStarted { session_id, .. } => {
                 self.active_session = Some(session_id.clone());
@@ -881,6 +923,49 @@ impl ShellApp {
                 );
                 if ui.button("Re-check").clicked() {
                     self.refresh_permissions();
+                }
+            });
+        });
+        ui.add_space(6.0);
+    }
+
+    /// Actionable text-cleanup banner (D-0017), same placement/pattern as the permission banner:
+    /// shown while cleanup is on and Ollama is missing/stopped or the selected model is not
+    /// pulled, with the matching button. Cleanup is optional, so it only nags — never blocks.
+    fn ui_ollama_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(model) = self.cfg.as_ref().map(|c| c.cleanup.model.clone()) else {
+            return;
+        };
+        let Some(attention) = self.ollama.attention(&model, &self.models) else {
+            return;
+        };
+        theme::card_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("⚠ {}", attention.banner_text()))
+                        .color(egui::Color32::from_rgb(0xF2, 0x9D, 0x1C)),
+                );
+                match &attention {
+                    OllamaAttention::NotInstalled => {
+                        if ui.button("Install Ollama").clicked() {
+                            permissions_ui::open_system_settings(ollama_ui::OLLAMA_DOWNLOAD_URL);
+                        }
+                    }
+                    OllamaAttention::NotRunning { can_start } => {
+                        if ui
+                            .add_enabled(*can_start, egui::Button::new("Start"))
+                            .clicked()
+                        {
+                            self.start_ollama();
+                        }
+                    }
+                    OllamaAttention::ModelMissing { id, .. } => {
+                        if let Some(id) = id {
+                            if ui.button("Download").clicked() {
+                                self.start_model_download(id);
+                            }
+                        }
+                    }
                 }
             });
         });
@@ -1267,6 +1352,140 @@ impl ShellApp {
                 ui.selectable_value(&mut cfg.cleanup_mode, CleanupMode::Never, "never");
             });
         });
+        ui.add_space(theme::CARD_GAP);
+        theme::card_frame().show(ui, |ui| {
+            ui.heading("Text cleanup (Ollama)");
+            self.ui_ollama_body(ui, cfg, false);
+        });
+    }
+
+    /// Body of the "Text cleanup (Ollama)" card, shared by Settings → Cleanup and the onboarding
+    /// step: server status + Install/Start, the "Off" option, the validated models, then the
+    /// installed-but-unvalidated extras. `onboarding` adds the "Skip (no cleanup)" action.
+    fn ui_ollama_body(&mut self, ui: &mut egui::Ui, cfg: &mut Config, onboarding: bool) {
+        ui.label(self.ollama.status_label());
+        if let Some(st) = self.ollama.status.clone() {
+            if !st.installed {
+                ui.horizontal(|ui| {
+                    if ui.button("Install Ollama").clicked() {
+                        permissions_ui::open_system_settings(ollama_ui::OLLAMA_DOWNLOAD_URL);
+                    }
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(ollama_ui::BREW_INSTALL_HINT).monospace(),
+                        )
+                        .selectable(true),
+                    );
+                });
+            } else if !st.running {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(st.can_start, egui::Button::new("Start"))
+                        .clicked()
+                    {
+                        self.start_ollama();
+                    }
+                    if !st.can_start {
+                        ui.label(
+                            egui::RichText::new("Start it manually (the URL is not local).")
+                                .weak()
+                                .small(),
+                        );
+                    }
+                });
+            }
+        }
+        if let Some(err) = self.ollama.last_error.clone() {
+            ui.colored_label(egui::Color32::from_rgb(0xE0, 0x3B, 0x24), err);
+        }
+        ui.add_space(6.0);
+
+        if ui
+            .selectable_label(!cfg.cleanup.enabled(), "Off (no cleanup)")
+            .clicked()
+            && cfg.cleanup.enabled()
+            && self.set_cleanup_model("")
+        {
+            cfg.cleanup.model.clear();
+        }
+        ui.add_space(4.0);
+
+        let validated: Vec<ModelEntry> = self
+            .models
+            .cleanup_validated()
+            .into_iter()
+            .cloned()
+            .collect();
+        for entry in &validated {
+            self.ui_cleanup_model_row(ui, cfg, entry);
+        }
+        let extras: Vec<ModelEntry> = self
+            .models
+            .cleanup_unvalidated()
+            .into_iter()
+            .cloned()
+            .collect();
+        if !extras.is_empty() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Installed in Ollama — not validated for Czech").strong());
+            for entry in &extras {
+                self.ui_cleanup_model_row(ui, cfg, entry);
+            }
+        }
+        if onboarding {
+            ui.add_space(6.0);
+            if ui.button("Skip (no cleanup)").clicked() && self.set_cleanup_model("") {
+                cfg.cleanup.model.clear();
+                self.onboarding.ollama_ready = true;
+                self.persist_onboarding();
+            }
+        }
+    }
+
+    /// One Ollama cleanup model: name, size, and Download / Cancel / Use / "In use ✓".
+    fn ui_cleanup_model_row(&mut self, ui: &mut egui::Ui, cfg: &mut Config, entry: &ModelEntry) {
+        let error = self.models.download_error(&entry.id).map(str::to_string);
+        let phase = self.models.phase(&entry.id);
+        let tag = entry.ollama_tag.clone().unwrap_or_default();
+        theme::card_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(model_display_name(&entry.id)).strong());
+                    ui.label(
+                        egui::RichText::new(format!("{tag} · {}", entry.size_label()))
+                            .weak()
+                            .small(),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if entry.downloading {
+                        if ui.button("Cancel").clicked() {
+                            self.cancel_model_download(&entry.id);
+                        }
+                        ui.label(download_verb(entry, phase));
+                    } else if entry.present {
+                        if entry.selected {
+                            ui.colored_label(theme::ACCENT, "In use ✓");
+                        } else if ui.button("Use").clicked() && self.set_cleanup_model(&tag) {
+                            cfg.cleanup.model = tag.clone();
+                        }
+                    } else {
+                        if ui.button("Download").clicked() {
+                            self.start_model_download(&entry.id);
+                        }
+                        if let Some(err) = &error {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xE0, 0x3B, 0x24),
+                                format!("Error: {err}"),
+                            );
+                        } else {
+                            ui.label("Not downloaded");
+                        }
+                    }
+                });
+            });
+        });
+        ui.add_space(6.0);
     }
 
     fn ui_models_section(&mut self, cfg: &mut Config, ui: &mut egui::Ui) {
@@ -1286,7 +1505,7 @@ impl ShellApp {
             }
         });
         ui.add_space(theme::CARD_GAP);
-        let ids: Vec<String> = self.models.entries.iter().map(|m| m.id.clone()).collect();
+        let ids: Vec<String> = self.models.stt_entries().map(|m| m.id.clone()).collect();
         for id in ids {
             self.ui_model_row(ui, &id);
         }
@@ -1300,8 +1519,8 @@ impl ShellApp {
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(
-                            "Power users only — point the daemon at a custom model file \
-                             instead of the managed download.",
+                            "Power users only — point the daemon at a custom speech-recognition \
+                             model file instead of the managed download.",
                         )
                         .weak()
                         .small(),
@@ -1310,15 +1529,6 @@ impl ShellApp {
                         ui.label("STT");
                         ui.text_edit_singleline(&mut cfg.models.stt);
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("Cleanup LLM");
-                        ui.text_edit_singleline(&mut self.cleanup_model_input);
-                    });
-                    ui.label(
-                        egui::RichText::new("Empty cleanup path disables the LLM cleanup stage.")
-                            .weak()
-                            .small(),
-                    );
                     ui.label(
                         egui::RichText::new(
                             "Model path changes are staged until the daemon restarts.",
@@ -1459,7 +1669,7 @@ impl ShellApp {
                 }
             });
             {
-                let ids: Vec<String> = self.models.entries.iter().map(|m| m.id.clone()).collect();
+                let ids: Vec<String> = self.models.stt_entries().map(|m| m.id.clone()).collect();
                 for id in ids {
                     ui.horizontal(|ui| {
                         ui.add_space(20.0);
@@ -1468,7 +1678,27 @@ impl ShellApp {
                 }
             }
 
-            checklist_row(ui, self.onboarding.mic_ack, "3. Microphone permission");
+            // D-0017: optional text cleanup through a local Ollama. Skippable ("Skip (no cleanup)"
+            // sets the model to "" and latches `ollama_ready`); it never blocks dictation.
+            checklist_row(
+                ui,
+                self.onboarding.ollama_ready,
+                "3. Text cleanup (Ollama, optional)",
+            );
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.vertical(|ui| match self.cfg.take() {
+                    Some(mut cfg) => {
+                        self.ui_ollama_body(ui, &mut cfg, true);
+                        self.cfg = Some(cfg);
+                    }
+                    None => {
+                        ui.label("No config loaded — is the daemon running?");
+                    }
+                });
+            });
+
+            checklist_row(ui, self.onboarding.mic_ack, "4. Microphone permission");
             ui.horizontal(|ui| {
                 ui.add_space(20.0);
                 ui.label(
@@ -1487,18 +1717,18 @@ impl ShellApp {
             // daemon build without this endpoint).
             self.ui_permission_onboarding_step(
                 ui,
-                "4. Input Monitoring permission (global hotkey)",
+                "5. Input Monitoring permission (global hotkey)",
                 permissions_ui::INPUT_MONITORING_SETTINGS_URL,
                 Permission::InputMonitoring,
             );
             self.ui_permission_onboarding_step(
                 ui,
-                "5. Accessibility permission (paste into other apps)",
+                "6. Accessibility permission (paste into other apps)",
                 permissions_ui::ACCESSIBILITY_SETTINGS_URL,
                 Permission::Accessibility,
             );
 
-            checklist_row(ui, self.onboarding.test_dictation_done, "6. Test dictation");
+            checklist_row(ui, self.onboarding.test_dictation_done, "7. Test dictation");
             ui.horizontal(|ui| {
                 ui.add_space(20.0);
                 let label = if self.active_session.is_some() {
@@ -1653,6 +1883,7 @@ impl eframe::App for ShellApp {
         self.drain_menu_events(ctx);
         self.poll_models_if_due();
         self.poll_permissions_if_due();
+        self.update_ollama_ready();
 
         // Drive the floating overlay viewport here (not in `ui()`): `logic` runs
         // every frame regardless of the main window's visibility, while `ui` is
@@ -1708,6 +1939,7 @@ impl eframe::App for ShellApp {
                 // showing the summary banner there too would just duplicate it.
                 if self.screen != Screen::Onboarding {
                     self.ui_permissions_banner(ui);
+                    self.ui_ollama_banner(ui);
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| match self.screen {
                     Screen::Onboarding => self.ui_onboarding(ui),
@@ -1737,13 +1969,27 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
+/// "Verifying…" / "Downloading NN%"; "Downloading…" while the total is unknown (an Ollama pull's
+/// status-only lines report `total == 0`) so the label never shows a bogus 0%.
+fn download_verb(entry: &ModelEntry, phase: Option<DownloadPhase>) -> String {
+    if phase == Some(DownloadPhase::Verifying) {
+        "Verifying…".to_string()
+    } else {
+        entry.progress_percent().map_or_else(
+            || "Downloading…".to_string(),
+            |p| format!("Downloading {p}%"),
+        )
+    }
+}
+
 /// A short human label for a catalog model id (D-0015), so the three model-download surfaces
 /// don't show the raw `stt-large-v3-turbo` id verbatim.
 fn model_display_name(id: &str) -> &str {
     match id {
         "stt-large-v3-turbo" => "Speech recognition (Whisper large-v3-turbo)",
-        "cleanup-qwen3-8b" => "Cleanup LLM (Qwen3-8B, optional)",
-        other => other,
+        "cleanup-qwen3-vl-8b-instruct" => "Qwen3-VL 8B Instruct (default)",
+        "cleanup-qwen3-8b" => "Qwen3 8B",
+        other => other.strip_prefix("ollama:").unwrap_or(other),
     }
 }
 

@@ -129,6 +129,12 @@ mod tests {
         fn platform_permissions(&self) -> Result<PlatformPermissions, ApiError> {
             self.0.clone()
         }
+        fn ollama_status(&self) -> Result<crate::api::OllamaStatus, ApiError> {
+            unimplemented!()
+        }
+        fn start_ollama(&self) -> Result<(), ApiError> {
+            unimplemented!()
+        }
     }
 
     fn permissions(input_monitoring: &str, accessibility: &str) -> PlatformPermissions {

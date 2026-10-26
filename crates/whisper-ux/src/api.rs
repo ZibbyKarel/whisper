@@ -258,17 +258,43 @@ pub struct ModelEntry {
     pub id: String,
     /// `"stt"` | `"cleanup"`.
     pub kind: String,
-    pub filename: String,
+    /// `"file"` | `"ollama"` (D-0017); an older daemon omits it, which means `"file"`.
+    #[serde(default = "default_model_source")]
+    pub source: String,
+    /// The Ollama tag (`ollama` source only).
+    #[serde(default)]
+    pub ollama_tag: Option<String>,
+    /// In the validated catalog (checked on real Czech samples).
+    #[serde(default)]
+    pub validated: bool,
+    /// `cleanup.model` names this entry.
+    #[serde(default)]
+    pub selected: bool,
+    /// `file` source only.
+    #[serde(default)]
+    pub filename: Option<String>,
     pub required: bool,
     pub size_bytes: u64,
     pub present: bool,
-    pub path: String,
+    /// Resolved on-disk target (`file` source only).
+    #[serde(default)]
+    pub path: Option<String>,
     pub downloading: bool,
     #[serde(default)]
     pub progress: Option<ModelProgress>,
 }
 
+fn default_model_source() -> String {
+    "file".to_string()
+}
+
 impl ModelEntry {
+    /// `true` for an entry served by the local Ollama server rather than a downloaded file.
+    #[must_use]
+    pub fn is_ollama(&self) -> bool {
+        self.source == "ollama"
+    }
+
     /// Human-readable size, e.g. `"547 MB"` / `"4.7 GB"` — used by every model-download
     /// surface (startup gate, Settings → Models, onboarding) so formatting stays consistent.
     #[must_use]
@@ -297,6 +323,20 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.0} MB", b / MB)
     }
+}
+
+/// `GET /v1/ollama` body (mirror of `OllamaStatusDto`, D-0017): whether a local Ollama is
+/// installed/running at the configured `cleanup.ollama_url`, and whether the daemon may start it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OllamaStatus {
+    pub installed: bool,
+    pub running: bool,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub can_start: bool,
 }
 
 /// `GET /v1/models` body (mirror of `ModelsListResponse`).
@@ -537,6 +577,18 @@ pub enum ApiEvent {
         error: Option<String>,
         ts_ms: u64,
     },
+    /// The local Ollama server's state changed (mirror of the daemon's `ollama.status`,
+    /// D-0017): emitted when a `POST /v1/ollama/start` finishes.
+    #[serde(rename = "ollama.status")]
+    OllamaStatus {
+        installed: bool,
+        running: bool,
+        #[serde(default)]
+        version: Option<String>,
+        url: String,
+        can_start: bool,
+        ts_ms: u64,
+    },
 }
 
 /// Result of decoding one WS text frame. Tolerant by design: an unknown `type`
@@ -594,6 +646,7 @@ mod tests {
     const AUDIO_LEVEL: &str =
         r#"{"type":"audio.level","session_id":"s1","rms":0.12,"peak":0.4,"ts_ms":15}"#;
     const MODEL_DOWNLOAD: &str = r#"{"type":"model.download","id":"stt-large-v3-turbo","downloaded":100,"total":574041195,"phase":"downloading","ts_ms":16}"#;
+    const OLLAMA_STATUS_EVENT: &str = r#"{"type":"ollama.status","installed":true,"running":true,"version":"0.12.3","url":"http://127.0.0.1:11434","can_start":false,"ts_ms":18}"#;
     const MODEL_DOWNLOAD_ERROR: &str = r#"{"type":"model.download","id":"stt-large-v3-turbo","downloaded":0,"total":574041195,"phase":"error","error":"integrity check failed","ts_ms":17}"#;
 
     #[test]
@@ -617,6 +670,7 @@ mod tests {
             AUDIO_LEVEL,
             MODEL_DOWNLOAD,
             MODEL_DOWNLOAD_ERROR,
+            OLLAMA_STATUS_EVENT,
         ];
         for fixture in all {
             assert!(
@@ -698,12 +752,19 @@ mod tests {
     fn models_list_response_parses_the_daemon_shape() {
         // Fixture copied from the real `GET /v1/models` shape in daemon/api.rs.
         let json = r#"{"models":[
-            {"id":"stt-large-v3-turbo","kind":"stt","filename":"ggml-large-v3-turbo-q5_0.bin","required":true,"size_bytes":574041195,"present":false,"path":"/data/models/ggml-large-v3-turbo-q5_0.bin","downloading":true,"progress":{"downloaded":1000,"total":574041195}},
-            {"id":"cleanup-qwen3-8b","kind":"cleanup","filename":"Qwen3-8B-Q4_K_M.gguf","required":false,"size_bytes":5027783488,"present":true,"path":"/data/models/Qwen3-8B-Q4_K_M.gguf","downloading":false,"progress":null}
+            {"id":"stt-large-v3-turbo","kind":"stt","source":"file","ollama_tag":null,"validated":true,"selected":false,"filename":"ggml-large-v3-turbo-q5_0.bin","required":true,"size_bytes":574041195,"present":false,"path":"/data/models/ggml-large-v3-turbo-q5_0.bin","downloading":true,"progress":{"downloaded":1000,"total":574041195}},
+            {"id":"cleanup-qwen3-vl-8b-instruct","kind":"cleanup","source":"ollama","ollama_tag":"qwen3-vl:8b-instruct","validated":true,"selected":true,"filename":null,"required":false,"size_bytes":6100000000,"present":true,"path":null,"downloading":false,"progress":null},
+            {"id":"ollama:gemma3:12b","kind":"cleanup","source":"ollama","ollama_tag":"gemma3:12b","validated":false,"selected":false,"filename":null,"required":false,"size_bytes":8100000000,"present":true,"path":null,"downloading":false,"progress":null}
         ]}"#;
         let resp: ModelsListResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.models.len(), 2);
+        assert_eq!(resp.models.len(), 3);
         let stt = &resp.models[0];
+        assert_eq!(stt.source, "file");
+        assert_eq!(
+            stt.filename.as_deref(),
+            Some("ggml-large-v3-turbo-q5_0.bin")
+        );
+        assert!(stt.validated && !stt.is_ollama());
         assert!(stt.required);
         assert!(!stt.present);
         assert!(stt.downloading);
@@ -718,6 +779,14 @@ mod tests {
         assert_eq!(stt.size_label(), "574 MB");
 
         let cleanup = &resp.models[1];
+        assert!(cleanup.is_ollama());
+        assert!(cleanup.selected && cleanup.validated);
+        assert_eq!(cleanup.ollama_tag.as_deref(), Some("qwen3-vl:8b-instruct"));
+        assert_eq!(cleanup.filename, None);
+        assert_eq!(cleanup.path, None);
+        let extra = &resp.models[2];
+        assert!(!extra.validated && extra.is_ollama());
+        assert_eq!(extra.ollama_tag.as_deref(), Some("gemma3:12b"));
         assert!(cleanup.present);
         assert!(!cleanup.downloading);
         assert_eq!(cleanup.progress, None);
@@ -725,15 +794,79 @@ mod tests {
     }
 
     #[test]
+    fn older_daemon_models_payload_still_deserializes() {
+        // Pre-D-0017 shape: string filename/path, none of source/ollama_tag/validated/selected.
+        let json = r#"{"models":[
+            {"id":"cleanup-qwen3-8b","kind":"cleanup","filename":"Qwen3-8B-Q4_K_M.gguf","required":false,"size_bytes":5027783488,"present":true,"path":"/data/models/Qwen3-8B-Q4_K_M.gguf","downloading":false,"progress":null}
+        ]}"#;
+        let resp: ModelsListResponse = serde_json::from_str(json).unwrap();
+        let m = &resp.models[0];
+        assert_eq!(m.source, "file");
+        assert!(!m.is_ollama() && !m.validated && !m.selected);
+        assert_eq!(m.ollama_tag, None);
+        assert_eq!(m.filename.as_deref(), Some("Qwen3-8B-Q4_K_M.gguf"));
+        assert_eq!(m.path.as_deref(), Some("/data/models/Qwen3-8B-Q4_K_M.gguf"));
+    }
+
+    #[test]
+    fn older_daemon_config_with_legacy_cleanup_path_parses() {
+        let json = r#"{"models":{"stt":"x","cleanup":"/abs/Qwen3-8B-Q4_K_M.gguf"}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.models.stt, "x");
+        assert_eq!(cfg.cleanup, CleanupConfig::default());
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert!(v["models"].get("cleanup").is_none());
+    }
+
+    #[test]
+    fn ollama_status_parses_the_daemon_shape() {
+        // Fixtures mirror `ollama_status_dto_wire_shape` in daemon/api.rs.
+        let running: OllamaStatus = serde_json::from_str(
+            r#"{"installed":true,"running":true,"version":"0.12.3","url":"http://127.0.0.1:11434","can_start":false}"#,
+        )
+        .unwrap();
+        assert!(running.installed && running.running && !running.can_start);
+        assert_eq!(running.version.as_deref(), Some("0.12.3"));
+        assert_eq!(running.url, "http://127.0.0.1:11434");
+        let stopped: OllamaStatus = serde_json::from_str(
+            r#"{"installed":true,"running":false,"version":null,"url":"http://127.0.0.1:11434","can_start":true}"#,
+        )
+        .unwrap();
+        assert_eq!(stopped.version, None);
+        assert!(stopped.can_start);
+    }
+
+    #[test]
+    fn ollama_status_event_fields_decoded() {
+        match parse_event(OLLAMA_STATUS_EVENT) {
+            Incoming::Known(ApiEvent::OllamaStatus {
+                installed,
+                running,
+                version,
+                can_start,
+                ..
+            }) => {
+                assert!(installed && running && !can_start);
+                assert_eq!(version.as_deref(), Some("0.12.3"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn size_label_formats_mb_and_gb() {
         let mut m = ModelEntry {
             id: "x".to_string(),
             kind: "stt".to_string(),
-            filename: "x.bin".to_string(),
+            source: "file".to_string(),
+            ollama_tag: None,
+            validated: true,
+            selected: false,
+            filename: Some("x.bin".to_string()),
             required: true,
             size_bytes: 547_000_000,
             present: false,
-            path: String::new(),
+            path: None,
             downloading: false,
             progress: None,
         };

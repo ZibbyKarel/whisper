@@ -17,6 +17,7 @@ pub mod dict_editor;
 pub mod icons;
 pub mod language;
 pub mod models_ui;
+pub mod ollama_ui;
 pub mod onboarding;
 pub mod overlay;
 pub mod permissions_ui;

@@ -63,10 +63,15 @@ impl ModelsPanel {
                 self.download_errors.remove(id);
                 if let Some(entry) = self.entry_mut(id) {
                     entry.downloading = true;
-                    entry.progress = Some(ModelProgress {
-                        downloaded: *downloaded,
-                        total: *total,
-                    });
+                    // Ollama pull status-only lines report `total == 0`: keep the last known
+                    // progress (no flicker to 0%); with none yet, stay indeterminate
+                    // (`progress_percent()` is `None` for a zero total).
+                    if *total > 0 || entry.progress.is_none() {
+                        entry.progress = Some(ModelProgress {
+                            downloaded: *downloaded,
+                            total: *total,
+                        });
+                    }
                 }
             }
             DownloadPhase::Done => {
@@ -138,6 +143,35 @@ impl ModelsPanel {
         }
     }
 
+    /// Cleanup models served by Ollama that are in the validated (Czech-checked) catalog.
+    #[must_use]
+    pub fn cleanup_validated(&self) -> Vec<&ModelEntry> {
+        self.cleanup_entries().filter(|m| m.validated).collect()
+    }
+
+    /// Cleanup models installed in Ollama outside the validated catalog.
+    #[must_use]
+    pub fn cleanup_unvalidated(&self) -> Vec<&ModelEntry> {
+        self.cleanup_entries().filter(|m| !m.validated).collect()
+    }
+
+    /// The cleanup entry `cleanup.model` currently names, if the daemon lists one.
+    #[must_use]
+    pub fn selected_cleanup(&self) -> Option<&ModelEntry> {
+        self.cleanup_entries().find(|m| m.selected)
+    }
+
+    /// Speech-recognition entries (the only ones the startup gate/onboarding model step show).
+    pub fn stt_entries(&self) -> impl Iterator<Item = &ModelEntry> {
+        self.entries.iter().filter(|m| m.kind == "stt")
+    }
+
+    fn cleanup_entries(&self) -> impl Iterator<Item = &ModelEntry> {
+        self.entries
+            .iter()
+            .filter(|m| m.kind == "cleanup" && m.is_ollama())
+    }
+
     /// Every catalog model marked `required` that is not yet `present`.
     #[must_use]
     pub fn missing_required(&self) -> Vec<&ModelEntry> {
@@ -168,11 +202,15 @@ mod tests {
             } else {
                 "cleanup".to_string()
             },
-            filename: format!("{id}.bin"),
+            source: "file".to_string(),
+            ollama_tag: None,
+            validated: true,
+            selected: false,
+            filename: Some(format!("{id}.bin")),
             required,
             size_bytes: 1_000,
             present,
-            path: format!("/data/{id}.bin"),
+            path: Some(format!("/data/{id}.bin")),
             downloading: false,
             progress: None,
         }
@@ -222,6 +260,12 @@ mod tests {
             unimplemented!()
         }
         fn platform_permissions(&self) -> Result<crate::api::PlatformPermissions, ApiError> {
+            unimplemented!()
+        }
+        fn ollama_status(&self) -> Result<crate::api::OllamaStatus, ApiError> {
+            unimplemented!()
+        }
+        fn start_ollama(&self) -> Result<(), ApiError> {
             unimplemented!()
         }
     }
@@ -468,5 +512,99 @@ mod tests {
             ts_ms: 1,
         });
         assert!(panel.entries.is_empty());
+    }
+
+    fn ollama_entry(id: &str, tag: &str, validated: bool, selected: bool) -> ModelEntry {
+        ModelEntry {
+            source: "ollama".to_string(),
+            ollama_tag: Some(tag.to_string()),
+            validated,
+            selected,
+            filename: None,
+            path: None,
+            ..entry(id, false, true)
+        }
+    }
+
+    #[test]
+    fn cleanup_lists_split_validated_vs_unvalidated_and_find_selected() {
+        let panel = ModelsPanel {
+            entries: vec![
+                entry("stt-large-v3-turbo", true, true),
+                ollama_entry(
+                    "cleanup-qwen3-vl-8b-instruct",
+                    "qwen3-vl:8b-instruct",
+                    true,
+                    false,
+                ),
+                ollama_entry("cleanup-qwen3-8b", "qwen3:8b", true, false),
+                ollama_entry("ollama:gemma3:12b", "gemma3:12b", false, true),
+            ],
+            ..Default::default()
+        };
+        let validated: Vec<_> = panel
+            .cleanup_validated()
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(
+            validated,
+            ["cleanup-qwen3-vl-8b-instruct", "cleanup-qwen3-8b"]
+        );
+        let extra: Vec<_> = panel
+            .cleanup_unvalidated()
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(extra, ["ollama:gemma3:12b"]);
+        assert_eq!(panel.selected_cleanup().unwrap().id, "ollama:gemma3:12b");
+        let stt: Vec<_> = panel.stt_entries().map(|m| m.id.as_str()).collect();
+        assert_eq!(stt, ["stt-large-v3-turbo"]);
+        // The gate stays STT-only: cleanup is never `required`.
+        assert!(panel.required_satisfied());
+    }
+
+    #[test]
+    fn selected_cleanup_none_when_nothing_selected() {
+        let panel = ModelsPanel {
+            entries: vec![ollama_entry("cleanup-qwen3-8b", "qwen3:8b", true, false)],
+            ..Default::default()
+        };
+        assert!(panel.selected_cleanup().is_none());
+    }
+
+    #[test]
+    fn zero_total_progress_event_keeps_last_known_percent() {
+        let mut e = ollama_entry("cleanup-qwen3-8b", "qwen3:8b", true, false);
+        e.present = false;
+        let mut panel = ModelsPanel {
+            entries: vec![e],
+            ..Default::default()
+        };
+        let ev = |downloaded, total| ApiEvent::ModelDownload {
+            id: "cleanup-qwen3-8b".to_string(),
+            downloaded,
+            total,
+            phase: DownloadPhase::Downloading,
+            error: None,
+            ts_ms: 1,
+        };
+        // Status-only line first: indeterminate, never NaN/0%.
+        panel.apply_event(&ev(0, 0));
+        assert_eq!(
+            panel.entry("cleanup-qwen3-8b").unwrap().progress_percent(),
+            None
+        );
+        panel.apply_event(&ev(500, 1_000));
+        assert_eq!(
+            panel.entry("cleanup-qwen3-8b").unwrap().progress_percent(),
+            Some(50)
+        );
+        // A later status-only line must not reset it.
+        panel.apply_event(&ev(0, 0));
+        assert_eq!(
+            panel.entry("cleanup-qwen3-8b").unwrap().progress_percent(),
+            Some(50)
+        );
     }
 }

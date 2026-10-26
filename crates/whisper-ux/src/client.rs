@@ -8,7 +8,7 @@ use std::time::Duration;
 use ureq::Agent;
 
 use crate::api::{
-    Config, ConfigUpdateResponse, ErrorEnvelope, HealthResponse, ModelsListResponse,
+    Config, ConfigUpdateResponse, ErrorEnvelope, HealthResponse, ModelsListResponse, OllamaStatus,
     PlatformPermissions, SessionAccepted, SessionRecord, StatusResponse,
 };
 
@@ -65,6 +65,12 @@ pub trait Api {
     /// `GET /v1/platform/permissions` — current macOS TCC grant status for the hotkey/paste
     /// path (D-0016).
     fn platform_permissions(&self) -> Result<PlatformPermissions, ApiError>;
+    /// `GET /v1/ollama` — is a local Ollama installed/running, and may the daemon start it
+    /// (D-0017).
+    fn ollama_status(&self) -> Result<OllamaStatus, ApiError>;
+    /// `POST /v1/ollama/start` — ask the daemon to start the local Ollama (`202`; `409
+    /// ollama_not_startable` when it cannot).
+    fn start_ollama(&self) -> Result<(), ApiError>;
 }
 
 /// ureq-backed [`Api`] implementation.
@@ -249,6 +255,14 @@ impl Api for HttpClient {
 
     fn platform_permissions(&self) -> Result<PlatformPermissions, ApiError> {
         decode(self.get_value("/v1/platform/permissions")?)
+    }
+
+    fn ollama_status(&self) -> Result<OllamaStatus, ApiError> {
+        decode(self.get_value("/v1/ollama")?)
+    }
+
+    fn start_ollama(&self) -> Result<(), ApiError> {
+        self.call_status_only(false, "/v1/ollama/start")
     }
 }
 
@@ -449,6 +463,39 @@ mod tests {
         let p = client.platform_permissions().unwrap();
         assert_eq!(p.input_monitoring, "denied");
         assert_eq!(p.accessibility, "granted");
+    }
+
+    #[test]
+    fn ollama_status_parses_body_and_hits_the_route() {
+        let (base, rx) = mock_once(
+            "200 OK",
+            r#"{"installed":true,"running":false,"version":null,"url":"http://127.0.0.1:11434","can_start":true}"#,
+        );
+        let client = HttpClient::new(base, None);
+        let st = client.ollama_status().unwrap();
+        assert!(st.installed && !st.running && st.can_start);
+        assert!(rx.recv().unwrap().starts_with("GET /v1/ollama "));
+    }
+
+    #[test]
+    fn start_ollama_accepts_202_and_surfaces_409_code() {
+        let (base, rx) = mock_once("202 Accepted", "");
+        let client = HttpClient::new(base, None);
+        client.start_ollama().unwrap();
+        assert!(rx.recv().unwrap().starts_with("POST /v1/ollama/start "));
+
+        let (base, _rx) = mock_once(
+            "409 Conflict",
+            r#"{"error":{"code":"ollama_not_startable","message":"not startable"}}"#,
+        );
+        let client = HttpClient::new(base, None);
+        match client.start_ollama() {
+            Err(ApiError::Http { status, code, .. }) => {
+                assert_eq!(status, 409);
+                assert_eq!(code, "ollama_not_startable");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
