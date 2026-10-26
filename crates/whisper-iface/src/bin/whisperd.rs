@@ -41,6 +41,12 @@ async fn run() -> Result<(), String> {
     }
 
     let stt = config.models.stt.clone();
+    if let Some(legacy) = &config.models.cleanup {
+        eprintln!(
+            "whisperd: [models].cleanup = {} is legacy and ignored; cleanup now uses [cleanup] (Ollama)",
+            legacy.display()
+        );
+    }
     let cleanup = config.models.cleanup.clone();
 
     // Compose the platform adapters only when built with `--features platform` (D-0012); the

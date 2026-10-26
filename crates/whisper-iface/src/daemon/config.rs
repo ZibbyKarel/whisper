@@ -3,7 +3,7 @@
 //! the `GET/PUT /v1/config` JSON body, so the wire contract and the on-disk format never drift.
 //!
 //! Field order is load-bearing for TOML serialization: scalar fields must precede the
-//! `[models]` / `[history]` tables (TOML requires tables after values).
+//! `[models]` / `[cleanup]` / `[history]` tables (TOML requires tables after values).
 
 use std::path::{Path, PathBuf};
 
@@ -33,20 +33,14 @@ fn default_stt_model() -> PathBuf {
     PathBuf::from("models/ggml-large-v3-turbo-q5_0.bin")
 }
 
-fn default_cleanup_model() -> Option<PathBuf> {
-    Some(PathBuf::from("models/Qwen3-8B-Q4_K_M.gguf"))
-}
-
-/// Resident model paths (D-0004 STT, D-0005 cleanup LLM).
+/// Resident STT model path (D-0004). Cleanup is served by Ollama, see [`CleanupConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelsConfig {
     #[serde(default = "default_stt_model")]
     pub stt: PathBuf,
-    /// `None` disables the cleanup stage entirely (a supported profile, D-0005).
-    #[serde(
-        default = "default_cleanup_model",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Legacy in-process GGUF path: still parsed so old config files load, but ignored and
+    /// never written back (D-0017). Cleanup is configured by `[cleanup]`.
+    #[serde(default, skip_serializing)]
     pub cleanup: Option<PathBuf>,
 }
 
@@ -54,8 +48,46 @@ impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
             stt: default_stt_model(),
-            cleanup: default_cleanup_model(),
+            cleanup: None,
         }
+    }
+}
+
+fn default_ollama_url() -> String {
+    "http://127.0.0.1:11434".to_string()
+}
+
+fn default_cleanup_model_tag() -> String {
+    "qwen3-vl:8b-instruct".to_string()
+}
+
+fn default_keep_alive() -> String {
+    "30m".to_string()
+}
+
+/// Cleanup LLM served by a local Ollama server (D-0017). An empty `model` disables the cleanup
+/// stage entirely (a supported profile, D-0005).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CleanupConfig {
+    pub ollama_url: String,
+    pub model: String,
+    pub keep_alive: String,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            ollama_url: default_ollama_url(),
+            model: default_cleanup_model_tag(),
+            keep_alive: default_keep_alive(),
+        }
+    }
+}
+
+impl CleanupConfig {
+    pub fn enabled(&self) -> bool {
+        !self.model.trim().is_empty()
     }
 }
 
@@ -249,6 +281,8 @@ pub struct Config {
     #[serde(default)]
     pub models: ModelsConfig,
     #[serde(default)]
+    pub cleanup: CleanupConfig,
+    #[serde(default)]
     pub history: HistoryConfig,
     #[serde(default)]
     pub hotkey: HotkeyConfig,
@@ -269,6 +303,7 @@ impl Default for Config {
             delivery: DeliveryMode::default(),
             dictionary_path: None,
             models: ModelsConfig::default(),
+            cleanup: CleanupConfig::default(),
             history: HistoryConfig::default(),
             hotkey: HotkeyConfig::default(),
             vad: VadTuning::default(),
@@ -297,9 +332,6 @@ impl Config {
     /// unchanged so the existing not-found error path still reports it.
     pub fn resolve_model_paths(&mut self, data_dir: &Path) {
         self.models.stt = resolve_model_path(&self.models.stt, data_dir, |p| p.exists());
-        if let Some(cleanup) = &self.models.cleanup {
-            self.models.cleanup = Some(resolve_model_path(cleanup, data_dir, |p| p.exists()));
-        }
     }
 
     /// Load from `path`, or return defaults if the file does not exist. A malformed file is a
@@ -461,23 +493,62 @@ mod tests {
     }
 
     #[test]
-    fn resolve_model_paths_updates_both_models() {
+    fn resolve_model_paths_rebases_stt_and_ignores_legacy_cleanup() {
         let data = Path::new("/support/whisper-engine");
         let mut cfg = Config::default();
         cfg.models.stt = PathBuf::from("models/stt.bin");
-        cfg.models.cleanup = Some(PathBuf::from("models/llm.gguf"));
-        // Simulate both present only under data_dir.
         let stt_at = data.join("models/stt.bin");
-        let llm_at = data.join("models/llm.gguf");
         // resolve_model_paths uses the real `Path::exists`, so exercise the pure
         // helper here and assert the method delegates to it consistently.
         assert_eq!(
             resolve_model_path(&cfg.models.stt, data, |p| p == stt_at),
             stt_at
         );
-        assert_eq!(
-            resolve_model_path(cfg.models.cleanup.as_ref().unwrap(), data, |p| p == llm_at),
-            llm_at
+        // The legacy cleanup path is never rebased (D-0017).
+        cfg.models.cleanup = Some(PathBuf::from("models/llm.gguf"));
+        cfg.resolve_model_paths(data);
+        assert_eq!(cfg.models.cleanup, Some(PathBuf::from("models/llm.gguf")));
+    }
+
+    #[test]
+    fn default_cleanup_is_qwen3_vl_on_ollama() {
+        let c = Config::default().cleanup;
+        assert_eq!(c.ollama_url, "http://127.0.0.1:11434");
+        assert_eq!(c.model, "qwen3-vl:8b-instruct");
+        assert_eq!(c.keep_alive, "30m");
+        assert!(c.enabled());
+        assert_eq!(Config::default().models.cleanup, None);
+    }
+
+    #[test]
+    fn legacy_models_cleanup_parses_and_is_ignored() {
+        let cfg = Config::from_toml_str(
+            "[models]\nstt = \"x.bin\"\ncleanup = \"/abs/Qwen3-8B-Q4_K_M.gguf\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.cleanup.model, "qwen3-vl:8b-instruct");
+        assert!(cfg.models.cleanup.is_some());
+        let out = cfg.to_toml_string().unwrap();
+        assert!(
+            !out.contains("Qwen3-8B"),
+            "legacy path re-serialized: {out}"
         );
+    }
+
+    #[test]
+    fn empty_model_disables() {
+        let cfg = Config::from_toml_str("[cleanup]\nmodel = \"\"\n").unwrap();
+        assert!(!cfg.cleanup.enabled());
+        let cfg = Config::from_toml_str("[cleanup]\nmodel = \"  \"\n").unwrap();
+        assert!(!cfg.cleanup.enabled());
+    }
+
+    #[test]
+    fn cleanup_section_parses_partial_with_czech_model_tag() {
+        let cfg = Config::from_toml_str("[cleanup]\nmodel = \"příliš:žluťoučký\"\n").unwrap();
+        assert_eq!(cfg.cleanup.model, "příliš:žluťoučký");
+        assert_eq!(cfg.cleanup.ollama_url, "http://127.0.0.1:11434");
+        let back = Config::from_toml_str(&cfg.to_toml_string().unwrap()).unwrap();
+        assert_eq!(cfg, back);
     }
 }

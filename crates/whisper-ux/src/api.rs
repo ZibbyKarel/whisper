@@ -47,8 +47,35 @@ pub enum HotkeyMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelsConfig {
     pub stt: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy in-process GGUF path, ignored by the daemon (D-0017); never sent back.
+    #[serde(default, skip_serializing)]
     pub cleanup: Option<String>,
+}
+
+/// Cleanup LLM on a local Ollama server (mirror of `CleanupConfig`, `[cleanup]`, D-0017).
+/// An empty `model` disables cleanup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CleanupConfig {
+    pub ollama_url: String,
+    pub model: String,
+    pub keep_alive: String,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            ollama_url: "http://127.0.0.1:11434".to_string(),
+            model: "qwen3-vl:8b-instruct".to_string(),
+            keep_alive: "30m".to_string(),
+        }
+    }
+}
+
+impl CleanupConfig {
+    pub fn enabled(&self) -> bool {
+        !self.model.trim().is_empty()
+    }
 }
 
 /// Global hotkey configuration (mirror of `HotkeyConfig`).
@@ -123,6 +150,7 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dictionary_path: Option<String>,
     pub models: ModelsConfig,
+    pub cleanup: CleanupConfig,
     pub history: HistoryConfig,
     pub hotkey: HotkeyConfig,
     pub vad: VadTuning,
@@ -141,8 +169,9 @@ impl Default for Config {
             dictionary_path: None,
             models: ModelsConfig {
                 stt: "models/ggml-large-v3-turbo-q5_0.bin".to_string(),
-                cleanup: Some("models/Qwen3-8B-Q4_K_M.gguf".to_string()),
+                cleanup: None,
             },
+            cleanup: CleanupConfig::default(),
             history: HistoryConfig::default(),
             hotkey: HotkeyConfig {
                 // Daemon default is moving to a modifier-only combo with the
@@ -745,6 +774,24 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.hotkey.enabled);
         assert_eq!(cfg.hotkey.combo, "Ctrl+Alt");
+    }
+
+    #[test]
+    fn config_cleanup_section_json_fixture_round_trips() {
+        // Fixture mirrors the daemon's `/v1/config` body for `[cleanup]` (D-0017).
+        let json = r#"{"cleanup":{"ollama_url":"http://127.0.0.1:11434","model":"qwen3-vl:8b-instruct","keep_alive":"30m"}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.cleanup, CleanupConfig::default());
+        assert!(cfg.cleanup.enabled());
+        let v: serde_json::Value = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["cleanup"]["model"], "qwen3-vl:8b-instruct");
+        assert_eq!(v["cleanup"]["keep_alive"], "30m");
+        assert!(v["models"].get("cleanup").is_none());
+        let back: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(cfg, back);
+
+        let off: Config = serde_json::from_str(r#"{"cleanup":{"model":""}}"#).unwrap();
+        assert!(!off.cleanup.enabled());
     }
 
     #[test]
