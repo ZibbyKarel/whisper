@@ -58,8 +58,8 @@ trait TextSink      { fn deliver(&self, text: &str) -> DeliverResult; }  // inje
 trait Clock/EventBus…                                                    // testability
 ```
 
-Production adapters: cpal mic, whisper.cpp (whisper-rs), llama.cpp (qwen3:8b GGUF),
-pasteboard-paste. **Adapter placement:** production STT/LLM adapters live in
+Production adapters: cpal mic, whisper.cpp (whisper-rs), `OllamaCleanupEngine` (HTTP to the
+shared local Ollama server, default `qwen3-vl:8b-instruct`, D-0017), pasteboard-paste. **Adapter placement:** production STT/LLM adapters live in
 `whisper-iface` (heavy native deps); `whisper-core` depends only on the traits, keeping
 it a genuinely pure lib and CI hardware-free. Test adapters: fixture WAVs, canned STT,
 identity cleanup, capture sink. `AudioSource` reports device loss (mic disconnect —
@@ -98,7 +98,8 @@ cleanup gate: skip LLM if no disfluency/self-correction markers detected
    │ marker set is a Phase-3 deliverable, tuned on real recordings; note that
    │ self-correction handling is UNVALIDATED until LLM round 2 (few-shot prompt)
    ▼
-LLM cleanup (llama.cpp, qwen3:8b, few-shot anti-paraphrase prompt) — OPTIONAL per profile
+LLM cleanup (local Ollama `/api/chat`, qwen3-vl:8b-instruct, few-shot anti-paraphrase prompt) — OPTIONAL per profile
+   │ any engine error/timeout (20 s) → dictionary text delivered, skip reason `engine_failed`
    │ trap-safety contract: dictated questions/commands are transcribed, never answered
    ▼
 TextFinal event → TextSink (platform injection) + WS event + history
@@ -112,8 +113,8 @@ session — a failed stage returns the best text so far (raw transcript beats no
 
 Model lifecycle failures are first-class: if the STT model fails to load (missing GGUF,
 OOM), the engine emits `model.load_failed`, stays up, and rejects sessions with a
-structured error; if only the cleanup LLM fails, the engine degrades to cleanup-off and
-says so in `/v1/status`. Concurrency: **one active dictation session per engine**
+structured error; if only the cleanup LLM fails (Ollama missing/stopped, model not pulled), the engine
+degrades to cleanup-off and says so in `/v1/status` (phase `degraded`); STT keeps working. Concurrency: **one active dictation session per engine**
 (`409 Conflict` on start-while-busy); `/v1/transcribe` one-shots queue behind the active
 session for the shared STT/LLM resources (bounded queue, structured busy error beyond it).
 
@@ -140,7 +141,7 @@ release.
 | earlier segments | 0 ms at release (decoded during recording) | design (§3.2) |
 | dictionary pass | <1 ms | string ops |
 | cleanup gate: skipped | 0 ms (est. ~40 % of cases per FreeFlow) | |
-| cleanup LLM (when it runs) | ~1.1 s (in-process, release, KV-prefix cached; 0.5–2.7 s by input length) | D-0005 guard, round 2 |
+| cleanup LLM (when it runs) | ~1.3 s (Ollama on localhost, `qwen3-vl:8b-instruct`, model kept warm via `keep_alive`) | D-0017 gate |
 | injection (paste) | ~50 ms | |
 
 Mitigations: segment-granular partials over WS (UX shows text as segments close), models
@@ -157,9 +158,13 @@ Local-only by default (`127.0.0.1`, token auth optional). JSON everywhere.
   (audio from mic port, or `audio_b64`/file for headless use).
 - `POST /v1/transcribe` — one-shot: audio in → final text out (the embeddable primitive).
 - `GET/PUT /v1/config`, `GET/PUT /v1/dictionary` — runtime configuration.
+- `GET /v1/ollama` (installed/running/version/can_start), `POST /v1/ollama/start` — the
+  daemon probes and (loopback only) starts the shared Ollama server; the tray never talks
+  to Ollama directly (D-0017).
 - `WS /v1/events` — `session.started|partial_transcript|raw_transcript|cleaned|delivered|
   cancelled|failed`, `secure_input.blocked`, `audio.device_lost`,
-  `model.loading|ready|load_failed`. Events are best-effort; the authoritative final
+  `model.loading|ready|load_failed`, `model.download`, `ollama.status`.
+  Events are best-effort; the authoritative final
   result of any session is persisted and retrievable via `GET /v1/sessions/{id}` — a WS
   client disconnecting mid-session does not cancel the session or lose the result.
 - Plugins/processing injection (Phase 4, not MVP): an orchestrator may register a
