@@ -639,11 +639,12 @@ pub async fn start_model_download(
     let registry = state.model_downloads.clone();
     let model_id = model.id.to_string();
     let rewarm_state = state.clone();
+    let selected_model = state.cleanup_model.clone();
 
     tokio::spawn(async move {
         let progress_events = events.clone();
         let progress_id = model_id.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let rewarm = tokio::task::spawn_blocking(move || {
             let on_progress = move |p: DownloadProgress| {
                 let _ = progress_events.send(model_download_event(&progress_id, &p));
             };
@@ -651,21 +652,21 @@ pub async fn start_model_download(
                 models::run_pull(model, &OllamaClient::new(ollama_url), &handle, on_progress);
                 // A finished pull of the selected cleanup model clears a stale "model missing".
                 let pulled = handle.snapshot().phase == DownloadPhase::Done;
-                let selected = rewarm_state
-                    .cleanup_model
-                    .read()
-                    .expect("cleanup model lock")
-                    .clone();
-                if pulled && normalize_tag(tag) == normalize_tag(&selected) {
-                    rewarm_cleanup(&rewarm_state);
-                }
+                let selected = selected_model.read().expect("cleanup model lock").clone();
+                pulled && normalize_tag(tag) == normalize_tag(&selected)
             } else {
                 models::run_download(model, &data_dir, &handle, on_progress);
+                false
             }
         })
-        .await;
+        .await
+        .unwrap_or(false);
         // Terminal (done/error/cancel) — free the slot so a retry can begin fresh.
         registry.end(&model_id);
+        // Re-warm only after the slot is free, so the model load doesn't hold `downloading`.
+        if rewarm {
+            let _ = tokio::task::spawn_blocking(move || rewarm_cleanup(&rewarm_state)).await;
+        }
     });
 
     Ok(StatusCode::ACCEPTED)
@@ -944,15 +945,18 @@ pub async fn start_ollama(State(state): State<Arc<AppState>>) -> Result<StatusCo
                 Some(inst) => ollama_probe::start(&inst, &client),
                 None => Err("ollama is not installed".to_string()),
             };
-            match outcome {
-                Ok(()) => rewarm_cleanup(&rewarm_state),
-                Err(e) => eprintln!("whisperd: ollama start failed: {e}"),
+            if let Err(e) = &outcome {
+                eprintln!("whisperd: ollama start failed: {e}");
             }
-            ollama_status_blocking(&url)
+            (outcome.is_ok(), ollama_status_blocking(&url))
         })
         .await;
-        if let Ok(dto) = result {
+        if let Ok((started, dto)) = result {
+            // Report the server state first; the model load below can take a while.
             send_ollama_status(&state, dto);
+            if started {
+                let _ = tokio::task::spawn_blocking(move || rewarm_cleanup(&rewarm_state)).await;
+            }
         }
     });
 

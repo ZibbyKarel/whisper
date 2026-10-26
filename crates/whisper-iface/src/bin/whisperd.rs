@@ -109,14 +109,21 @@ fn spawn_ollama_autostart(cleanup: &CleanupConfig, state: std::sync::Arc<AppStat
         else {
             return;
         };
-        match ollama::start(&inst, &client) {
+        let started = match ollama::start(&inst, &client) {
             Ok(()) => {
                 eprintln!("whisperd: started ollama at {}", client.base());
-                handlers::rewarm_cleanup(&state);
+                true
             }
-            Err(e) => eprintln!("whisperd: ollama auto-start failed: {e}"),
-        }
+            Err(e) => {
+                eprintln!("whisperd: ollama auto-start failed: {e}");
+                false
+            }
+        };
+        // Report the server state before the (possibly slow) model load.
         handlers::emit_ollama_status(&state, client.base());
+        if started {
+            handlers::rewarm_cleanup(&state);
+        }
     });
 }
 
