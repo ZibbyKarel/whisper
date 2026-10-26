@@ -9,6 +9,7 @@
 
 pub mod cleanup;
 pub mod daemon;
+pub mod ollama;
 pub mod stt;
 pub mod vad;
 
