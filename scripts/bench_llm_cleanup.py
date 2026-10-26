@@ -8,6 +8,9 @@ WER/CER against expected cleaned text, latency, and two safety heuristics:
 "answered_instead" (the model treated a trap case as a question/command to
 follow) and "diacritics_lost" (Czech diacritics were stripped).
 
+NOTE: the zero-shot prompt below is NOT the production cleanup prompt. The
+production safety gate is `cleanup_trap_safety.rs`, not this harness.
+
 stdlib only, no third-party deps (local-first constraint). Requires an
 Ollama server running locally (http://localhost:11434) with the target
 models already pulled (`ollama pull <model>`).

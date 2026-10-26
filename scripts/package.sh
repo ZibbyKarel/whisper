@@ -4,9 +4,10 @@
 # assembles Whisper.app with both binaries as siblings (so the tray's sibling
 # resolver finds whisperd), ad-hoc signs it, and wraps it in a UDZO DMG.
 #
-# Models are NOT bundled (6+ GB, D-0014). Pass --link-models to symlink the repo
-# models/ into the app-support dir and drop a starter config there (never
-# overwriting an existing one).
+# Models are NOT bundled (D-0014). Pass --link-models to symlink the repo's STT
+# model into the app-support dir and drop a starter config there (never
+# overwriting an existing one). Text cleanup runs on a local Ollama server
+# (D-0017), not a bundled model; Ollama is a prerequisite, not installed here.
 #
 # Usage: scripts/package.sh [--link-models]
 set -euo pipefail
@@ -18,6 +19,12 @@ DIST="$REPO/dist"
 APP="$DIST/Whisper.app"
 BUNDLE_ID="cz.zibby.whisper"
 MIN_MACOS="12.0"
+
+if ! command -v ollama >/dev/null 2>&1; then
+  echo "WARNING: ollama not found on PATH. Text cleanup needs a local Ollama" >&2
+  echo "         (brew install ollama && brew services start ollama); dictation" >&2
+  echo "         still works without it, cleanup is skipped." >&2
+fi
 
 LINK_MODELS=0
 for arg in "$@"; do
@@ -128,7 +135,11 @@ if [ "$LINK_MODELS" -eq 1 ]; then
   DATA="$HOME/Library/Application Support/whisper-engine"
   echo "==> Linking models into $DATA"
   mkdir -p "$DATA"
-  ln -sfn "$REPO/models" "$DATA/models"
+  # A previous version symlinked the whole repo models/ dir; replace that link.
+  if [ -L "$DATA/models" ]; then rm "$DATA/models"; fi
+  mkdir -p "$DATA/models"
+  # Only the STT model is linked; the cleanup LLM is served by Ollama.
+  ln -sfn "$REPO/models/ggml-large-v3-turbo-q5_0.bin" "$DATA/models/ggml-large-v3-turbo-q5_0.bin"
   CFG="$DATA/config.toml"
   if [ ! -f "$CFG" ]; then
     echo "    writing starter config $CFG"
@@ -142,7 +153,11 @@ delivery = "paste"
 
 [models]
 stt = "models/ggml-large-v3-turbo-q5_0.bin"
-cleanup = "models/Qwen3-8B-Q4_K_M.gguf"
+
+[cleanup]
+ollama_url = "http://127.0.0.1:11434"
+model = "qwen3-vl:8b-instruct"
+keep_alive = "30m"
 
 [hotkey]
 enabled = true

@@ -52,7 +52,7 @@ language, and cleanup behavior in the tray's Settings.
 
 ```bash
 scripts/package.sh                # build Whisper.app + dist/Whisper.dmg
-scripts/package.sh --link-models   # also symlink repo models/ into the app-support
+scripts/package.sh --link-models   # also symlink the repo STT model into the app-support
                                     # dir + write a starter config (dev convenience)
 ```
 

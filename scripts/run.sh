@@ -34,6 +34,12 @@ if [ "$FORCE_BUILD" -eq 1 ] || [ ! -x "$WHISPERD" ] || [ ! -x "$TRAY" ]; then
   cargo build --release -p whisper-ux --bin whisper-tray
 fi
 
+if ! command -v ollama >/dev/null 2>&1; then
+  echo "WARNING: ollama not found on PATH. Text cleanup needs a local Ollama" >&2
+  echo "         (brew install ollama && brew services start ollama); dictation" >&2
+  echo "         still works without it, cleanup is skipped." >&2
+fi
+
 mkdir -p "$LOG_DIR"
 
 STARTED_DAEMON=0

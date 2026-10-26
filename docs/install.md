@@ -24,7 +24,7 @@ This produces:
 - `dist/Whisper.app` — the app bundle (ad-hoc signed).
 - `dist/Whisper.dmg` — a disk image with a drag-to-Applications window.
 
-The first build compiles whisper.cpp and llama.cpp from source and takes several
+The first build compiles whisper.cpp from source and takes several
 minutes; later builds are fast.
 
 ## 2. Install
@@ -97,7 +97,7 @@ dir: `~/Library/Application Support/whisper-engine/models/`.
 
 ### Option A — you have the repo models (fastest)
 
-Symlink the repo `models/` into the data dir and write a starter config:
+Symlink the repo's STT model into the data dir and write a starter config:
 
 ```bash
 scripts/package.sh --link-models
@@ -107,15 +107,43 @@ This never overwrites an existing `config.toml`. It writes one only if none is
 present, pointing at:
 
 - STT: `models/ggml-large-v3-turbo-q5_0.bin` (Whisper large-v3-turbo, D-0004)
-- Cleanup: `models/Qwen3-8B-Q4_K_M.gguf` (qwen3:8b, D-0005)
+- Cleanup: served by Ollama, `[cleanup] model = "qwen3-vl:8b-instruct"` (see
+  "Text cleanup (Ollama)" below)
 
 with `delivery = "paste"` and the push-to-talk hotkey `Ctrl+Alt` enabled.
+
+### Text cleanup (Ollama)
+
+Optional LLM cleanup runs on a local [Ollama](https://ollama.com) server. Whisper
+never installs Ollama and never deletes Ollama models:
+
+```bash
+brew install ollama && brew services start ollama
+ollama pull qwen3-vl:8b-instruct   # default; or pick/pull it from the tray
+```
+
+The default model `qwen3-vl:8b-instruct` is shared with any other app using the
+same Ollama. If Ollama is installed but not running, whisperd starts it (tries
+`brew services start ollama`, then `open -a Ollama`, then `ollama serve`). If it
+is missing, dictation still works and cleanup is skipped. Config:
+
+```toml
+[cleanup]
+ollama_url = "http://127.0.0.1:11434"
+model = "qwen3-vl:8b-instruct"   # "" turns cleanup off
+keep_alive = "30m"
+```
+
+Validated for Czech: `qwen3-vl:8b-instruct`, `qwen3:8b`; other installed models
+are listed in the tray as "not validated for Czech". The legacy
+`[models] cleanup = ...` key is ignored, so `models/Qwen3-8B-Q4_K_M.gguf` is no
+longer used and can be deleted.
 
 ### Option B — manual
 
 ```bash
 mkdir -p ~/Library/Application\ Support/whisper-engine/models
-# copy or symlink your GGML/GGUF model files into that models/ directory
+# copy or symlink your GGML Whisper (STT) model file into that models/ directory
 ```
 
 Then create `~/Library/Application Support/whisper-engine/config.toml` (see the
