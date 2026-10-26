@@ -159,6 +159,27 @@ Append-only. Newest at bottom. Absolute dates.
 - **Gates:** `cargo fmt --all -- --check` clean. `cargo build` (default) and `cargo build -p whisper-iface --features platform` both `0 errors` (only the pre-existing `whisper-rs-sys`/`llama-cpp-sys` duplicate-`ggml`-symbol linker warning, D-0014). `cargo clippy --workspace --all-targets -- -D warnings` and the same with `--all-features` both clean (only the pre-existing unrelated `block v0.1.6` future-incompat notice). `cargo test --workspace` **282 passed, 12 ignored**, identical with `--all-features` — includes the new `permission.rs` unit tests (3), the `/v1/platform/permissions` JSON fixture (daemon `api.rs`) + its mirror (`ux/api.rs`), two headless-vs-platform-feature contract-test variants (`daemon_contract.rs`, gated by `#[cfg(feature = "platform")]` since the live grant answer is host-dependent), the new hardware test, and 11 new `whisper-ux` tests (`permissions_ui.rs` + `onboarding.rs`). Manually ran the new `#[ignore]`d hardware test on this (real macOS) dev machine: both `input_monitoring_access()` and `accessibility_access()` returned `Granted`, confirming the FFI is correct end-to-end, not just compiling.
 - **Deviations / open questions:** the plan referenced onboarding "steps 3/4" for Input Monitoring/Accessibility, but the actual code had step 3 = Microphone (unrelated ack) and step 4 = Accessibility only — there was no existing Input Monitoring onboarding step. Added one (new step 4, renumbering Accessibility to 5 and Test dictation to 6) rather than silently dropping the Input Monitoring live-status requirement the plan called for. The tray's `open_system_settings` shells out to `open` (`std::process::Command`), the same pattern already used for daemon lifecycle in `daemon_ctl.rs` (D-0014) — flagging since the task's stated boundary was "never call OS APIs from the tray"; this is a URL-scheme launch, not an engine/TCC capability call, but worth an explicit sign-off if that boundary is meant more strictly than the existing `daemon_ctl.rs` precedent suggests. Not (and cannot be) verified against an actual ad-hoc-reinstall grant-drop, the exact scenario that motivated this work — flagged as the outstanding manual-verification item, same caveat as every other TCC-dependent path (D-0012/D-0015).
 
+## 2026-10-26 — Text cleanup moves to the shared local Ollama (D-0017)
+
+- **Why:** the user runs several local apps on light LLMs. z.i.b.b.y's coloring book already serves `qwen3-vl:8b-instruct` through Ollama, while Whisper kept a private 4.8 GB GGUF in llama.cpp. The goal is one model store and one runtime.
+- **Spike (rejected): STT via Ollama.** Ollama has no transcription API. `gemma4:e4b` audio chat was clearly worse on Czech (cs-01 WER 0.67), about 4× slower, answered a trap in Cyrillic, and produced an emoji runaway (`docs/stt-ollama-spike.md`). STT stays on in-process whisper.cpp.
+- **Cleanup on Ollama,** using the production few-shot prompt on 13 Czech cases:
+  - `qwen3-vl:8b-instruct`: WER 0.012, 0/4 traps, 0 diacritics lost, about 1.25 s.
+  - `qwen3:8b`: WER 0.019, 0/4 traps.
+  - `qwen3:4b`: rejected; it ignores `think:false`.
+- **Core:** `CleanupEngine::prepare/is_enabled`. A cleanup error now delivers the dictionary text with skip reason `engine_failed` and never fails the dictation.
+- **Daemon:**
+  - `ollama.rs` client (version/tags/chat/load/pull) and `OllamaCleanupEngine` (20 s timeout, single-flight warm-up, live health → `degraded`).
+  - A `[cleanup]` config section (`ollama_url`, `model`, `keep_alive`). The model swaps at runtime.
+  - `GET /v1/ollama` and `POST /v1/ollama/start`, plus the `ollama.status` event.
+  - Loopback auto-start: brew services, then Ollama.app, then `ollama serve`.
+  - The catalog has Ollama-sourced entries (2 validated, plus installed extras labeled "not validated for Czech"), pulled via `/api/pull`. Whisper never deletes Ollama models.
+  - `llama-cpp-2` is removed.
+- **Tray:** a "Text cleanup (Ollama)" card, an optional onboarding step, and an attention banner (not installed / not running / model missing). Ollama is never auto-installed.
+- **Scripts/docs:** run.sh and package.sh warn when Ollama is missing, and `--link-models` links STT only. `docs/install.md` adds the Ollama prerequisite.
+- **Process:** superpowers SDD with 8 tasks. Sonnet implementers, a separate reviewer per task, a final whole-branch review on Opus, then one fix wave and an Opus re-review.
+- **Gates:** fmt and `clippy -D warnings` clean. `cargo test --workspace --all-features` passes 363 tests with 0 failures; the live Ollama gate `cleanup_trap_safety` passes.
+
 ## Debt register
 
 (empty)

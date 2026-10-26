@@ -42,6 +42,7 @@ Local-first, modular voice intelligence engine (Wispr Flow–inspired), Czech-fi
   (`GET /v1/models`, `POST`/`DELETE /v1/models/{id}/download`, `model.download` WS event);
   tray startup gate + reworked Settings → Models + onboarding checklist step, all backed by
   one shared `ModelsPanel`/`ui_model_row` component
+- ✅ Text cleanup via the shared local Ollama (D-0017, 2026-10-26): `llama-cpp-2` and the GGUF removed; `/v1/ollama`; Ollama models in the catalog; tray card, onboarding step and banner
 - Remaining: deploy checklist, app icon + UI polish round 2, performance/latency tuning, plugin system maturity, signing/notarization decision, resumable downloads (deferred by D-0015)
 
 Milestone rule: after every milestone — update this file + CHANGELOG, commit.

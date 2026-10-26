@@ -1,6 +1,19 @@
 # HANDOFF
 
 ## Current state
+**2026-10-26 — branch `feat/ollama-cleanup` (not merged, not pushed):**
+- Text cleanup now runs on the shared local Ollama, default `qwen3-vl:8b-instruct`, the same model the coloring book uses. STT stays on whisper.cpp. See D-0017 and the PROGRESS entry.
+- Manual checks still to do:
+  - in the tray: Ollama card, onboarding step, banner states (stop Ollama, then Start);
+  - a real model pull with Cancel;
+  - a dictation with Ollama off, which should deliver uncleaned text.
+- The old `models/Qwen3-8B-Q4_K_M.gguf` (4.8 GB) can be deleted. The experiment models `gemma4:e4b` and `qwen3:4b` are still in Ollama; the user decides whether to remove them.
+- Deferred minors from the review:
+  - pull progress resets per layer;
+  - the tray polls `/v1/models` and `/v1/ollama` on the UI thread;
+  - an `ollama_url` change applies to the probe immediately but to chat only after a restart;
+  - the per-session `prepare()` can mask an empty-output error.
+
 Phases 1–4 complete; Phases 5–6 implemented + hardened through three rounds of live
 user feedback, **pending final manual verification** (2026-07-11). Round 2: PUT
 /v1/config 500 fixed (mkdir parent), default hotkey **Ctrl+Alt** (modifier-only,
@@ -41,7 +54,7 @@ in managed mode, D-0014). Pipeline: capture → Silero VAD → per-segment whisp
 ## Completed
 See PROGRESS.md 2026-07-10/2026-07-11 entries (research → architecture → core →
 daemon → platform → tray → feedback round 2/3 → model provisioning). ADRs
-D-0004..D-0015 in DECISIONS.md.
+D-0004..D-0017 in DECISIONS.md.
 
 ## Unfinished / next steps
 1. **Manual verification (user):** packaged-app or run.sh walkthrough — Czech at
