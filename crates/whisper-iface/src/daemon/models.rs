@@ -39,44 +39,104 @@ impl ModelKind {
     }
 }
 
-/// One entry in the compiled-in catalog (D-0015 design doc table). Values verified against
-/// HuggingFace on 2026-07-11; the STT entry's size and SHA-256 are additionally confirmed
-/// byte-identical (`shasum -a 256`) to the file the Czech STT parity/e2e suites already use,
-/// so provisioning introduces no pipeline change and no Czech regression.
+/// Where a managed model comes from.
 #[derive(Debug, Clone, Copy)]
-pub struct ManagedModel {
-    pub id: &'static str,
-    pub kind: ModelKind,
+pub enum ModelSource {
+    /// A pinned HTTPS download, SHA-256 verified, stored under `<data_dir>/models/` (D-0015).
+    File(FileSource),
+    /// A model served by the local Ollama server (D-0017): presence comes from `/api/tags`,
+    /// the download is `/api/pull`. `size_hint` is an approximate on-disk size for the UI only.
+    Ollama { tag: &'static str, size_hint: u64 },
+}
+
+/// The pinned-download half of [`ModelSource::File`].
+#[derive(Debug, Clone, Copy)]
+pub struct FileSource {
     pub filename: &'static str,
     pub url: &'static str,
     pub size_bytes: u64,
     pub sha256: &'static str,
+}
+
+/// One entry in the compiled-in catalog (D-0015 design doc table). Values verified against
+/// HuggingFace on 2026-07-11; the STT entry's size and SHA-256 are additionally confirmed
+/// byte-identical (`shasum -a 256`) to the file the Czech STT parity/e2e suites already use,
+/// so provisioning introduces no pipeline change and no Czech regression. Cleanup entries are
+/// Ollama tags (D-0017).
+#[derive(Debug, Clone, Copy)]
+pub struct ManagedModel {
+    pub id: &'static str,
+    pub kind: ModelKind,
+    pub source: ModelSource,
     pub required: bool,
+    /// Validated on real Czech samples before adoption (CLAUDE.md hard constraint).
+    pub validated: bool,
     pub license: &'static str,
 }
 
-/// The two pinned catalog entries. STT is required (dictation cannot run without it); the
-/// Qwen3 cleanup LLM is optional (D-0005: cleanup-off is a supported profile).
-static CATALOG: [ManagedModel; 2] = [
+impl ManagedModel {
+    /// The file source, `None` for an Ollama-sourced model.
+    pub fn file(&self) -> Option<FileSource> {
+        match self.source {
+            ModelSource::File(f) => Some(f),
+            ModelSource::Ollama { .. } => None,
+        }
+    }
+
+    /// The Ollama tag, `None` for a file-sourced model.
+    pub fn ollama_tag(&self) -> Option<&'static str> {
+        match self.source {
+            ModelSource::Ollama { tag, .. } => Some(tag),
+            ModelSource::File(_) => None,
+        }
+    }
+
+    /// Expected size in bytes (exact for files, an approximate hint for Ollama models).
+    pub fn size_bytes(&self) -> u64 {
+        match self.source {
+            ModelSource::File(f) => f.size_bytes,
+            ModelSource::Ollama { size_hint, .. } => size_hint,
+        }
+    }
+}
+
+/// The pinned catalog entries. STT is required (dictation cannot run without it); the cleanup
+/// LLMs are optional (D-0005: cleanup-off is a supported profile). The id `cleanup-qwen3-8b`
+/// is kept stable across the move from GGUF to Ollama (D-0017).
+static CATALOG: [ManagedModel; 3] = [
     ManagedModel {
         id: "stt-large-v3-turbo",
         kind: ModelKind::Stt,
-        filename: "ggml-large-v3-turbo-q5_0.bin",
-        url:
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
-        size_bytes: 574_041_195,
-        sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+        source: ModelSource::File(FileSource {
+            filename: "ggml-large-v3-turbo-q5_0.bin",
+            url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+            size_bytes: 574_041_195,
+            sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+        }),
         required: true,
+        validated: true,
         license: "MIT",
+    },
+    ManagedModel {
+        id: "cleanup-qwen3-vl-8b-instruct",
+        kind: ModelKind::Cleanup,
+        source: ModelSource::Ollama {
+            tag: "qwen3-vl:8b-instruct",
+            size_hint: 6_200_000_000,
+        },
+        required: false,
+        validated: true,
+        license: "Apache-2.0",
     },
     ManagedModel {
         id: "cleanup-qwen3-8b",
         kind: ModelKind::Cleanup,
-        filename: "Qwen3-8B-Q4_K_M.gguf",
-        url: "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
-        size_bytes: 5_027_783_488,
-        sha256: "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+        source: ModelSource::Ollama {
+            tag: "qwen3:8b",
+            size_hint: 5_200_000_000,
+        },
         required: false,
+        validated: true,
         license: "Apache-2.0",
     },
 ];
@@ -92,8 +152,11 @@ pub fn find(id: &str) -> Option<&'static ManagedModel> {
 }
 
 /// The download target: `<data_dir>/models/<filename>`.
-pub fn target_path(model: &ManagedModel, data_dir: &Path) -> PathBuf {
-    data_dir.join("models").join(model.filename)
+/// `None` for an Ollama-sourced model (it has no file under `data_dir`).
+pub fn target_path(model: &ManagedModel, data_dir: &Path) -> Option<PathBuf> {
+    model
+        .file()
+        .map(|f| data_dir.join("models").join(f.filename))
 }
 
 /// The in-progress download file: `<target>.part`. Written fresh on every attempt (no resume
@@ -107,9 +170,13 @@ pub fn part_path(target: &Path) -> PathBuf {
 /// Cheap presence check: `present = target.exists() && metadata.len() == size_bytes`. No full
 /// checksum here — hashing a 5 GB file on every launch would be far too slow. A short/
 /// truncated `.part` or wrong-size file is NOT present (D-0015 design doc).
+/// Always `false` for an Ollama-sourced model (its presence is `/api/tags`, not a file).
 pub fn is_present(model: &ManagedModel, data_dir: &Path) -> bool {
-    match std::fs::metadata(target_path(model, data_dir)) {
-        Ok(meta) => meta.len() == model.size_bytes,
+    let (Some(f), Some(target)) = (model.file(), target_path(model, data_dir)) else {
+        return false;
+    };
+    match std::fs::metadata(target) {
+        Ok(meta) => meta.len() == f.size_bytes,
         Err(_) => false,
     }
 }
@@ -227,13 +294,23 @@ pub fn run_download(
     handle: &DownloadHandle,
     mut on_progress: impl FnMut(DownloadProgress),
 ) {
-    let target = target_path(model, data_dir);
+    let (Some(file), Some(target)) = (model.file(), target_path(model, data_dir)) else {
+        let p = DownloadProgress {
+            downloaded: 0,
+            total: model.size_bytes(),
+            phase: DownloadPhase::Error,
+            error: Some(format!("{} is not a file-sourced model", model.id)),
+        };
+        handle.set(p.clone());
+        on_progress(p);
+        return;
+    };
     let part = part_path(&target);
-    let outcome = attempt_download(model, &target, &part, handle, &mut on_progress);
+    let outcome = attempt_download(&file, &target, &part, handle, &mut on_progress);
     let final_progress = match outcome {
         Ok(()) => DownloadProgress {
-            downloaded: model.size_bytes,
-            total: model.size_bytes,
+            downloaded: file.size_bytes,
+            total: file.size_bytes,
             phase: DownloadPhase::Done,
             error: None,
         },
@@ -243,7 +320,7 @@ pub fn run_download(
             let _ = std::fs::remove_file(&part);
             DownloadProgress {
                 downloaded: 0,
-                total: model.size_bytes,
+                total: file.size_bytes,
                 phase: DownloadPhase::Error,
                 error: Some(e),
             }
@@ -253,8 +330,65 @@ pub fn run_download(
     on_progress(final_progress);
 }
 
-fn attempt_download(
+/// Pull an Ollama-sourced model (`POST /api/pull`) on the calling thread — callers run this via
+/// `spawn_blocking`, like [`run_download`], and the same terminal contract holds (exactly one
+/// `Done` or `Error` final progress). Cancel = return from the pull, which drops the stream:
+/// Ollama aborts the pull and keeps its `-partial` blobs, so a retry resumes (D-0017).
+pub fn run_pull(
     model: &ManagedModel,
+    client: &crate::ollama::OllamaClient,
+    handle: &DownloadHandle,
+    mut on_progress: impl FnMut(DownloadProgress),
+) {
+    let Some(tag) = model.ollama_tag() else {
+        let p = DownloadProgress {
+            downloaded: 0,
+            total: model.size_bytes(),
+            phase: DownloadPhase::Error,
+            error: Some(format!("{} is not an Ollama-sourced model", model.id)),
+        };
+        handle.set(p.clone());
+        on_progress(p);
+        return;
+    };
+    let mut last_total = model.size_bytes();
+    let result = client.pull(tag, &handle.cancel, |line| {
+        if line.total > 0 {
+            last_total = line.total;
+        }
+        let phase = if line.status.contains("verifying") {
+            DownloadPhase::Verifying
+        } else {
+            DownloadPhase::Downloading
+        };
+        emit(handle, line.completed, line.total, phase, &mut on_progress);
+    });
+    let final_progress = match result {
+        Ok(()) => DownloadProgress {
+            downloaded: last_total,
+            total: last_total,
+            phase: DownloadPhase::Done,
+            error: None,
+        },
+        Err(e) => DownloadProgress {
+            downloaded: 0,
+            total: last_total,
+            phase: DownloadPhase::Error,
+            error: Some(match e {
+                crate::ollama::OllamaError::Cancelled => "cancelled".to_string(),
+                // The server's own error text, verbatim (e.g. "pull model manifest: file does
+                // not exist").
+                crate::ollama::OllamaError::Protocol(text) => text,
+                other => other.to_string(),
+            }),
+        },
+    };
+    handle.set(final_progress.clone());
+    on_progress(final_progress);
+}
+
+fn attempt_download(
+    model: &FileSource,
     target: &Path,
     part: &Path,
     handle: &DownloadHandle,
@@ -431,11 +565,14 @@ mod tests {
         ManagedModel {
             id: "test-small",
             kind: ModelKind::Cleanup,
-            filename: "small.bin",
-            url: "https://example.invalid/small.bin",
-            size_bytes: 128,
-            sha256: "0",
+            source: ModelSource::File(FileSource {
+                filename: "small.bin",
+                url: "https://example.invalid/small.bin",
+                size_bytes: 128,
+                sha256: "0",
+            }),
             required: false,
+            validated: false,
             license: "MIT",
         }
     }
@@ -478,11 +615,14 @@ mod tests {
         ManagedModel {
             id: "test-model",
             kind: ModelKind::Stt,
-            filename: "test-model.bin",
-            url: Box::leak(url.into_boxed_str()),
-            size_bytes: body.len() as u64,
-            sha256: Box::leak(digest.into_boxed_str()),
+            source: ModelSource::File(FileSource {
+                filename: "test-model.bin",
+                url: Box::leak(url.into_boxed_str()),
+                size_bytes: body.len() as u64,
+                sha256: Box::leak(digest.into_boxed_str()),
+            }),
             required: true,
+            validated: false,
             license: "MIT",
         }
     }
@@ -490,28 +630,48 @@ mod tests {
     // -- catalog ----------------------------------------------------------
 
     #[test]
-    fn catalog_ids_are_unique_and_urls_well_formed() {
+    fn catalog_ids_are_unique_and_sources_well_formed() {
         let entries = catalog();
         let mut ids: Vec<&str> = entries.iter().map(|m| m.id).collect();
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), entries.len(), "catalog ids must be unique");
         for m in entries {
-            assert!(m.url.starts_with("https://"), "{} url not https", m.id);
-            assert_eq!(m.sha256.len(), 64, "{} sha256 not 64 hex chars", m.id);
+            match m.source {
+                ModelSource::File(f) => {
+                    assert!(f.url.starts_with("https://"), "{} url not https", m.id);
+                    assert_eq!(f.sha256.len(), 64, "{} sha256 not 64 hex chars", m.id);
+                    assert!(
+                        f.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                        "{} sha256 not hex",
+                        m.id
+                    );
+                    assert!(!f.filename.is_empty(), "{} has empty filename", m.id);
+                }
+                ModelSource::Ollama { tag, .. } => {
+                    assert!(tag.contains(':'), "{} tag must be explicit", m.id);
+                }
+            }
+            assert!(m.size_bytes() > 0, "{} has zero size", m.id);
             assert!(
-                m.sha256.chars().all(|c| c.is_ascii_hexdigit()),
-                "{} sha256 not hex",
+                m.validated,
+                "{} is in the catalog so must be validated",
                 m.id
             );
-            assert!(m.size_bytes > 0, "{} has zero size", m.id);
-            assert!(!m.filename.is_empty(), "{} has empty filename", m.id);
         }
         // Exactly the STT default is required (D-0015 design doc: STT required, cleanup
         // optional).
         assert_eq!(entries.iter().filter(|m| m.required).count(), 1);
         assert!(find("stt-large-v3-turbo").is_some_and(|m| m.required));
-        assert!(find("cleanup-qwen3-8b").is_some_and(|m| !m.required));
+        // Stable id kept across the GGUF -> Ollama move (D-0017).
+        assert_eq!(
+            find("cleanup-qwen3-8b").and_then(|m| m.ollama_tag()),
+            Some("qwen3:8b")
+        );
+        assert_eq!(
+            find("cleanup-qwen3-vl-8b-instruct").and_then(|m| m.ollama_tag()),
+            Some("qwen3-vl:8b-instruct")
+        );
     }
 
     #[test]
@@ -526,7 +686,7 @@ mod tests {
     fn presence_requires_exact_size_match() {
         let dir = TempDir::new("presence");
         let model = small_test_model();
-        let target = target_path(&model, dir.path());
+        let target = target_path(&model, dir.path()).unwrap();
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
         assert!(
@@ -534,13 +694,13 @@ mod tests {
             "missing file is not present"
         );
 
-        std::fs::write(&target, vec![0u8; (model.size_bytes - 1) as usize]).unwrap();
+        std::fs::write(&target, vec![0u8; (model.size_bytes() - 1) as usize]).unwrap();
         assert!(
             !is_present(&model, dir.path()),
             "short/truncated file is not present"
         );
 
-        std::fs::write(&target, vec![0u8; model.size_bytes as usize]).unwrap();
+        std::fs::write(&target, vec![0u8; model.size_bytes() as usize]).unwrap();
         assert!(is_present(&model, dir.path()), "exact-size file is present");
     }
 
@@ -548,7 +708,7 @@ mod tests {
     fn target_and_part_paths_follow_convention() {
         let model = small_test_model();
         let data_dir = Path::new("/support/whisper-engine");
-        let target = target_path(&model, data_dir);
+        let target = target_path(&model, data_dir).unwrap();
         assert_eq!(target, data_dir.join("models").join("small.bin"));
         assert_eq!(part_path(&target), data_dir.join("models/small.bin.part"));
     }
@@ -605,7 +765,7 @@ mod tests {
 
         run_download(&model, dir.path(), &handle, |p| phases.push(p.phase));
 
-        let target = target_path(&model, dir.path());
+        let target = target_path(&model, dir.path()).unwrap();
         let part = part_path(&target);
         assert!(target.exists());
         assert!(!part.exists());
@@ -646,7 +806,9 @@ mod tests {
         let base = serve_once(served.clone());
         let mut model = matching_test_model(format!("{base}/file.bin"), &served);
         // Pin a checksum that does NOT match what the server actually serves.
-        model.sha256 = Box::leak("0".repeat(64).into_boxed_str());
+        if let ModelSource::File(f) = &mut model.source {
+            f.sha256 = Box::leak("0".repeat(64).into_boxed_str());
+        }
         let dir = TempDir::new("download-corrupt");
         let handle = DownloadHandle::new();
         let mut last_error = None;
@@ -657,7 +819,7 @@ mod tests {
             }
         });
 
-        let target = target_path(&model, dir.path());
+        let target = target_path(&model, dir.path()).unwrap();
         let part = part_path(&target);
         assert!(!target.exists(), "corrupt download must not be installed");
         assert!(
@@ -691,7 +853,7 @@ mod tests {
         });
 
         assert!(saw_downloading, "expected at least one progress tick");
-        let target = target_path(&model, dir.path());
+        let target = target_path(&model, dir.path()).unwrap();
         let part = part_path(&target);
         assert!(!target.exists());
         assert!(!part.exists(), ".part must be removed on cancel");

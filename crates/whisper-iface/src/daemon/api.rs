@@ -217,20 +217,33 @@ pub struct ModelProgressDto {
     pub total: u64,
 }
 
-/// One catalog model's provisioning status (`GET /v1/models` D-0015 design doc). Deliberately
-/// does not expose `url`/`sha256`/`license` on the wire — those are provisioning internals, not
-/// part of the operator-facing contract.
+/// One model's provisioning status (`GET /v1/models` D-0015 design doc). Deliberately does not
+/// expose `url`/`sha256`/`license` on the wire — those are provisioning internals, not part of
+/// the operator-facing contract. Catalog entries come first; installed Ollama models outside the
+/// catalog follow as `ollama:<tag>` (D-0017).
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelEntryDto {
     pub id: String,
     /// `"stt"` | `"cleanup"`.
     pub kind: String,
-    pub filename: String,
+    /// `"file"` | `"ollama"`.
+    pub source: String,
+    /// The Ollama tag (`ollama` source only).
+    pub ollama_tag: Option<String>,
+    /// In the validated catalog (checked on real Czech samples).
+    pub validated: bool,
+    /// `cleanup.model` names this entry (tags compared normalized: no tag == `:latest`).
+    pub selected: bool,
+    /// `file` source only.
+    pub filename: Option<String>,
     pub required: bool,
+    /// Exact for files; an approximate hint for catalog Ollama entries, the reported size for
+    /// installed extras.
     pub size_bytes: u64,
     pub present: bool,
-    /// The resolved on-disk target path (`<data_dir>/models/<filename>`), present or not.
-    pub path: String,
+    /// The resolved on-disk target path (`<data_dir>/models/<filename>`), present or not
+    /// (`file` source only).
+    pub path: Option<String>,
     pub downloading: bool,
     pub progress: Option<ModelProgressDto>,
 }
@@ -455,6 +468,81 @@ mod tests {
         let ev_v = serde_json::to_value(&err_ev).unwrap();
         assert_eq!(ev_v["phase"], "error");
         assert_eq!(ev_v["error"], "integrity check failed");
+    }
+
+    #[test]
+    fn model_entry_dto_wire_shape() {
+        // Fixtures mirrored in `whisper-ux/src/api.rs` (Task 7): drift must fail both sides.
+        let file = ModelEntryDto {
+            id: "stt-large-v3-turbo".to_string(),
+            kind: "stt".to_string(),
+            source: "file".to_string(),
+            ollama_tag: None,
+            validated: true,
+            selected: false,
+            filename: Some("ggml-large-v3-turbo-q5_0.bin".to_string()),
+            required: true,
+            size_bytes: 574_041_195,
+            present: false,
+            path: Some("/data/models/ggml-large-v3-turbo-q5_0.bin".to_string()),
+            downloading: true,
+            progress: Some(ModelProgressDto {
+                downloaded: 10,
+                total: 574_041_195,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&file).unwrap(),
+            serde_json::json!({
+                "id": "stt-large-v3-turbo",
+                "kind": "stt",
+                "source": "file",
+                "ollama_tag": null,
+                "validated": true,
+                "selected": false,
+                "filename": "ggml-large-v3-turbo-q5_0.bin",
+                "required": true,
+                "size_bytes": 574_041_195_u64,
+                "present": false,
+                "path": "/data/models/ggml-large-v3-turbo-q5_0.bin",
+                "downloading": true,
+                "progress": { "downloaded": 10, "total": 574_041_195_u64 }
+            })
+        );
+
+        let ollama = ModelEntryDto {
+            id: "ollama:gemma3:12b".to_string(),
+            kind: "cleanup".to_string(),
+            source: "ollama".to_string(),
+            ollama_tag: Some("gemma3:12b".to_string()),
+            validated: false,
+            selected: true,
+            filename: None,
+            required: false,
+            size_bytes: 8_100_000_000,
+            present: true,
+            path: None,
+            downloading: false,
+            progress: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&ollama).unwrap(),
+            serde_json::json!({
+                "id": "ollama:gemma3:12b",
+                "kind": "cleanup",
+                "source": "ollama",
+                "ollama_tag": "gemma3:12b",
+                "validated": false,
+                "selected": true,
+                "filename": null,
+                "required": false,
+                "size_bytes": 8_100_000_000_u64,
+                "present": true,
+                "path": null,
+                "downloading": false,
+                "progress": null
+            })
+        );
     }
 
     #[test]

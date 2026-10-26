@@ -16,7 +16,7 @@ use whisper_core::dictionary::Dictionary;
 use whisper_core::session::CancellationToken;
 
 use crate::cleanup::CleanupHealth;
-use crate::ollama::{is_loopback_url, OllamaClient};
+use crate::ollama::{is_loopback_url, normalize_tag, InstalledModel, OllamaClient};
 
 use super::api::{
     ApiEvent, AudioRequest, ConfigUpdateResponse, ErrorBody, ErrorEnvelope, HealthResponse,
@@ -504,48 +504,119 @@ pub async fn put_dictionary(
 // Model provisioning (D-0015): GET /v1/models, POST/DELETE /v1/models/{id}/download
 // ---------------------------------------------------------------------------
 
-/// `GET /v1/models`: the compiled-in catalog plus each entry's live presence/download state.
+/// `GET /v1/models`: the compiled-in catalog plus each entry's live presence/download state
+/// (Ollama presence from `/api/tags`), then installed non-catalog Ollama models (D-0017).
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsListResponse> {
-    let models = models::catalog()
+    let (url, selected_tag) = {
+        let cfg = state.config.read().expect("config lock");
+        (cfg.cleanup.ollama_url.clone(), cfg.cleanup.model.clone())
+    };
+    // `tags()` is blocking I/O with short timeouts; Ollama down is not an error here — its
+    // models are simply not present (D-0017).
+    let installed = tokio::task::spawn_blocking(move || OllamaClient::new(url).tags())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let is_selected = |tag: &str| {
+        !selected_tag.trim().is_empty() && normalize_tag(tag) == normalize_tag(&selected_tag)
+    };
+
+    let download_state = |id: &str| match state.model_downloads.get(id) {
+        Some(handle) => {
+            let p = handle.snapshot();
+            (
+                true,
+                Some(ModelProgressDto {
+                    downloaded: p.downloaded,
+                    total: p.total,
+                }),
+            )
+        }
+        None => (false, None),
+    };
+
+    let mut models: Vec<ModelEntryDto> = models::catalog()
         .iter()
         .map(|m| {
-            let target = models::target_path(m, &state.data_dir);
-            let present = models::is_present(m, &state.data_dir);
-            let (downloading, progress) = match state.model_downloads.get(m.id) {
-                Some(handle) => {
-                    let p = handle.snapshot();
-                    (
-                        true,
-                        Some(ModelProgressDto {
-                            downloaded: p.downloaded,
-                            total: p.total,
-                        }),
-                    )
-                }
-                None => (false, None),
-            };
+            let (downloading, progress) = download_state(m.id);
+            let file = m.file();
+            let tag = m.ollama_tag();
             ModelEntryDto {
                 id: m.id.to_string(),
                 kind: m.kind.as_str().to_string(),
-                filename: m.filename.to_string(),
+                source: if tag.is_some() { "ollama" } else { "file" }.to_string(),
+                ollama_tag: tag.map(str::to_string),
+                validated: m.validated,
+                selected: tag.is_some_and(is_selected),
+                filename: file.map(|f| f.filename.to_string()),
                 required: m.required,
-                size_bytes: m.size_bytes,
-                present,
-                path: target.display().to_string(),
+                size_bytes: m.size_bytes(),
+                present: match tag {
+                    Some(t) => installed
+                        .iter()
+                        .any(|i| normalize_tag(&i.name) == normalize_tag(t)),
+                    None => models::is_present(m, &state.data_dir),
+                },
+                path: models::target_path(m, &state.data_dir).map(|p| p.display().to_string()),
                 downloading,
                 progress,
             }
         })
         .collect();
+
+    // Installed Ollama models outside the catalog: selectable but not validated.
+    for inst in &installed {
+        let in_catalog = models::catalog()
+            .iter()
+            .filter_map(|m| m.ollama_tag())
+            .any(|t| normalize_tag(t) == normalize_tag(&inst.name));
+        if in_catalog || is_embedding_model(inst) {
+            continue;
+        }
+        models.push(ModelEntryDto {
+            id: format!("ollama:{}", inst.name),
+            kind: models::ModelKind::Cleanup.as_str().to_string(),
+            source: "ollama".to_string(),
+            ollama_tag: Some(inst.name.clone()),
+            validated: false,
+            selected: is_selected(&inst.name),
+            filename: None,
+            required: false,
+            size_bytes: inst.size,
+            present: true,
+            path: None,
+            downloading: false,
+            progress: None,
+        });
+    }
     Json(ModelsListResponse { models })
 }
 
-/// `POST /v1/models/{id}/download`: start a download in the background (`202 Accepted`); `409`
-/// if this model is already downloading, `404` for an unknown id.
+/// Embedding-only models cannot do chat cleanup, so they are not offered as extras.
+fn is_embedding_model(m: &InstalledModel) -> bool {
+    m.name.to_ascii_lowercase().contains("embed")
+        || (!m.families.is_empty()
+            && m.families.iter().all(|f| {
+                let f = f.to_ascii_lowercase();
+                f.contains("embed") || f.contains("bert")
+            }))
+}
+
+/// `POST /v1/models/{id}/download`: start a download (file) or pull (Ollama) in the background
+/// (`202 Accepted`); `409` if this model is already downloading or is an already-installed
+/// `ollama:<tag>` extra, `404` for an unknown id.
 pub async fn start_model_download(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiErr> {
+    if id.starts_with("ollama:") {
+        return Err(ApiErr::new(
+            StatusCode::CONFLICT,
+            "already_present",
+            format!("model {id} is already installed in Ollama"),
+        ));
+    }
     let model =
         models::find(&id).ok_or_else(|| ApiErr::not_found(format!("unknown model {id}")))?;
     let handle = state
@@ -554,6 +625,13 @@ pub async fn start_model_download(
         .ok_or_else(|| ApiErr::download_busy(&id))?;
 
     let data_dir = state.data_dir.clone();
+    let ollama_url = state
+        .config
+        .read()
+        .expect("config lock")
+        .cleanup
+        .ollama_url
+        .clone();
     let events = state.events.clone();
     let registry = state.model_downloads.clone();
     let model_id = model.id.to_string();
@@ -562,9 +640,14 @@ pub async fn start_model_download(
         let progress_events = events.clone();
         let progress_id = model_id.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            models::run_download(model, &data_dir, &handle, move |p: DownloadProgress| {
+            let on_progress = move |p: DownloadProgress| {
                 let _ = progress_events.send(model_download_event(&progress_id, &p));
-            });
+            };
+            if model.ollama_tag().is_some() {
+                models::run_pull(model, &OllamaClient::new(ollama_url), &handle, on_progress);
+            } else {
+                models::run_download(model, &data_dir, &handle, on_progress);
+            }
         })
         .await;
         // Terminal (done/error/cancel) — free the slot so a retry can begin fresh.
@@ -574,8 +657,10 @@ pub async fn start_model_download(
     Ok(StatusCode::ACCEPTED)
 }
 
-/// `DELETE /v1/models/{id}/download`: cancel an in-flight download (aborts the task, deletes
-/// `.part`); `404` for an unknown model id, no-op (`204`) if nothing is in flight.
+/// `DELETE /v1/models/{id}/download`: cancel an in-flight download or pull (file: aborts and
+/// deletes `.part`; Ollama: drops the pull stream, Ollama keeps its partial blobs so a retry
+/// resumes); `404` for an unknown model id, no-op (`204`) if nothing is in flight. There is
+/// deliberately no removal path for Ollama models (D-0017).
 pub async fn cancel_model_download(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
