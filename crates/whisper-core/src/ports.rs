@@ -29,6 +29,17 @@ pub trait SttEngine {
 /// trap-safety contract is enforced by the prompt/adapter, not this trait.
 pub trait CleanupEngine {
     fn clean(&self, text: &str, ctx: &CleanupCtx) -> Result<String, CleanupError>;
+
+    /// Called once when a session enters `Recording`, before capture frames are consumed —
+    /// a hook to warm the backend (e.g. load a model) while the user is still speaking.
+    /// Best-effort and infallible: a failure here surfaces later as a `clean` error.
+    fn prepare(&self) {}
+
+    /// Whether the engine is currently usable. `false` is treated exactly like no engine
+    /// being configured.
+    fn is_enabled(&self) -> bool {
+        true
+    }
 }
 
 /// Delivers final text — platform text injection or an API response

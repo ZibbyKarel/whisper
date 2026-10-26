@@ -335,9 +335,9 @@ fn cancellation_mid_pipeline_stops_before_delivery() {
 }
 
 #[test]
-fn cleanup_failure_carries_best_text_so_far() {
-    let raw = "Otevři si terminál a spusť npm install, pak zkontroluj packa json.";
-    let expected_partial = "Otevři si terminál a spusť npm install, pak zkontroluj package.json.";
+fn cleanup_error_degrades_to_dict_text() {
+    let raw = "ehm, Příliš žluťoučký kůň úpěl ďábelské ódy, packa json.";
+    let expected = "ehm, Příliš žluťoučký kůň úpěl ďábelské ódy, package.json.";
 
     let dictionary =
         Dictionary::from_json_str(r#"{"pairs": [{"from": "packa json", "to": "package.json"}]}"#)
@@ -362,16 +362,99 @@ fn cleanup_failure_carries_best_text_so_far() {
         },
     );
 
+    let rx = pipeline.subscribe();
     let token = CancellationToken::new();
     let state = pipeline.run(AudioCfg::default(), &CleanupCtx::default(), &token);
 
-    match state {
-        SessionState::Failed(info) => {
-            assert_eq!(info.partial_text.as_deref(), Some(expected_partial));
+    assert_eq!(state, SessionState::Idle);
+    assert_eq!(sink.captured.lock().unwrap().as_deref(), Some(expected));
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        PipelineEvent::CleanupSkipped {
+            reason: CleanupSkipReason::EngineFailed
         }
-        other => panic!("expected Failed state, got {other:?}"),
+    )));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, PipelineEvent::Failed { .. })));
+}
+
+/// Counts `prepare`/`clean` calls and exposes a togglable `is_enabled`.
+struct CountingCleanup {
+    prepared: Arc<std::sync::atomic::AtomicUsize>,
+    cleaned: Arc<std::sync::atomic::AtomicUsize>,
+    enabled: bool,
+}
+
+impl CleanupEngine for CountingCleanup {
+    fn clean(&self, text: &str, _ctx: &CleanupCtx) -> Result<String, CleanupError> {
+        self.cleaned
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(text.to_string())
     }
-    assert!(sink.captured.lock().unwrap().is_none());
+    fn prepare(&self) {
+        self.prepared
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+/// Runs one `Always` session with a `CountingCleanup`; returns (prepare count, clean count,
+/// events).
+fn run_counting_session(enabled: bool) -> (usize, usize, Vec<PipelineEvent>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let prepared = Arc::new(AtomicUsize::new(0));
+    let cleaned = Arc::new(AtomicUsize::new(0));
+    let mut pipeline = Pipeline::new(
+        Box::new(FixtureAudioSource::new(fixture_path("mix-01.wav"))),
+        Box::new(NoopVad::default()),
+        Box::new(FakeStt {
+            text: "Příliš žluťoučký kůň".to_string(),
+            lang: "cs".to_string(),
+        }),
+        Dictionary::empty(),
+        Some(Box::new(CountingCleanup {
+            prepared: prepared.clone(),
+            cleaned: cleaned.clone(),
+            enabled,
+        })),
+        Box::new(CaptureSink::default()),
+        PipelineConfig {
+            cleanup_mode: CleanupMode::Always,
+            skip_gate: SkipGateConfig::default(),
+        },
+    );
+    let rx = pipeline.subscribe();
+    let token = CancellationToken::new();
+    let state = pipeline.run(AudioCfg::default(), &CleanupCtx::default(), &token);
+    assert_eq!(state, SessionState::Idle);
+    (
+        prepared.load(Ordering::SeqCst),
+        cleaned.load(Ordering::SeqCst),
+        rx.try_iter().collect(),
+    )
+}
+
+#[test]
+fn prepare_called_once_per_session() {
+    let (prepared, cleaned, _) = run_counting_session(true);
+    assert_eq!(prepared, 1);
+    assert_eq!(cleaned, 1);
+}
+
+#[test]
+fn disabled_engine_skips_as_no_engine_configured() {
+    let (_, cleaned, events) = run_counting_session(false);
+    assert_eq!(cleaned, 0, "a disabled engine must never be asked to clean");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        PipelineEvent::CleanupSkipped {
+            reason: CleanupSkipReason::NoEngineConfigured
+        }
+    )));
 }
 
 #[test]

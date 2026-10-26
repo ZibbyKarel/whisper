@@ -46,6 +46,7 @@ pub fn skip_reason_str(reason: CleanupSkipReason) -> &'static str {
         CleanupSkipReason::ModeDisabled => "mode_disabled",
         CleanupSkipReason::GateClean => "gate_clean",
         CleanupSkipReason::NoEngineConfigured => "no_engine_configured",
+        CleanupSkipReason::EngineFailed => "engine_failed",
     }
 }
 

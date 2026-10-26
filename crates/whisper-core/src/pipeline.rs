@@ -102,6 +102,10 @@ pub enum CleanupSkipReason {
     /// [`CleanupEngine`] is configured — degrade gracefully rather than fail the session
     /// (`ARCHITECTURE.md` §3.2, "the engine never dies with a session").
     NoEngineConfigured,
+    /// The [`CleanupEngine`] ran but returned an error (e.g. the Ollama server is down) —
+    /// the dictionary-passed text is delivered instead; a dictation never fails because
+    /// cleanup did.
+    EngineFailed,
 }
 
 /// Drives one dictation session end to end through the ports it is constructed with.
@@ -167,6 +171,10 @@ impl Pipeline {
         fsm.transition(SessionState::Recording)
             .expect("Idle->Recording is always valid");
         self.emit(PipelineEvent::SessionStarted);
+        // Warm the cleanup backend while the user is still speaking.
+        if let Some(engine) = self.cleanup.as_ref().filter(|e| e.is_enabled()) {
+            engine.prepare();
+        }
 
         let mut stream = match self.audio.start(audio_cfg) {
             Ok(stream) => stream,
@@ -258,7 +266,7 @@ impl Pipeline {
             CleanupMode::Auto => self.config.skip_gate.needs_cleanup(&dict_text),
         };
         let final_text = if wants_cleanup {
-            match &self.cleanup {
+            match self.cleanup.as_ref().filter(|e| e.is_enabled()) {
                 Some(engine) => match engine.clean(&dict_text, cleanup_ctx) {
                     Ok(cleaned) => {
                         self.emit(PipelineEvent::Cleaned {
@@ -267,7 +275,14 @@ impl Pipeline {
                         cleaned
                     }
                     Err(err) => {
-                        return self.fail(&mut fsm, PipelineError::from(err), Some(dict_text))
+                        // Degrade, never fail: deliver the dictionary-passed text.
+                        eprintln!(
+                            "whisper-core: cleanup failed, delivering dictionary text: {err}"
+                        );
+                        self.emit(PipelineEvent::CleanupSkipped {
+                            reason: CleanupSkipReason::EngineFailed,
+                        });
+                        dict_text
                     }
                 },
                 None => {
