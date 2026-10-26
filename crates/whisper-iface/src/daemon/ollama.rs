@@ -48,6 +48,7 @@ pub enum Launch {
 pub fn find_installation(
     path_env: Option<&str>,
     exists: impl Fn(&Path) -> bool,
+    resolve: impl Fn(&Path) -> PathBuf,
 ) -> Option<Installation> {
     let mut candidates: Vec<PathBuf> = path_env
         .into_iter()
@@ -64,6 +65,10 @@ pub fn find_installation(
         .iter()
         .find(|p| BREW_PREFIXES.iter().any(|prefix| p.starts_with(prefix)))
     {
+        // The Ollama.app installer links its CLI into /usr/local/bin; that is the app, not Brew.
+        if resolve(brew).to_string_lossy().contains("/Ollama.app/") {
+            return Some(Installation::App);
+        }
         return Some(Installation::Brew(brew.clone()));
     }
     if exists(Path::new(APP_PATH)) {
@@ -72,10 +77,15 @@ pub fn find_installation(
     found.into_iter().next().map(Installation::Binary)
 }
 
+/// Real-filesystem symlink resolution for [`find_installation`]; unresolvable paths stay as-is.
+pub fn canonical(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// Installed (on this machine) and running (answering at the client's URL).
 pub fn probe(client: &OllamaClient) -> Probe {
     let path_env = std::env::var("PATH").ok();
-    let installed = find_installation(path_env.as_deref(), |p| p.exists()).is_some();
+    let installed = find_installation(path_env.as_deref(), |p| p.exists(), canonical).is_some();
     let version = client.version().ok();
     Probe {
         installed,
@@ -85,10 +95,12 @@ pub fn probe(client: &OllamaClient) -> Probe {
 }
 
 /// The launch command(s) for an installation, in the order they are tried.
-fn launch_plan(inst: &Installation) -> Vec<(Command, Launch)> {
+fn launch_plan(inst: &Installation, base_url: &str) -> Vec<(Command, Launch)> {
     let serve = |bin: &Path| {
         let mut c = Command::new(bin);
         c.arg("serve");
+        // A bare `ollama serve` binds the default port; follow the configured loopback URL.
+        c.env("OLLAMA_HOST", host_port(base_url));
         (c, Launch::Detach)
     };
     match inst {
@@ -106,6 +118,12 @@ fn launch_plan(inst: &Installation) -> Vec<(Command, Launch)> {
         }
         Installation::Binary(bin) => vec![serve(bin)],
     }
+}
+
+/// `host:port` of a URL (scheme and any path stripped), as `OLLAMA_HOST` expects.
+fn host_port(url: &str) -> &str {
+    let rest = url.trim().split_once("://").map_or(url.trim(), |(_, r)| r);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
 }
 
 /// Run a command for real: `Wait` requires a successful exit, `Detach` spawns and forgets.
@@ -142,7 +160,7 @@ pub fn start_with(
 ) -> Result<(), String> {
     let mut last_err = None;
     let mut launched = false;
-    for (mut cmd, launch) in launch_plan(inst) {
+    for (mut cmd, launch) in launch_plan(inst, client.base()) {
         match run(&mut cmd, launch) {
             Ok(()) => {
                 launched = true;
@@ -189,6 +207,7 @@ mod tests {
         let got = find_installation(
             Some("/usr/bin:/opt/homebrew/bin"),
             exists_in(&["/opt/homebrew/bin/ollama", "/Applications/Ollama.app"]),
+            |p| p.to_path_buf(),
         );
         assert_eq!(
             got,
@@ -200,7 +219,11 @@ mod tests {
 
     #[test]
     fn find_installation_app() {
-        let got = find_installation(Some("/usr/bin"), exists_in(&["/Applications/Ollama.app"]));
+        let got = find_installation(
+            Some("/usr/bin"),
+            exists_in(&["/Applications/Ollama.app"]),
+            |p| p.to_path_buf(),
+        );
         assert_eq!(got, Some(Installation::App));
     }
 
@@ -209,6 +232,7 @@ mod tests {
         let got = find_installation(
             Some("/usr/bin:/home/u/bin"),
             exists_in(&["/home/u/bin/ollama"]),
+            |p| p.to_path_buf(),
         );
         assert_eq!(
             got,
@@ -218,7 +242,9 @@ mod tests {
 
     #[test]
     fn find_installation_checks_standard_prefixes_without_path() {
-        let got = find_installation(None, exists_in(&["/usr/local/bin/ollama"]));
+        let got = find_installation(None, exists_in(&["/usr/local/bin/ollama"]), |_| {
+            PathBuf::from("/usr/local/Cellar/ollama/0.12.3/bin/ollama")
+        });
         assert_eq!(
             got,
             Some(Installation::Brew(PathBuf::from("/usr/local/bin/ollama")))
@@ -226,8 +252,45 @@ mod tests {
     }
 
     #[test]
+    fn find_installation_app_cli_symlink_is_app_not_brew() {
+        let got = find_installation(
+            Some("/usr/bin"),
+            exists_in(&["/usr/local/bin/ollama", "/Applications/Ollama.app"]),
+            |_| PathBuf::from("/Applications/Ollama.app/Contents/Resources/ollama"),
+        );
+        assert_eq!(got, Some(Installation::App));
+    }
+
+    #[test]
+    fn serve_fallback_passes_configured_host_port() {
+        let inst = Installation::Binary(PathBuf::from("/home/u/bin/ollama"));
+        let plan = launch_plan(&inst, "http://127.0.0.1:11500/");
+        let envs: Vec<_> = plan[0]
+            .0
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs,
+            vec![(
+                "OLLAMA_HOST".to_string(),
+                Some("127.0.0.1:11500".to_string())
+            )]
+        );
+        assert_eq!(host_port("localhost:11434"), "localhost:11434");
+    }
+
+    #[test]
     fn find_installation_none() {
-        assert_eq!(find_installation(Some("/usr/bin"), |_| false), None);
+        assert_eq!(
+            find_installation(Some("/usr/bin"), |_| false, |p| p.to_path_buf()),
+            None
+        );
     }
 
     /// Mock Ollama answering `/api/version` once per connection, forever (detached thread).

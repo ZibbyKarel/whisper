@@ -139,7 +139,11 @@ if [ "$LINK_MODELS" -eq 1 ]; then
   if [ -L "$DATA/models" ]; then rm "$DATA/models"; fi
   mkdir -p "$DATA/models"
   # Only the STT model is linked; the cleanup LLM is served by Ollama.
-  ln -sfn "$REPO/models/ggml-large-v3-turbo-q5_0.bin" "$DATA/models/ggml-large-v3-turbo-q5_0.bin"
+  if [ -f "$REPO/models/ggml-large-v3-turbo-q5_0.bin" ]; then
+    ln -sfn "$REPO/models/ggml-large-v3-turbo-q5_0.bin" "$DATA/models/ggml-large-v3-turbo-q5_0.bin"
+  else
+    echo "warning: $REPO/models/ggml-large-v3-turbo-q5_0.bin not found; STT model not linked" >&2
+  fi
   CFG="$DATA/config.toml"
   if [ ! -f "$CFG" ]; then
     echo "    writing starter config $CFG"

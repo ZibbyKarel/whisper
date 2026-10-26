@@ -102,7 +102,8 @@ impl OllamaPanel {
     pub fn status_label(&self) -> String {
         match &self.status {
             None => "Checking Ollama…".to_string(),
-            Some(s) if !s.installed => "Ollama not installed".to_string(),
+            // A running server is by definition installed, whatever the filesystem probe found.
+            Some(s) if !s.running && !s.installed => "Ollama not installed".to_string(),
             Some(s) if !s.running => "Ollama installed — not running".to_string(),
             Some(OllamaStatus {
                 version: Some(v), ..
@@ -129,7 +130,7 @@ impl OllamaPanel {
             return None;
         }
         let status = self.status.as_ref()?;
-        if !status.installed {
+        if !status.running && !status.installed {
             return Some(OllamaAttention::NotInstalled);
         }
         if !status.running {
@@ -294,6 +295,23 @@ mod tests {
     }
 
     const MODEL: &str = "qwen3-vl:8b-instruct";
+
+    #[test]
+    fn running_server_is_never_not_installed() {
+        let p = OllamaPanel {
+            status: Some(OllamaStatus {
+                installed: false,
+                running: true,
+                version: Some("0.12.3".to_string()),
+                url: "http://127.0.0.1:11434".to_string(),
+                can_start: false,
+            }),
+            last_error: None,
+        };
+        let models = models_with(vec![cleanup_entry("m", MODEL, true, true)]);
+        assert_eq!(p.attention(MODEL, &models), None);
+        assert!(!p.status_label().to_lowercase().contains("not installed"));
+    }
 
     #[test]
     fn needs_attention_when_not_installed() {

@@ -961,7 +961,15 @@ impl ShellApp {
                     }
                     OllamaAttention::ModelMissing { id, .. } => {
                         if let Some(id) = id {
-                            if ui.button("Download").clicked() {
+                            // Already pulling: show progress instead of re-POSTing (409).
+                            let progress = self
+                                .models
+                                .entry(id)
+                                .filter(|e| e.downloading)
+                                .map(|e| download_verb(e, self.models.phase(id)));
+                            if let Some(text) = progress {
+                                ui.label(text);
+                            } else if ui.button("Download").clicked() {
                                 self.start_model_download(id);
                             }
                         }

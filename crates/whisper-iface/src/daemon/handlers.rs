@@ -5,6 +5,7 @@
 
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -25,7 +26,7 @@ use super::api::{
     StatusResponse,
 };
 use super::config::{Config, DeliveryMode};
-use super::models::{self, DownloadProgress};
+use super::models::{self, DownloadPhase, DownloadProgress};
 use super::ollama as ollama_probe;
 use super::state::{
     now_ms, AppState, CaptureControl, EnginePhase, Job, JobAudio, LiveSourceCtx, SinkKind,
@@ -407,7 +408,9 @@ pub async fn put_config(
         if new.cleanup.ollama_url != cur.cleanup.ollama_url
             || new.cleanup.keep_alive != cur.cleanup.keep_alive
         {
-            // The Ollama client and keep-alive are fixed when the engine is built.
+            // Staged: the cleanup chat client and keep-alive are fixed when the engine is built,
+            // so chat uses the new values after a restart. The Ollama probe, models list and pull
+            // read the URL from config per request and use it immediately.
             staged.push("cleanup".to_string());
         }
         if new.audio != cur.audio {
@@ -635,6 +638,7 @@ pub async fn start_model_download(
     let events = state.events.clone();
     let registry = state.model_downloads.clone();
     let model_id = model.id.to_string();
+    let rewarm_state = state.clone();
 
     tokio::spawn(async move {
         let progress_events = events.clone();
@@ -643,8 +647,18 @@ pub async fn start_model_download(
             let on_progress = move |p: DownloadProgress| {
                 let _ = progress_events.send(model_download_event(&progress_id, &p));
             };
-            if model.ollama_tag().is_some() {
+            if let Some(tag) = model.ollama_tag() {
                 models::run_pull(model, &OllamaClient::new(ollama_url), &handle, on_progress);
+                // A finished pull of the selected cleanup model clears a stale "model missing".
+                let pulled = handle.snapshot().phase == DownloadPhase::Done;
+                let selected = rewarm_state
+                    .cleanup_model
+                    .read()
+                    .expect("cleanup model lock")
+                    .clone();
+                if pulled && normalize_tag(tag) == normalize_tag(&selected) {
+                    rewarm_cleanup(&rewarm_state);
+                }
             } else {
                 models::run_download(model, &data_dir, &handle, on_progress);
             }
@@ -790,15 +804,79 @@ fn wav_bytes_to_mono_f32(bytes: &[u8]) -> Result<Vec<f32>, hound::Error> {
 
 /// Probe the configured Ollama URL (blocking: a 2 s version request plus filesystem checks).
 fn ollama_status_blocking(url: &str) -> OllamaStatusDto {
-    let probe = ollama_probe::probe(&OllamaClient::new(url));
+    status_dto(url, ollama_probe::probe(&OllamaClient::new(url)))
+}
+
+/// DTO from a probe. A server that answers is installed by definition, even when the filesystem
+/// search (PATH / Homebrew / app bundle) finds nothing (e.g. a remote or custom-path install).
+fn status_dto(url: &str, probe: ollama_probe::Probe) -> OllamaStatusDto {
+    let installed = probe.installed || probe.running;
     OllamaStatusDto {
-        can_start: probe.installed && !probe.running && is_loopback_url(url),
-        installed: probe.installed,
+        can_start: installed && !probe.running && is_loopback_url(url),
+        installed,
         running: probe.running,
         version: probe.version,
         url: url.to_string(),
     }
 }
+
+/// After Ollama comes up or the selected model is pulled, load the model and replace the stale
+/// cleanup health (typically a `Degraded`-causing error from an earlier failed warm-up). Blocking:
+/// polls `/api/version` briefly (a just-started server may not answer yet), then `load`s.
+pub fn rewarm_cleanup(state: &AppState) {
+    let (url, keep_alive) = {
+        let cfg = state.config.read().expect("config lock");
+        (
+            cfg.cleanup.ollama_url.clone(),
+            cfg.cleanup.keep_alive.clone(),
+        )
+    };
+    let model = state
+        .cleanup_model
+        .read()
+        .expect("cleanup model lock")
+        .clone();
+    rewarm(
+        &OllamaClient::new(url),
+        &model,
+        &keep_alive,
+        &state.cleanup_health,
+        REWARM_POLL,
+    );
+}
+
+fn rewarm(
+    client: &OllamaClient,
+    model: &str,
+    keep_alive: &str,
+    health: &std::sync::RwLock<CleanupHealth>,
+    poll: Duration,
+) {
+    if model.trim().is_empty() {
+        return;
+    }
+    for _ in 0..REWARM_POLLS {
+        if client.version().is_ok() {
+            break;
+        }
+        std::thread::sleep(poll);
+    }
+    let result = match client.load(model, keep_alive) {
+        Ok(()) => CleanupHealth {
+            ready: true,
+            error: None,
+        },
+        Err(e) => CleanupHealth {
+            ready: false,
+            error: Some(e.to_string()),
+        },
+    };
+    *health.write().expect("cleanup health lock") = result;
+}
+
+/// Version polls (× interval) before a re-warm gives up waiting for a just-started server.
+const REWARM_POLLS: u32 = 10;
+const REWARM_POLL: Duration = Duration::from_millis(500);
 
 fn ollama_url(state: &AppState) -> String {
     state
@@ -821,6 +899,22 @@ pub async fn get_ollama(
     Ok(Json(dto))
 }
 
+fn send_ollama_status(state: &AppState, dto: OllamaStatusDto) {
+    let _ = state.events.send(ApiEvent::OllamaStatus {
+        installed: dto.installed,
+        running: dto.running,
+        version: dto.version,
+        url: dto.url,
+        can_start: dto.can_start,
+        ts_ms: now_ms(),
+    });
+}
+
+/// Probe `url` (blocking) and broadcast the result as an `ollama.status` event.
+pub fn emit_ollama_status(state: &AppState, url: &str) {
+    send_ollama_status(state, ollama_status_blocking(url));
+}
+
 /// `POST /v1/ollama/start`: launch a local Ollama (`202`, started in the background; the result
 /// arrives as an `ollama.status` WS event) or `409` when it cannot/need not be started.
 pub async fn start_ollama(State(state): State<Arc<AppState>>) -> Result<StatusCode, ApiErr> {
@@ -837,32 +931,124 @@ pub async fn start_ollama(State(state): State<Arc<AppState>>) -> Result<StatusCo
         ));
     }
 
+    let rewarm_state = state.clone();
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             let client = OllamaClient::new(url.as_str());
             let path_env = std::env::var("PATH").ok();
-            let outcome = match ollama_probe::find_installation(path_env.as_deref(), |p| p.exists())
-            {
+            let outcome = match ollama_probe::find_installation(
+                path_env.as_deref(),
+                |p| p.exists(),
+                ollama_probe::canonical,
+            ) {
                 Some(inst) => ollama_probe::start(&inst, &client),
                 None => Err("ollama is not installed".to_string()),
             };
-            if let Err(e) = outcome {
-                eprintln!("whisperd: ollama start failed: {e}");
+            match outcome {
+                Ok(()) => rewarm_cleanup(&rewarm_state),
+                Err(e) => eprintln!("whisperd: ollama start failed: {e}"),
             }
             ollama_status_blocking(&url)
         })
         .await;
         if let Ok(dto) = result {
-            let _ = state.events.send(ApiEvent::OllamaStatus {
-                installed: dto.installed,
-                running: dto.running,
-                version: dto.version,
-                url: dto.url,
-                can_start: dto.can_start,
-                ts_ms: now_ms(),
-            });
+            send_ollama_status(&state, dto);
         }
     });
 
     Ok(StatusCode::ACCEPTED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn running_server_is_reported_installed() {
+        let probe = ollama_probe::Probe {
+            installed: false,
+            running: true,
+            version: Some("0.12.3".to_string()),
+        };
+        let dto = status_dto("http://127.0.0.1:11434", probe);
+        assert!(dto.installed && dto.running);
+        assert!(!dto.can_start);
+    }
+
+    /// Mock answering every request with `{"version":..}` (also fine as an empty chat reply).
+    fn mock_ollama() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let Ok(mut s) = stream else { break };
+                // Drain the whole request (headers + body) so closing never resets the client.
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let Ok(n) = s.read(&mut buf) else { break };
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req).to_ascii_lowercase();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let len = text[..h]
+                            .split("content-length:")
+                            .nth(1)
+                            .and_then(|r| r.lines().next())
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if req.len() >= h + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let body = r#"{"version":"0.12.3","done":true}"#;
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn rewarm_clears_stale_cleanup_health() {
+        let health = std::sync::RwLock::new(CleanupHealth {
+            ready: false,
+            error: Some("connection refused (Příliš žluťoučký kůň)".to_string()),
+        });
+        rewarm(
+            &OllamaClient::new(mock_ollama()),
+            "qwen3-vl:8b-instruct",
+            "30m",
+            &health,
+            Duration::from_millis(10),
+        );
+        let h = health.read().unwrap().clone();
+        assert!(h.ready && h.error.is_none(), "{h:?}");
+    }
+
+    #[test]
+    fn rewarm_records_load_failure() {
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let health = std::sync::RwLock::new(CleanupHealth::default());
+        rewarm(
+            &OllamaClient::new(dead),
+            "qwen3:8b",
+            "30m",
+            &health,
+            Duration::from_millis(1),
+        );
+        let h = health.read().unwrap().clone();
+        assert!(!h.ready && h.error.is_some(), "{h:?}");
+    }
 }

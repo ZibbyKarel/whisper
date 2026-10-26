@@ -9,7 +9,9 @@
 use std::path::PathBuf;
 
 use whisper_iface::daemon::config::{CleanupConfig, Config};
+use whisper_iface::daemon::handlers;
 use whisper_iface::daemon::ollama;
+use whisper_iface::daemon::state::AppState;
 use whisper_iface::ollama::{is_loopback_url, OllamaClient};
 #[cfg(not(feature = "platform"))]
 use whisper_iface::production_engine_builder;
@@ -74,7 +76,7 @@ async fn run() -> Result<(), String> {
     println!("  events: ws://{}/v1/events", daemon.addr);
 
     // Bring up a local Ollama in the background; startup never waits on it (D-0017).
-    spawn_ollama_autostart(&config_cleanup);
+    spawn_ollama_autostart(&config_cleanup, daemon.state.clone());
 
     #[cfg(feature = "platform")]
     let _hotkey = whisper_iface::daemon::platform::spawn_hotkey(daemon.state.clone(), &hotkey_cfg);
@@ -91,7 +93,7 @@ async fn run() -> Result<(), String> {
 
 /// If cleanup is on, the URL is loopback, and Ollama is installed but not answering, start it on
 /// a background thread (the start polls up to ~10 s, so it must never block startup).
-fn spawn_ollama_autostart(cleanup: &CleanupConfig) {
+fn spawn_ollama_autostart(cleanup: &CleanupConfig, state: std::sync::Arc<AppState>) {
     if !cleanup.enabled() || !is_loopback_url(&cleanup.ollama_url) {
         return;
     }
@@ -102,13 +104,19 @@ fn spawn_ollama_autostart(cleanup: &CleanupConfig) {
         if probe.running || !probe.installed {
             return;
         }
-        let Some(inst) = ollama::find_installation(path_env.as_deref(), |p| p.exists()) else {
+        let Some(inst) =
+            ollama::find_installation(path_env.as_deref(), |p| p.exists(), ollama::canonical)
+        else {
             return;
         };
         match ollama::start(&inst, &client) {
-            Ok(()) => eprintln!("whisperd: started ollama at {}", client.base()),
+            Ok(()) => {
+                eprintln!("whisperd: started ollama at {}", client.base());
+                handlers::rewarm_cleanup(&state);
+            }
             Err(e) => eprintln!("whisperd: ollama auto-start failed: {e}"),
         }
+        handlers::emit_ollama_status(&state, client.base());
     });
 }
 

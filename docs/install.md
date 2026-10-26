@@ -92,8 +92,9 @@ the right pane.
 
 ## 5. Set up the models
 
-Models are **not** bundled (they are 6+ GB). They live in the app-support data
-dir: `~/Library/Application Support/whisper-engine/models/`.
+Models are **not** bundled. The STT model (~0.6 GB) lives in the app-support
+data dir (`~/Library/Application Support/whisper-engine/models/`); the cleanup
+LLM is pulled into Ollama.
 
 ### Option A — you have the repo models (fastest)
 
